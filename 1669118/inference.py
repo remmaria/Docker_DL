@@ -6,7 +6,6 @@ import argparse
 import matplotlib.pyplot as plt
 import gc
 
-sys.path.append("/ix1/tibrahim/rmm270/UTILITIES/env_dl")
 import nibabel as nib
 import dipy.reconst.dti as dti
 from dipy.core.gradients import gradient_table

@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import sys
 
-sys.path.append("/ix1/tibrahim/rmm270/UTILITIES/my_libs")
 from monai.losses import SSIMLoss
 
 
@@ -27,6 +26,7 @@ class PhysicalCompoundLoss(nn.Module):
 
     def __init__(
         self,
+        patch_size,
         l1_weight=1.0,
         ssim_weight=1.0,
         grad_weight=10.0,
@@ -34,7 +34,19 @@ class PhysicalCompoundLoss(nn.Module):
         wm_multiplier=2.0,
     ):
         super(PhysicalCompoundLoss, self).__init__()
-        self.ssim = SSIMLoss(spatial_dims=3)
+
+        win_size = min(5, patch_size)
+
+        if win_size % 2 == 0:
+            win_size -= 1
+
+        win_size = max(win_size, 3)
+
+        self.ssim = SSIMLoss(
+            spatial_dims=3,
+            data_range=5.0,
+            win_size=win_size,
+        )
 
         # Pesos base (fixos após inicialização)
         self.l1_w_base   = float(l1_weight)
@@ -48,6 +60,26 @@ class PhysicalCompoundLoss(nn.Module):
         self.ssim_w = self.ssim_w_base
         self.grad_w = self.grad_w_base
         self.res_w  = self.res_w_base
+
+    def _compute_ssim(self, pred, target, mask):
+        mask_bin = (mask > 0.5).float()
+
+        fg_count = mask_bin.sum().clamp(min=1.0)
+        fg_mean = (pred * mask_bin).sum() / fg_count
+
+        pred_fg = pred * mask_bin + fg_mean.detach() * (1.0 - mask_bin)
+        target_fg = target * mask_bin + fg_mean.detach() * (1.0 - mask_bin)
+
+        # Clamp para evitar valores extremos que quebram a janela SSIM
+        pred_fg = pred_fg.clamp(0.0, 5.0)
+        target_fg = target_fg.clamp(0.0, 5.0)
+
+        ssim_val = self.ssim(pred_fg, target_fg)
+
+        # Protege NaN que vem de janelas sem variância
+        ssim_val = torch.nan_to_num(ssim_val, nan=1.0)  # SSIM loss=1 → pior caso
+
+        return ssim_val
 
     def set_phase_weights(self, fase: int):
         """
@@ -81,6 +113,22 @@ class PhysicalCompoundLoss(nn.Module):
         pred          : [B, 1, H, W, D] — resíduo predito pelo decoder.
         media_vizinhos: [B, 1, H, W, D] — média ponderada dos vizinhos.
         """
+        
+        
+        pred_final = torch.nan_to_num(
+            pred_final,
+            nan=0.0,
+            posinf=5.0,
+            neginf=0.0,
+        )
+
+        target = torch.nan_to_num(
+            target,
+            nan=0.0,
+            posinf=5.0,
+            neginf=0.0,
+        )
+
         # Garante float32 para estabilidade (especialmente com SSIM)
         pred_final = pred_final.float()
         target     = target.float()
@@ -98,7 +146,11 @@ class PhysicalCompoundLoss(nn.Module):
 
         # 2. PERDA ESTRUTURAL (SSIM)
         # Usa máscara binária simples para não distorcer estatísticas locais
-        loss_ssim = self.ssim(pred_final * mask, target * mask)
+        loss_ssim = self._compute_ssim(
+            pred_final,
+            target,
+            mask
+        )
 
         # 3. PERDA DE GRADIENTE PONDERADA
         loss_grad = self._weighted_gradient_loss(pred_final, target, weights)
@@ -118,6 +170,9 @@ class PhysicalCompoundLoss(nn.Module):
             + self.grad_w * loss_grad
             + self.res_w  * loss_res
         )
+
+        assert not torch.isnan(pred_final).any(), "pred_final tem NaN antes do SSIM"
+        assert not torch.isnan(target).any(), "target tem NaN antes do SSIM"
 
         return total_loss, {
             "l1":   loss_l1,

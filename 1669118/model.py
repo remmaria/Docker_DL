@@ -28,7 +28,7 @@ class QSpaceAttentionNetwork(nn.Module):
        e tem uma camada intermediária a mais para absorver a nova informação.
     """
 
-    def __init__(self, k_neighbors=4, feature_channels=64):
+    def __init__(self, k_neighbors, feature_channels=64):
         super(QSpaceAttentionNetwork, self).__init__()
         self.K = k_neighbors
 

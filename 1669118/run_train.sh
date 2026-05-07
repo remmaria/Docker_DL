@@ -1,22 +1,33 @@
 #!/bin/bash
-#SBATCH --job-name=qspAttNtw
+#SBATCH --job-name=dmri_dl
 #SBATCH --cluster=gpu
-#SBATCH --partition=rtx6k
+#SBATCH --partition=h200
 #SBATCH --gres=gpu:1 
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16 # importante para dataloader
-#SBATCH --mem=128G
+#SBATCH --mem=32G
 #SBATCH --time=0-23:00:00  
 #SBATCH --account=tibrahim
 #SBATCH --error=job.%J.err
 #SBATCH --output=job.%J.out
 
-module load apptainer
+# limpa módulos antigos
+module purge
 
-export APPTAINERENV_PYTHONWARNINGS="ignore::DeprecationWarning"
+# carrega anaconda
+module load anaconda3/2025.7.0-2-python_3.11
 
-apptainer exec --nv --cleanenv \
-  -B /ix1/tibrahim/rmm270:/ix1/tibrahim/rmm270 \
-  /ix1/tibrahim/rmm270/UTILITIES/pytorch_24.12-py3.sif \
-  python3 -s -u train.py --job_id "$SLURM_JOB_ID"
+# ativa conda corretamente
+eval "$(conda shell.bash hook)"
+conda activate dmri_dl
+
+# impede puxar lixo do ~/.local
+export PYTHONNOUSERSITE=1
+
+# opcional: limitar threads de libs CPU
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+
+# roda treino
+python train.py --job_id "$SLURM_JOB_ID"

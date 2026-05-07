@@ -1,18 +1,20 @@
 # Identificação
 name_project: "VFI-Harmonization"
-tbcomment: "init0_f1ep7f2ep13_norm3000_new2_k8_bs24_alpha2.0-losspers-0.0002"
+tbcomment: "init0_f1ep7f2ep13_norm2000_k8_bs256_alpha2.0-losspers-0.0002"
 seed: 42
 
+model: v1
 load_model: ""
 
 # Hiperparâmetros
-lr: 0.0002
-batch_size: 8
+lr: 0.00005
+batch_size: 256
+patch_size: 32
 epochs: 100
 alpha: 2.0
 k_neighbors: 8
 
-bval_max: 3000
+bval_max: 2000
 
 # Pesos da Loss
 loss_weights:
@@ -22,7 +24,11 @@ loss_weights:
   res: 50.0
   wm: 2.0
 
+curriculum:
+  fase1: 15
+  fase2: 25
+
 # Caminhos (Cluster)
 base_path: "/ix1/tibrahim/rmm270/DATA/DWIs/studies/all_bias"
-csv_folder: "/ix1/tibrahim/rmm270/DATA/DWIs/studies/COORDS_VFI_MASKED_NEW"
+csv_folder: "/ix1/tibrahim/rmm270/DATA/DWIs/studies/COORDS_DL"
 checkpoint_dir: "checkpoints"

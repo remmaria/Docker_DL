@@ -147,66 +147,399 @@ def plot_q_space_selection(bvals, bvecs, target_idx, neighbor_indices, save_path
     plt.savefig(save_path)
     plt.close('all')
 
-
 def save_debug_documentation_png(
-    neighbors, target, output_final, res_predito,
-    step, save_dir, origin_b, target_b, alpha,
-    query_coord, neighbors_coords
+    neighbors,
+    target,
+    output_final,
+    res_predito,
+    step,
+    save_dir,
+    origin_b,
+    target_b,
+    alpha,
+    query_coord,
+    neighbors_coords,
 ):
-    """
-    Painel 2×3 mostrando: vizinho[0], vizinho com maior peso,
-    média ponderada, target real, predição final, resíduo aprendido.
-    """
+
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import torch
+
     slice_idx = target.shape[-1] // 2
-    B, K      = neighbors.shape[0], neighbors.shape[1]
+
+    B, K = neighbors.shape[0], neighbors.shape[1]
+
+    # =====================================================
+    # weighted average
+    # =====================================================
 
     with torch.no_grad():
-        target_v  = query_coord[:, 1:].float()
-        neigh_vs  = neighbors_coords[:, :, 1:].float()
-        sim       = torch.einsum('bi,bki->bk', target_v, neigh_vs)
-        weights   = torch.softmax(sim / 0.1, dim=1)
 
-        weights_vol      = weights.view(B, K, 1, 1, 1, 1)
-        media_ponderada_vol = torch.sum(neighbors.float() * weights_vol, dim=1)
+        target_v = query_coord[:, 1:].float()
 
-    n1          = neighbors[0, 0, 0, :, :, slice_idx].detach().cpu().float().numpy() * alpha
-    top_w_idx   = torch.argmax(weights[0]).item()
-    n_top       = neighbors[0, top_w_idx, 0, :, :, slice_idx].detach().cpu().float().numpy() * alpha
-    target_img  = target[0, 0, :, :, slice_idx].detach().cpu().float().numpy() * alpha
-    pred_img    = output_final[0, 0, :, :, slice_idx].detach().cpu().float().numpy() * alpha
-    res_img     = res_predito[0, 0, :, :, slice_idx].detach().cpu().float().numpy() * alpha
-    mean_img    = media_ponderada_vol[0, 0, :, :, slice_idx].detach().cpu().float().numpy() * alpha
+        neigh_vs = neighbors_coords[:, :, 1:].float()
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        sim = torch.einsum(
+            'bi,bki->bk',
+            target_v,
+            neigh_vs
+        )
+
+        weights = torch.softmax(
+            sim / 0.1,
+            dim=1
+        )
+
+        weights_vol = weights.view(
+            B, K, 1, 1, 1, 1
+        )
+
+        media_ponderada_vol = torch.sum(
+            neighbors.float() * weights_vol,
+            dim=1
+        )
+
+    # =====================================================
+    # dominant neighbor
+    # =====================================================
+
+    top_w_idx = torch.argmax(
+        weights[0]
+    ).item()
+
+    dominant_neighbor = (
+        neighbors[
+            0,
+            top_w_idx,
+            0,
+            :,
+            :,
+            slice_idx
+        ]
+        .detach()
+        .cpu()
+        .float()
+        .numpy()
+    ) * alpha
+
+    # =====================================================
+    # weighted mean
+    # =====================================================
+
+    mean_img = (
+        media_ponderada_vol[
+            0,
+            0,
+            :,
+            :,
+            slice_idx
+        ]
+        .detach()
+        .cpu()
+        .float()
+        .numpy()
+    ) * alpha
+
+    # =====================================================
+    # target
+    # =====================================================
+
+    target_img = (
+        target[
+            0,
+            0,
+            :,
+            :,
+            slice_idx
+        ]
+        .detach()
+        .cpu()
+        .float()
+        .numpy()
+    ) * alpha
+
+    # =====================================================
+    # prediction
+    # =====================================================
+
+    pred_img = (
+        output_final[
+            0,
+            0,
+            :,
+            :,
+            slice_idx
+        ]
+        .detach()
+        .cpu()
+        .float()
+        .numpy()
+    ) * alpha
+
+    # =====================================================
+    # learned residual
+    # =====================================================
+
+    residual_img = (
+        res_predito[
+            0,
+            0,
+            :,
+            :,
+            slice_idx
+        ]
+        .detach()
+        .cpu()
+        .float()
+        .numpy()
+    ) * alpha
+
+    # =====================================================
+    # errors
+    # =====================================================
+
+    diff_neighbor_target = (
+        dominant_neighbor - target_img
+    )
+
+    diff_mean_target = (
+        mean_img - target_img
+    )
+
+    diff_pred_target = (
+        pred_img - target_img
+    )
+
+    # ganho relativo REAL
+    # positivo = melhorou
+    # negativo = piorou
+
+    diff_improvement = (
+        np.abs(diff_mean_target)
+        - np.abs(diff_pred_target)
+    )
+
+    # =====================================================
+    # limits
+    # =====================================================
+
     vmax = 0.5
 
-    b_in  = origin_b[0].item() if torch.is_tensor(origin_b) else origin_b
-    b_out = target_b[0].item() if torch.is_tensor(target_b) else target_b
+    diff_neighbor_lim = (
+        np.max(np.abs(diff_neighbor_target))
+        + 1e-8
+    )
 
-    axes[0, 0].imshow(n1,       cmap='jet', vmin=0, vmax=vmax)
-    axes[0, 0].set_title(f"Vizinho Index 0 (b{int(b_in)})")
+    diff_mean_lim = (
+        np.max(np.abs(diff_mean_target))
+        + 1e-8
+    )
 
-    axes[0, 1].imshow(n_top,    cmap='jet', vmin=0, vmax=vmax)
-    axes[0, 1].set_title(f"Vizinho c/ Maior Peso (w={weights[0, top_w_idx]:.2f})")
+    diff_pred_lim = (
+        np.max(np.abs(diff_pred_target))
+        + 1e-8
+    )
 
-    axes[0, 2].imshow(mean_img, cmap='jet', vmin=0, vmax=vmax)
-    axes[0, 2].set_title("Média Ponderada (Input Real da Rede)")
+    improvement_lim = (
+        np.max(np.abs(diff_improvement))
+        + 1e-8
+    )
 
-    axes[1, 0].imshow(target_img, cmap='jet', vmin=0, vmax=vmax)
-    axes[1, 0].set_title(f"Target Real (b{int(b_out)})")
+    residual_lim = (
+        np.max(np.abs(residual_img))
+        + 1e-8
+    )
 
-    axes[1, 1].imshow(pred_img,   cmap='jet', vmin=0, vmax=vmax)
-    axes[1, 1].set_title("Predição Final (Média + Resíduo)")
+    # =====================================================
+    # plotting
+    # =====================================================
 
-    res_lim = np.max(np.abs(res_img)) + 1e-8
-    im = axes[1, 2].imshow(res_img, cmap='seismic', vmin=-res_lim, vmax=res_lim)
-    axes[1, 2].set_title("Resíduo Aprendido (Ajuste)")
-    fig.colorbar(im, ax=axes[1, 2])
+    fig, axes = plt.subplots(
+        2,
+        4,
+        figsize=(24, 12)
+    )
+
+    b_in = (
+        origin_b[0].item()
+        if torch.is_tensor(origin_b)
+        else origin_b
+    )
+
+    b_out = (
+        target_b[0].item()
+        if torch.is_tensor(target_b)
+        else target_b
+    )
+
+    # =====================================================
+    # ROW 1
+    # =====================================================
+
+    # -----------------------------------------------------
+    # dominant neighbor
+    # -----------------------------------------------------
+
+    axes[0, 0].imshow(
+        dominant_neighbor,
+        cmap='jet',
+        vmin=0,
+        vmax=vmax
+    )
+
+    axes[0, 0].set_title(
+        f"Vizinho Dominante\n"
+        f"(b{int(b_in)}) "
+        f"(w={weights[0, top_w_idx]:.2f})"
+    )
+
+    # -----------------------------------------------------
+    # weighted mean
+    # -----------------------------------------------------
+
+    axes[0, 1].imshow(
+        mean_img,
+        cmap='jet',
+        vmin=0,
+        vmax=vmax
+    )
+
+    axes[0, 1].set_title(
+        "Média Ponderada"
+    )
+
+    # -----------------------------------------------------
+    # prediction
+    # -----------------------------------------------------
+
+    axes[0, 2].imshow(
+        pred_img,
+        cmap='jet',
+        vmin=0,
+        vmax=vmax
+    )
+
+    axes[0, 2].set_title(
+        "Predição Final"
+    )
+
+    # -----------------------------------------------------
+    # target
+    # -----------------------------------------------------
+
+    axes[0, 3].imshow(
+        target_img,
+        cmap='jet',
+        vmin=0,
+        vmax=vmax
+    )
+
+    axes[0, 3].set_title(
+        f"Target Real\n(b{int(b_out)})"
+    )
+
+    # =====================================================
+    # ROW 2
+    # =====================================================
+
+    # -----------------------------------------------------
+    # neighbor error
+    # -----------------------------------------------------
+
+    im_neigh = axes[1, 0].imshow(
+        diff_neighbor_target,
+        cmap='seismic',
+        vmin=-diff_neighbor_lim,
+        vmax=diff_neighbor_lim
+    )
+
+    axes[1, 0].set_title(
+        "Erro Vizinho vs Target"
+    )
+
+    fig.colorbar(
+        im_neigh,
+        ax=axes[1, 0]
+    )
+
+    # -----------------------------------------------------
+    # mean error
+    # -----------------------------------------------------
+
+    im_mean = axes[1, 1].imshow(
+        diff_mean_target,
+        cmap='seismic',
+        vmin=-diff_mean_lim,
+        vmax=diff_mean_lim
+    )
+
+    axes[1, 1].set_title(
+        "Erro Média vs Target"
+    )
+
+    fig.colorbar(
+        im_mean,
+        ax=axes[1, 1]
+    )
+
+    # -----------------------------------------------------
+    # prediction error
+    # -----------------------------------------------------
+
+    im_pred = axes[1, 2].imshow(
+        diff_pred_target,
+        cmap='seismic',
+        vmin=-diff_pred_lim,
+        vmax=diff_pred_lim
+    )
+
+    axes[1, 2].set_title(
+        "Erro Predição vs Target"
+    )
+
+    fig.colorbar(
+        im_pred,
+        ax=axes[1, 2]
+    )
+
+    # -----------------------------------------------------
+    # improvement map
+    # -----------------------------------------------------
+
+    im_improve = axes[1, 3].imshow(
+        diff_improvement,
+        cmap='coolwarm',
+        vmin=-improvement_lim,
+        vmax=improvement_lim
+    )
+
+    axes[1, 3].set_title(
+        "Ganho Relativo do Modelo\n"
+        "|Erro Média| - |Erro Pred|"
+    )
+
+    fig.colorbar(
+        im_improve,
+        ax=axes[1, 3]
+    )
+
+    # =====================================================
 
     for ax in axes.ravel():
-        ax.axis('off')
+
+        if ax.has_data():
+            ax.axis('off')
+
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"doc_step_{step}.png"))
+
+    plt.savefig(
+        os.path.join(
+            save_dir,
+            f"doc_step_{step}.png"
+        )
+    )
+
     plt.close('all')
 
 
