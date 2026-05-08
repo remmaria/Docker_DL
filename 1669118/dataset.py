@@ -248,7 +248,7 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
         t0 = time.time()
 
         # mmap_mode='r': abre sem carregar tudo para RAM
-        dwi  = np.load(paths["dwi_npy"], mmap_mode="r")   # (D, X, Y, Z)
+        dwi  = np.load(paths["dwi_npy"])   # (D, X, Y, Z)
         mask = np.asarray(
             nib.load(paths["mask_path"]).dataobj, dtype=np.float32
         )

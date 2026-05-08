@@ -287,20 +287,19 @@ def train(dic_config):
     # --- DATALOADERS ---
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=2, pin_memory=True, prefetch_factor=1,
+        num_workers=0, pin_memory=True
     )
     val_loader_patch = DataLoader(
         val_ds_patch, batch_size=batch_size, shuffle=False,
-        num_workers=2, pin_memory=True, prefetch_factor=1,
+        num_workers=0, pin_memory=True
     )
 
     val_loader_fast = DataLoader(
         val_fast_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=2,
-        pin_memory=True,
-        prefetch_factor=1,
+        num_workers=0,
+        pin_memory=True
     )
 
 

@@ -30,4 +30,4 @@ export OMP_NUM_THREADS=8
 export MKL_NUM_THREADS=8
 
 # roda treino
-python train.py --job_id "$SLURM_JOB_ID"
+time python train.py --job_id "$SLURM_JOB_ID"
