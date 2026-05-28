@@ -5,8 +5,8 @@
 #SBATCH --gres=gpu:1 
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=16 # importante para dataloader
+#SBATCH --mem=32G
 #SBATCH --time=0-23:00:00  
 #SBATCH --account=tibrahim
 #SBATCH --error=job.%J.err

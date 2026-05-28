@@ -3,6 +3,7 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import pandas as pd
+import os
 
 from scipy.ndimage import binary_erosion
 
@@ -13,7 +14,10 @@ from scipy.ndimage import binary_erosion
 
 ROOT = Path("/ix1/tibrahim/rmm270/DATA/DWIs/studies/all_bias")
 
-OUT_CSV = "/ix1/tibrahim/rmm270/DATA/DWIs/studies/COORDS_DL/master.csv"
+OUT_FOLDER = "/ix1/tibrahim/rmm270/DATA/DWIs/studies/COORDS_DL_new/"
+os.makedirs(OUT_FOLDER, exist_ok=True)
+
+OUT_CSV=f"{OUT_FOLDER}/master.csv"
 
 PATCH_SIZE = 32
 STRIDE = 16
@@ -242,7 +246,7 @@ for subj_dir in sorted(ROOT.iterdir()):
 
                     rows.append({
 
-                        "subject": subject,
+                        "SessionID": subject,
 
                         "dwi_path": str(dwi),
 
@@ -262,11 +266,18 @@ for subj_dir in sorted(ROOT.iterdir()):
 
                         "n_volumes": int(ndwi),
 
+                        # FIX: shape salvo é o da máscara erodida (usada para
+                        # calcular os bounds dos patches), não do DWI original.
+                        # O dataset.py deve usar esses valores para validar.
                         "shape_x": int(shape[0]),
 
                         "shape_y": int(shape[1]),
 
                         "shape_z": int(shape[2]),
+
+                        # FIX: registra o número de iterações de erosão usado.
+                        # O dataset.py deve usar o mesmo valor (MASK_EROSION_ITERS).
+                        "mask_erosion_iters": EROSION_ITERS,
 
                     })
 
@@ -304,5 +315,5 @@ print("\n==============================")
 print(f"✅ Subjects OK     : {subjects_ok}")
 print(f"❌ Subjects Failed : {subjects_failed}")
 print(f"🧠 Total patches   : {len(df)}")
-print(f"👤 Total subjects  : {df['subject'].nunique()}")
+print(f"👤 Total subjects  : {df['SessionID'].nunique()}")
 print("==============================")

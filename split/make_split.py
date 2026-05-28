@@ -20,7 +20,7 @@ python make_splits.py \
 O CSV master deve ter pelo menos as colunas:
     subject, dwi_path, center_x, center_y, center_z, protocol
 
-A coluna 'subject' deve conter o nome da pasta no formato
+A coluna 'SessionID' deve conter o nome da pasta no formato
     YYYYMMDDHHMMSS_XXXXXX-descricao
 onde os 8 primeiros caracteres (YYYYMMDD) são a data do scan.
 """
@@ -78,7 +78,7 @@ def filter_small_protocols(df: pd.DataFrame, min_subjects: int = 10) -> pd.DataF
     Imprime um relatório dos protocolos descartados.
     """
     subjects_per_protocol = (
-        df.groupby("protocol")["subject"]
+        df.groupby("protocol")["SessionID"]
         .nunique()
         .rename("n_subjects")
     )
@@ -102,21 +102,32 @@ def assign_strata(row: pd.Series) -> str:
 
 def load_outliers(outliers_txt: str) -> set[str]:
     """
-    Carrega subjects outliers a partir de um TXT/CSV com coluna SessionID.
+    Carrega SessionIDs de um TXT/CSV.
+    Aceita:
+        - apenas SessionID
+        - SessionID + Reason
+        - separados por TAB ou múltiplos espaços
     """
-    df_out = pd.read_csv(outliers_txt)
 
-    if "SessionID" not in df_out.columns:
-        raise ValueError(
-            f"O arquivo de outliers precisa conter a coluna 'SessionID'. "
-            f"Colunas encontradas: {list(df_out.columns)}"
-        )
+    df_out = pd.read_csv(
+        outliers_txt,
+        sep=r"\s+|\t+",
+        engine="python",
+        usecols=[0],
+        header=0,
+    )
 
-    outliers = set(df_out["SessionID"].astype(str).str.strip())
+    df_out.columns = ["SessionID"]
+
+    outliers = set(
+        df_out["SessionID"]
+        .astype(str)
+        .str.strip()
+    )
 
     print(f"⚠️  Outliers carregados: {len(outliers)}")
-    return outliers
-    
+
+    return outliers    
 # ──────────────────────────────────────────────────────────────────────────────
 # 2. SPLIT ESTRATIFICADO POR SUBJECT (não por patch)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -135,8 +146,8 @@ def stratified_subject_split(
     """
     # Uma linha por sujeito, mantendo o estrato
     subjects = (
-        df[["subject", "strata"]]
-        .drop_duplicates(subset="subject")
+        df[["SessionID", "strata"]]
+        .drop_duplicates(subset="SessionID")
         .reset_index(drop=True)
     )
 
@@ -176,13 +187,13 @@ def stratified_subject_split(
     train_subj = pd.concat([train_subj, subjects_small], ignore_index=True)
 
     # ── Expande de volta para os patches ─────────────────────────────────────
-    train_ids = set(train_subj["subject"])
-    val_ids   = set(val_subj["subject"])
-    test_ids  = set(test_subj["subject"])
+    train_ids = set(train_subj["SessionID"])
+    val_ids   = set(val_subj["SessionID"])
+    test_ids  = set(test_subj["SessionID"])
 
-    df_train = df[df["subject"].isin(train_ids)].copy()
-    df_val   = df[df["subject"].isin(val_ids)].copy()
-    df_test  = df[df["subject"].isin(test_ids)].copy()
+    df_train = df[df["SessionID"].isin(train_ids)].copy()
+    df_val   = df[df["SessionID"].isin(val_ids)].copy()
+    df_test  = df[df["SessionID"].isin(test_ids)].copy()
 
     return df_train, df_val, df_test
 
@@ -204,7 +215,7 @@ def print_report(
 
     # Contagem de sujeitos únicos por split e estrato
     def count_subjects(d: pd.DataFrame) -> pd.Series:
-        return d.groupby("strata")["subject"].nunique()
+        return d.groupby("strata")["SessionID"].nunique()
 
     all_strata = sorted(df["strata"].unique())
     counts = {
@@ -230,9 +241,9 @@ def print_report(
           f"Test:{len(df_test):>4}")
 
     # Verificação de leakage
-    train_ids = set(df_train["subject"])
-    val_ids   = set(df_val["subject"])
-    test_ids  = set(df_test["subject"])
+    train_ids = set(df_train["SessionID"])
+    val_ids   = set(df_val["SessionID"])
+    test_ids  = set(df_test["SessionID"])
     leaks = (train_ids & val_ids) | (train_ids & test_ids) | (val_ids & test_ids)
     if leaks:
         print(f"\n⚠️  LEAKAGE DETECTADO: {len(leaks)} sujeito(s) em múltiplos splits!")
@@ -244,7 +255,7 @@ def print_report(
     # Distribuição de eras
     print("\nDistribuição de coil_era por split:")
     for name, d in [("Train", df_train), ("Val", df_val), ("Test", df_test)]:
-        era_counts = d.drop_duplicates("subject")["coil_era"].value_counts().to_dict()
+        era_counts = d.drop_duplicates("SessionID")["coil_era"].value_counts().to_dict()
         print(f"  {name:5s}: {era_counts}")
 
     print("=" * 72 + "\n")
@@ -294,18 +305,30 @@ def main():
     if args.outliers_txt is not None:
         outliers = load_outliers(args.outliers_txt)
 
-        n_before = df["subject"].nunique()
+        n_before = df["SessionID"].nunique()
 
-        df = df[~df["subject"].astype(str).isin(outliers)].copy()
+        # salva antes de remover
+        removed_ids = sorted(
+            set(df["SessionID"].astype(str)) & outliers
+        )
 
-        n_after = df["subject"].nunique()
+        df = df[~df["SessionID"].astype(str).isin(outliers)].copy()
+
+        n_after = df["SessionID"].nunique()
 
         print(
             f"⚠️  Subjects removidos por outlier: {n_before - n_after}",
             flush=True,
         )
 
-    required_cols = {"subject", "dwi_path", "center_x", "center_y", "center_z", "protocol"}
+        if removed_ids:
+            print("\nSubjects descartados:")
+            for sid in removed_ids:
+                print(f"  - {sid}")
+        else:
+            print("\nNenhum SessionID do arquivo de outliers foi encontrado no dataset.")
+
+    required_cols = {"SessionID", "dwi_path", "center_x", "center_y", "center_z", "protocol"}
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"Colunas ausentes no CSV: {missing}")
@@ -316,13 +339,13 @@ def main():
                         "Reduza --min_subjects_per_protocol.")
 
     # ── Feature engineering ────────────────────────────────────────────────────
-    df["coil_era"] = df["subject"].apply(assign_coil_era)
+    df["coil_era"] = df["SessionID"].apply(assign_coil_era)
     df["strata"]   = df.apply(assign_strata, axis=1)
 
-    print(f"Sujeitos únicos  : {df['subject'].nunique()}", flush=True)
+    print(f"Sujeitos únicos  : {df['SessionID'].nunique()}", flush=True)
     print(f"Patches totais   : {len(df)}", flush=True)
     print(f"Estratos únicos  : {df['strata'].nunique()}", flush=True)
-    print(f"Distribuição era : {df.drop_duplicates('subject')['coil_era'].value_counts().to_dict()}", flush=True)
+    print(f"Distribuição era : {df.drop_duplicates('SessionID')['coil_era'].value_counts().to_dict()}", flush=True)
 
     # ── Split ──────────────────────────────────────────────────────────────────
     df_train, df_val, df_test = stratified_subject_split(
@@ -340,7 +363,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cols_to_save = [
-        "subject", "dwi_path", "center_x", "center_y", "center_z",
+        "SessionID", "dwi_path", "center_x", "center_y", "center_z",
         "protocol", "coil_era", "strata",
     ]
 

@@ -4,11 +4,11 @@ tbcomment: "init0_f1ep7f2ep13_norm2000_k8_bs256_alpha2.0-losspers-0.00005"
 seed: 42
 
 load_model: ""
-model_source: "v2"
+model_source: "v1"
 
 # Hiperparâmetros
-lr: 0.0001
-batch_size: 32
+lr: 0.00005
+batch_size: 256
 patch_size: 32
 epochs: 100
 alpha: 2.0
@@ -30,5 +30,5 @@ curriculum:
 
 # Caminhos (Cluster)
 base_path: "/ix1/tibrahim/rmm270/DATA/DWIs/studies/all_bias"
-csv_folder: "/ix1/tibrahim/rmm270/DATA/DWIs/studies/COORDS_DL_new"
+csv_folder: "/ix1/tibrahim/rmm270/DATA/DWIs/studies/COORDS_DL"
 checkpoint_dir: "checkpoints"

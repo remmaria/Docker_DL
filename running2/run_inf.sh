@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=dmri_dl
+#SBATCH --job-name=inf
 #SBATCH --cluster=gpu
 #SBATCH --partition=l40s
 #SBATCH --gres=gpu:1 
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=1 # importante para dataloader
 #SBATCH --mem=64G
 #SBATCH --time=0-23:00:00  
 #SBATCH --account=tibrahim
@@ -30,4 +30,4 @@ export OMP_NUM_THREADS=8
 export MKL_NUM_THREADS=8
 
 # roda treino
-python train.py --job_id "$SLURM_JOB_ID"
+python inference.py --job_id "$SLURM_JOB_ID"

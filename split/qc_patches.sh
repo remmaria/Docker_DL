@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ds_split
+#SBATCH --job-name=qc_patches
 #SBATCH --cluster=htc
 #SBATCH --partition=preempt
 #SBATCH --nodes=1
@@ -16,11 +16,4 @@ module load anaconda3/2025.7.0-2-python_3.11
 
 source /ix1/tibrahim/rmm270/UTILITIES/env_container/bin/activate
 
-python make_split.py \
-    --master_csv /ix1/tibrahim/rmm270/DATA/DWIs/studies/COORDS_DL_new/master.csv \
-    --out_dir /ix1/tibrahim/rmm270/DATA/DWIs/studies/COORDS_DL_new \
-    --min_subjects_per_protocol 10 \
-    --outliers_txt outliers.txt \
-    --val_size 0.15 \
-    --test_size 0.15 \
-    --seed 42
+python qc_patches.py

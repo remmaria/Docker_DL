@@ -285,20 +285,20 @@ def train(dic_config):
     # --- DATALOADERS ---
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=12, pin_memory=True, prefetch_factor=4,
+        num_workers=4, pin_memory=True, prefetch_factor=2,
     )
     val_loader_patch = DataLoader(
         val_ds_patch, batch_size=batch_size, shuffle=False,
-        num_workers=12, pin_memory=True, prefetch_factor=4,
+        num_workers=4, pin_memory=True, prefetch_factor=2,
     )
 
     val_loader_fast = DataLoader(
         val_fast_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=12,
+        num_workers=4,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=2,
     )
 
     print(f"📊 Treino: {len(train_ds)} patches | Val patch: {len(val_ds_patch)} | Val Fast patch: {len(val_fast_ds)}", flush=True)
@@ -342,10 +342,6 @@ def train(dic_config):
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         print(f"✅ Pesos carregados de {checkpoint_path}. LR={lr}", flush=True)
 
-
-    fixed_same_shell = None
-    fixed_cross_shell = None
-
     # --- LOOP PRINCIPAL ---
     global_step   = 0
     best_val_score = float('inf')
@@ -374,42 +370,6 @@ def train(dic_config):
         
         if not pesos_manuais:
             criterion.set_phase_weights(fase)
-
-        # Se ainda não temos o Same-Shell, ou se entramos na Fase 2 e não temos o Cross-Shell
-        if fixed_same_shell is None or (fase >= 2 and fixed_cross_shell is None):
-            print("🔄 Inspecionando batch para isolar referências do debug visual...", flush=True)
-            
-            for v_batch in val_loader_fast:
-                is_cross_tensor = v_batch["is_cross_shell"]
-                
-                for idx_in_batch in range(len(is_cross_tensor)):
-                    is_cross = bool(is_cross_tensor[idx_in_batch].item())
-                    
-                    # Captura o Same-Shell se ainda não tiver
-                    if not is_cross and fixed_same_shell is None:
-                        fixed_same_shell = {}
-                        for k, v in v_batch.items():
-                            fixed_same_shell[k] = v[idx_in_batch:idx_in_batch+1] if isinstance(v, torch.Tensor) else ([v[idx_in_batch]] if isinstance(v, list) else v)
-                        print("  🎯 [Sucesso] Patch de referência Same-Shell isolado!", flush=True)
-                        
-                    # Captura o Cross-Shell apenas se estivermos na fase correta e ainda não tiver
-                    elif is_cross and fixed_cross_shell is None and fase >= 2:
-                        fixed_cross_shell = {}
-                        for k, v in v_batch.items():
-                            fixed_cross_shell[k] = v[idx_in_batch:idx_in_batch+1] if isinstance(v, torch.Tensor) else ([v[idx_in_batch]] if isinstance(v, list) else v)
-                        print("  🎯 [Sucesso] Patch de referência Cross-Shell real isolado!", flush=True)
-                
-                # Critério de parada do DataLoader rápido
-                if fixed_same_shell is not None and (fase == 1 or fixed_cross_shell is not None):
-                    break
-
-        if fixed_same_shell is not None:
-            # Sua função de plot para o Same-Shell aqui...
-            pass
-            
-        if fixed_cross_shell is not None and fase >= 2:
-            # Sua função de plot para o Cross-Shell aqui...
-            pass
 
         print(f"🔥 Epoch {epoch+1}/{epochs} | Fase {fase}", flush=True)
         model.train()
@@ -491,8 +451,6 @@ def train(dic_config):
             target_b = batch["target_bval"]
 
             wandb.log({
-                "train/model_res_scale": model.res_scale.item(),
-                "train/softplus_res_scale": torch.nn.functional.softplus(model.res_scale).item(),
                 "train/total_loss": loss.item(),
                 "train/l1_loss":    loss_dict["l1"].item(),
                 "train/ssim_loss":  loss_dict["ssim"].item(),
@@ -511,7 +469,7 @@ def train(dic_config):
             })
 
             # ---- VALIDAÇÃO POR PATCH ----
-            if global_step % 200 == 0 and global_step != 0:
+            if global_step % 50 == 0 and global_step != 0:
                 print(f"VALIDAÇÃO {global_step}")
 
                 # val_logs agora contém chaves como 'val/rmse_cross_shell', 'val/loss', etc.
@@ -530,69 +488,41 @@ def train(dic_config):
 
             # ---- DEBUG VISUAL (a cada 50 steps) ----
             if global_step % 50 == 0:
-                print(f"DEBUG VISUAL FIXO {global_step}")
+                print(f"DEBUG VISUAL {global_step}")
                 model.eval()
                 with torch.no_grad():
-                    # Loop simples para gerar o debug dos dois cenários fixos
-                    for nome_fase, ref_batch in [("same_shell", fixed_same_shell), ("cross_shell", fixed_cross_shell)]:
-                        if ref_batch is None: 
-                            continue
-                        
-                        # Envia dados do patch fixo atual para o device
-                        neighbors = ref_batch["source_neighbors"].to(device)
-                        query     = ref_batch["target_query"].to(device)
-                        n_coords  = ref_batch["neighbors_coords"].to(device)
-                        target    = ref_batch["target_real"].to(device)
-                        mask      = ref_batch["mask"].to(device)
-                        
-                        # Garante que os b-values documentados sejam os deste patch fixo
-                        origin_b_fix = ref_batch["origin_bval"]
-                        target_b_fix = ref_batch["target_bval"]
-                        
-                        # Forward
-                        output_final, res_predito, media_vizinhos = model(neighbors, query, n_coords)
-                        
-                        subj_id          = str(ref_batch["id"][0])
-                        target_idx       = ref_batch["target_idx"][0].item()
-                        neighbor_indices = ref_batch["neighbor_indices"][0].cpu().numpy()
-                        
-                        # =================================================================
-                        # TUDO DO PLOT ENTRA AQUI (DENTRO DO LOOP FOR)
-                        # =================================================================
-                        bvals_plot = np.loadtxt(f"{base_path}/{subj_id}/bgpdwis_PA_geomcorr.bval")
-                        bvecs_plot = np.loadtxt(f"{base_path}/{subj_id}/bgpdwis_PA_geomcorr.bvec")
+                    subj_id         = batch["id"][0]
+                    target_idx      = batch["target_idx"][0].item()
+                    neighbor_indices = batch["neighbor_indices"][0].cpu().numpy()
 
-                        if bvecs_plot.shape[0] == 3 and bvecs_plot.shape[1] != 3:
-                            bvecs_plot = bvecs_plot.T
+                    bvals_plot  = np.loadtxt(f"{base_path}/{subj_id}/bgpdwis_PA_geomcorr.bval")
+                    bvecs_plot  = np.loadtxt(f"{base_path}/{subj_id}/bgpdwis_PA_geomcorr.bvec")
 
-                        folder_debug = f"debug_images/{dic_config['job_id']}"
-                        os.makedirs(folder_debug, exist_ok=True)
+                    if bvecs_plot.shape[0] == 3 and bvecs_plot.shape[1] != 3:
+                        bvecs_plot = bvecs_plot.T
 
-                        # Salva o painel principal — passa media_vizinhos para que o
-                        # plot use exatamente a mesma média ponderada do modelo,
-                        # evitando discrepância de temperatura/hiperparâmetros.
-                        save_debug_documentation_png(
-                            neighbors, target, output_final, res_predito,
-                            global_step, folder_debug, origin_b_fix, target_b_fix,
-                            alpha, query, n_coords,
-                            media_ponderada=media_vizinhos,
-                        )
+                    folder_debug = f"debug_images/{dic_config['job_id']}"
+                    os.makedirs(folder_debug, exist_ok=True)
 
-                        # Adicionado '_nome_fase' nos arquivos abaixo para não haver sobreposição
-                        q_path = os.path.join(folder_debug, f"qplot_step_{global_step}_{nome_fase}.png")
-                        plot_q_space_selection_antipodal(
-                            bvals_plot, bvecs_plot, target_idx, neighbor_indices, q_path
-                        )
+                    save_debug_documentation_png(
+                        neighbors, target, output_final, res_predito,
+                        global_step, folder_debug, origin_b, target_b,
+                        alpha, query, n_coords,
+                    )
 
-                        p_path = os.path.join(folder_debug, f"qplot_polar_step_{global_step}_{nome_fase}.png")
-                        plot_q_space_polar(bvecs_plot, target_idx, neighbor_indices, p_path)
+                    q_path = os.path.join(folder_debug, f"qplot_step_{global_step}.png")
+                    plot_q_space_selection_antipodal(
+                        bvals_plot, bvecs_plot, target_idx, neighbor_indices, q_path
+                    )
 
-                        print(f"📸 Debug visual salvo — {nome_fase} | sujeito {subj_id} | step {global_step}", flush=True)
+                    p_path = os.path.join(folder_debug, f"qplot_polar_step_{global_step}.png")
+                    plot_q_space_polar(bvecs_plot, target_idx, neighbor_indices, p_path)
+
+                    print(f"📸 Debug visual salvo — sujeito {subj_id} | step {global_step}", flush=True)
 
                 model.train()
 
             global_step += 1
-
 
         # ---- FINAL DA EPOCH ----
         print(f"🧪 Finalizando Epoch {epoch+1}...", flush=True)

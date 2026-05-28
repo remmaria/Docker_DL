@@ -23,10 +23,6 @@ import pandas as pd
 import torch
 from collections import OrderedDict
 from torch.utils.data import Dataset
-from scipy.ndimage import binary_erosion
-
-# FIX: número de iterações de erosão deve ser idêntico ao make_patches.py
-MASK_EROSION_ITERS = 2
 
 # ---------------------------------------------------------------------------
 # NUMA affinity helpers
@@ -94,11 +90,11 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
 
     Estrutura esperada por sujeito
     ------------------------------
-    <npy_dir>/<session_id>/<dwi_name>.npy   (D, X, Y, Z) float32
-    <npy_dir>/<session_id>/<dwi_name>.bval
-    <npy_dir>/<session_id>/<dwi_name>.bvec
-    <npy_dir>/<session_id>/<dwi_name>_mask3d.nii.gz      (máscara binária)
-    <npy_dir>/<session_id>/<dwi_name>_wm_mask.nii.gz     (máscara WM)
+    <npy_dir>/<subject_id>/<dwi_name>.npy   (D, X, Y, Z) float32
+    <npy_dir>/<subject_id>/<dwi_name>.bval
+    <npy_dir>/<subject_id>/<dwi_name>.bvec
+    <npy_dir>/<subject_id>/<dwi_name>_mask3d.nii.gz      (máscara binária)
+    <npy_dir>/<subject_id>/<dwi_name>_wm_mask.nii.gz     (máscara WM)
 
     Caso o CSV já tenha colunas com os caminhos completos, passe npy_dir=None
     e dwi_name=None; nesse caso inclua as colunas:
@@ -120,7 +116,6 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
         max_cache_size=300,
     ):
         self.df      = pd.read_csv(coords_csv)
-        print(self.df.columns)
         self.records = self.df.to_dict("records")
 
         self.npy_dir        = npy_dir
@@ -178,10 +173,10 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
         Suporta tanto caminhos explícitos no CSV quanto derivados de npy_dir.
         """
         if self.npy_dir is not None:
-            session_id = str(row["SessionID"])
-            base = os.path.join(self.npy_dir, session_id, self.dwi_name)
+            subject_id = str(row["subject"])
+            base = os.path.join(self.npy_dir, subject_id, self.dwi_name)
             return {
-                "session_id":  session_id,
+                "subject_id":  subject_id,
                 "dwi_npy":     f"{base}.npy",
                 "bval_path":   f"{base}.bval",
                 "bvec_path":   f"{base}.bvec",
@@ -191,7 +186,7 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
         else:
             # Caminhos completos já estão no CSV
             return {
-                "session_id":   str(row["subject"]),
+                "subject_id":   str(row["subject"]),
                 "dwi_npy":      row["dwi_npy"],
                 "bval_path":    row["bval_path"],
                 "bvec_path":    row["bvec_path"],
@@ -251,21 +246,16 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
 
         # mmap_mode='r': abre sem carregar tudo para RAM
         dwi  = np.load(paths["dwi_npy"], mmap_mode="r")   # (D, X, Y, Z)
-
-        # FIX: binariza explicitamente (> 0.5) para evitar valores float
-        # intermediários que fazem patch_mask == 1 retornar array vazio.
-        # FIX: aplica erosão idêntica ao make_patches.py (MASK_EROSION_ITERS=2)
-        # para garantir que a máscara em runtime seja a mesma usada para
-        # selecionar os patches no CSV.
-        mask_raw = nib.load(paths["mask_path"]).get_fdata() > 0
-        mask_eroded = binary_erosion(mask_raw, iterations=MASK_EROSION_ITERS)
-        mask = mask_eroded.astype(np.float32)
+        mask = np.asarray(
+            nib.load(paths["mask_path"]).dataobj, dtype=np.float32
+        )
 
         # WM mask é opcional — retorna zeros se não existir
-        # FIX: também binariza a WM mask pelo mesmo motivo
         wm_path = paths["wm_mask_path"]
         if wm_path and os.path.exists(wm_path):
-            wm_mask = (nib.load(wm_path).get_fdata() > 0).astype(np.float32)
+            wm_mask = np.asarray(
+                nib.load(wm_path).dataobj, dtype=np.float32
+            )
         else:
             wm_mask = np.zeros_like(mask)
 
@@ -284,7 +274,7 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
 
         if self._should_log_once():
             self._log(
-                f"[CACHE MISS VOLUME] {paths['session_id']}: "
+                f"[CACHE MISS VOLUME] {paths['subject_id']}: "
                 f"{time.time() - t0:.2f}s"
             )
 
@@ -301,7 +291,7 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
         t0  = time.time()
         row = self.records[idx]
         paths = self._paths_for(row)
-        session_id = paths["session_id"]
+        subject_id = paths["subject_id"]
         self._log(f"[TIMER] metadata: {time.time()-t0:.4f}s")
 
         # ---- caches -----------------------------------------------------
@@ -325,18 +315,6 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
         xs = max(0, cx - hp);  xe = min(sx, cx + hp)
         ys = max(0, cy - hp);  ye = min(sy, cy + hp)
         zs = max(0, cz - hp);  ze = min(sz, cz + hp)
-
-        # FIX: valida que o patch tem o tamanho esperado.
-        # Se o .npy tiver shape diferente do .nii usado no make_patches.py,
-        # os bounds podem ser truncados e o patch fica menor que patch_size,
-        # causando erros silenciosos no batch (tensores de shapes diferentes).
-        expected = self.patch_size
-        if (xe - xs) != expected or (ye - ys) != expected or (ze - zs) != expected:
-            raise ValueError(
-                f"Patch com shape errado para session={session_id} idx={idx}: "
-                f"got ({xe-xs},{ye-ys},{ze-zs}), esperado ({expected},{expected},{expected}). "
-                f"Volume shape={vol['shape']}, center=({cx},{cy},{cz})"
-            )
         self._log(f"[TIMER] patch coords: {time.time()-t0:.4f}s")
 
         # ---- máscaras -------------------------------------------------------
@@ -538,25 +516,38 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
 
         b0_vols = patch[[idx_map[i] for i in selected_b0]]     # (n_b0, px, py, pz)
         mean_b0 = np.mean(b0_vols, axis=0, keepdims=True)   # (1, px, py, pz)
-        # FIX: removido "mean_b0 * patch_mask" aqui — era redundante com o
-        # filtro patch_mask == 1 abaixo, e causava distorção quando a máscara
-        # tinha valores float (ex: 0.7 * sinal ao invés de sinal puro).
+        mean_b0 = mean_b0 * patch_mask
 
         # ---- stack de vizinhos ----------------------------------------------
         t0 = time.time()
         # Máscara binária do patch: (1, px, py, pz) — usada para zerar background
         patch_mask_bin = (patch_mask > 0.5)[np.newaxis]          # (1, px, py, pz)
 
-        # FIX: guard — se a máscara estiver toda zero, o patch não deveria
-        # estar no CSV. Lança erro explícito em vez de crash obscuro no numpy.
-        if patch_mask_bin.sum() == 0:
-            raise ValueError(
-                f"Patch sem voxels na máscara para session={session_id} idx={idx}. "
-                f"Verifique se MASK_EROSION_ITERS={MASK_EROSION_ITERS} está igual ao make_patches.py."
-            )
-
         # Valores de b0 APENAS onde a máscara é 1 (dentro do cérebro)
-        b0_in_mask = mean_b0[:, patch_mask_bin[0]]   # FIX: usa patch_mask_bin (bool) em vez de patch_mask == 1
+        b0_in_mask = mean_b0[:, patch_mask == 1] 
+
+        # Valores de b0 onde a máscara é 0 (fundo/ar)
+        b0_out_mask = mean_b0[:, patch_mask == 0]
+
+        # 1. Cria uma máscara booleana (True para negativos, False para o resto)
+        negativos_mask = b0_in_mask < 0
+
+        # 2. Conta quantos True existem
+        qtd_negativos = negativos_mask.sum()
+
+        # 3. (Opcional) Calcula a porcentagem para ver a gravidade
+        total_voxels_mask = b0_in_mask.size
+        porcentagem = (qtd_negativos / total_voxels_mask) * 100
+
+        #if porcentagem > 1 or b0_in_mask.min() < -80:
+        if b0_in_mask.min() < 0:
+            print(f"DEBUG IN-MASK {subject_id}: min={b0_in_mask.min()}, max={b0_in_mask.max()}, mean={b0_in_mask.mean()}")
+            print(f"Voxels negativos dentro da mask: {qtd_negativos} ({porcentagem:.3f}%)")
+      
+        #if b0_in_mask.size > 0:
+            #print(f"DEBUG IN-MASK: min={b0_in_mask.min()}, max={b0_in_mask.max()}, mean={b0_in_mask.mean()}")
+        #if b0_out_mask.size > 0:
+            #print(f"DEBUG OUT-MASK (fundo): min={b0_out_mask.min()}, max={b0_out_mask.max()}")
 
         mean_b0 = np.clip(mean_b0, a_min=0, a_max=None)
         denom   = mean_b0 * self.alpha
@@ -582,7 +573,6 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
         t0 = time.time()
         target_norm = np.divide(patch[idx_map[int(target_idx)]][np.newaxis], denom, out=np.zeros_like(patch[idx_map[int(target_idx)]][np.newaxis]), where=denom > 0)
         #print("target_norm: ",target_norm.min(),target_norm.max())            
-        target_norm = target_norm * patch_mask_bin
         self._log(f"[TIMER] target normalization: {time.time()-t0:.4f}s")
 
         # ---- coordenadas dos vizinhos ----------------------------------------
@@ -623,7 +613,7 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
 
             "is_cross_shell": bool(abs(input_shell - target_bval) > 150),
 
-            "id":          session_id,
+            "id":          subject_id,
             "origin_bval": float(input_shell),
             "target_bval": float(target_bval),
             "target_idx": torch.tensor(
