@@ -41,11 +41,10 @@ class QSpaceAttentionNetwork_v2(nn.Module):
         super(QSpaceAttentionNetwork_v2, self).__init__()
         self.K = k_neighbors
 
-        # FIX 1: res_scale inicializado perto de -inf para que
-        # softplus(res_scale) ≈ 0 no começo do treino.
-        # O modelo parte de output = media_ponderada + ~0, idêntico ao baseline.
-        # Conforme o gradiente flui, res_scale cresce organicamente.
-        self.res_scale = nn.Parameter(torch.tensor(-10.0))
+        # res_scale: controla a magnitude do resíduo aprendido.
+        # Inicializado em -1.5 → softplus(-1.5) ≈ 0.20
+        # Congelado durante o warmup (ver freeze_res_scale / unfreeze_res_scale)
+        self.res_scale = nn.Parameter(torch.tensor(-1.5))
 
         # 1. ENCODER — extrai features espaciais de cada vizinho
         # Três convoluções dilatadas em cascata: receptive field efetivo de
@@ -97,6 +96,15 @@ class QSpaceAttentionNetwork_v2(nn.Module):
         self._init_weights()
 
     # ------------------------------------------------------------------
+    def freeze_res_scale(self):
+        """Congela res_scale durante o warmup — só decoder/encoder treinam."""
+        self.res_scale.requires_grad_(False)
+
+    def unfreeze_res_scale(self):
+        """Libera res_scale após o decoder aprender direções razoáveis."""
+        self.res_scale.requires_grad_(True)
+
+    # ------------------------------------------------------------------
     def _init_weights(self):
         # Passo 1: inicialização padrão para todas as camadas
         for m in self.modules():
@@ -142,15 +150,38 @@ class QSpaceAttentionNetwork_v2(nn.Module):
 
         # ================================================================
         # PASSO 1: MÉDIA PONDERADA FÍSICA (baseline)
-        # Score = similaridade angular - penalidade de shell
         # ================================================================
+        # Temperatura adaptativa por fase:
+        #   Fase 1 — vizinhos já são os K mais próximos (dataset concentrado)
+        #            temperatura baixa (0.1) concentra ainda mais o peso no
+        #            mais próximo → preserva estrutura direcional fina
+        #   Fases 2/3 — vizinhos são metade próximos + metade diversos
+        #            temperatura maior (0.3) distribui peso entre os dois grupos
+        #            para que o decoder receba contexto T2 real dos diversos
+        #
+        # O canal delta_b já captura a diferença de shell para o decoder;
+        # aqui usamos b_diff só para penalizar vizinhos de shells erradas
+        # quando houver mistura (fases 2/3).
         dot_product = torch.abs(
             torch.sum(neigh_vs * target_v.unsqueeze(1), dim=-1)
         )  # [B, K]
 
         b_diff = torch.abs(neigh_bs - target_b)  # [B, K]
 
-        combined_scores = (dot_product / 0.3) - (b_diff * 1.0)
+        # delta_b médio: 0 na fase 1 (same-shell), >0 nas fases 2/3
+        # Usamos isso para adaptar temperatura e penalidade dinamicamente,
+        # sem precisar passar a fase explicitamente para o forward.
+        mean_b_diff = b_diff.mean(dim=1, keepdim=True)  # [B, 1]
+        is_cross = (mean_b_diff > 0.05).float()          # 1 se cross-shell, 0 se same
+
+        # temperatura: 0.1 (same-shell) → 0.3 (cross-shell)
+        temperature = 0.1 + 0.2 * is_cross   # [B, 1]
+
+        # penalidade b_diff: ativa só em cross-shell para não penalizar
+        # vizinhos do mesmo shell que têm b_diff ~ 0 por normalização
+        b_penalty = 2.0 * is_cross * b_diff   # [B, K]
+
+        combined_scores = (dot_product / temperature) - b_penalty
         weights = F.softmax(combined_scores, dim=1)             # [B, K]
         weights_vol = weights.view(B, K, 1, 1, 1, 1)
 
@@ -229,7 +260,7 @@ class QSpaceAttentionNetwork_v2(nn.Module):
         # → output_final ≈ media_ponderada ✓
         # ================================================================
         residuo   = self.decoder(fused_with_db)          # [B, 1, H, W, D]
-        res_scale = F.softplus(self.res_scale)            # escalar ≥ 0, começa em ~0
+        res_scale = F.softplus(self.res_scale)            # escalar ≥ 0
 
         output_final = media_ponderada + res_scale * residuo
 

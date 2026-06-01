@@ -6,7 +6,8 @@ import nibabel as nib
 def convert_subject(folder_path):
     # Dicionário de arquivos e seus tipos ideais
     targets = {
-        "bgpdwis_PA_geomcorr.nii": np.float32,
+        #"bgpdwis_PA_geomcorr.nii": np.float32,
+        "bgpdwis_PA_geomcorr_mask3d.nii.gz": np.uint8,
     }
     
     print(f"📂 Processando: {os.path.basename(folder_path)}")
@@ -26,7 +27,8 @@ def convert_subject(folder_path):
                     # ========================================================
                     # CORREÇÃO AQUI: Transpõe de (X, Y, Z, D) para (D, X, Y, Z)
                     # ========================================================
-                    data = np.transpose(data, (3, 0, 1, 2))
+                    if len(data.shape) > 3:
+                        data = np.transpose(data, (3, 0, 1, 2))
                     
                     # Converte para o tipo econômico e salva
                     np.save(npy_path, data.astype(dtype_target))

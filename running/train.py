@@ -65,11 +65,12 @@ def validate(model, loader, criterion, device, max_steps=None):
                 # Output completo do modelo
                 output, res_pred, media_vizinhos = model(neighbors, query, n_coords)
 
-            # --- CÁLCULO DAS LOSSES ---
-            loss, loss_dict = criterion(
-                output.float(), target.float(), mask.float(), maskWM.float(),
-                pred=res_pred.float(), media_vizinhos=media_vizinhos.float()
-            )
+                loss, loss_dict = criterion(
+                    output.float(), target.float(),
+                    mask.float(), maskWM.float(),
+                    pred=res_pred.float(),          # ← resíduo bruto, sem res_scale
+                    media_vizinhos=media_vizinhos.float(),
+                )
 
             # --- CÁLCULO DAS MÉTRICAS ---
             # 1. Identificar se é Cross-Shell (diferença entre b_origin e b_target)
@@ -324,9 +325,17 @@ def train(dic_config):
         wm_multiplier=weights['wm'],
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    # Separa res_scale dos demais parâmetros
+    res_scale_params = [model.res_scale]
+    other_params = [p for n, p in model.named_parameters() if n != 'res_scale']
+
+    optimizer = torch.optim.AdamW([
+        {'params': other_params,     'lr': lr,        'weight_decay': 1e-4},
+        {'params': res_scale_params, 'lr': lr * 200,  'weight_decay': 0.0},
+    ])
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10
+        optimizer, mode='min', factor=0.5, patience=3
     )
     scaler = torch.amp.GradScaler('cuda')
 
@@ -346,6 +355,12 @@ def train(dic_config):
     fixed_same_shell = None
     fixed_cross_shell = None
 
+    # No início do treino, antes do loop de epochs
+    model.freeze_res_scale()
+    # Inicializa em valor fixo moderado para o decoder ter sinal para aprender
+    with torch.no_grad():
+        model.res_scale.fill_(-1.5)  # softplus(-1.5) ≈ 0.20
+
     # --- LOOP PRINCIPAL ---
     global_step   = 0
     best_val_score = float('inf')
@@ -353,6 +368,9 @@ def train(dic_config):
     fase_manual   = None
     pesos_manuais = False
     for epoch in range(epochs):
+
+        if global_step > 500:
+            model.unfreeze_res_scale()
 
         if fase_manual is None:
             cl = dic_config.get('curriculum')
@@ -376,40 +394,46 @@ def train(dic_config):
             criterion.set_phase_weights(fase)
 
         # Se ainda não temos o Same-Shell, ou se entramos na Fase 2 e não temos o Cross-Shell
+        # IMPORTANTE: guardamos apenas o ÍNDICE do dataset, não os tensores.
+        # Os tensores são reconstruídos a cada chamada de debug via val_ds_patch[idx],
+        # garantindo que os vizinhos reflitam sempre a lógica atual do dataset
+        # (seleção por K-próximos, temperatura adaptativa, etc).
         if fixed_same_shell is None or (fase >= 2 and fixed_cross_shell is None):
-            print("🔄 Inspecionando batch para isolar referências do debug visual...", flush=True)
-            
+            print("🔄 Inspecionando dataset para isolar índices de referência do debug...", flush=True)
+
             for v_batch in val_loader_fast:
                 is_cross_tensor = v_batch["is_cross_shell"]
-                
+
                 for idx_in_batch in range(len(is_cross_tensor)):
                     is_cross = bool(is_cross_tensor[idx_in_batch].item())
-                    
-                    # Captura o Same-Shell se ainda não tiver
-                    if not is_cross and fixed_same_shell is None:
-                        fixed_same_shell = {}
+
+                    # Filtra patches com w_dominant > 0.35 para garantir
+                    # que o debug usa a nova seleção por K-próximos.
+                    # Com bins angulares w ~ 0.15; com K-próximos w > 0.40.
+                    w_dom = float(v_batch["w_dominant"][idx_in_batch].item())                         if "w_dominant" in v_batch else 1.0
+
+                    if not is_cross and fixed_same_shell is None and w_dom > 0.35:
+                        fixed_same_shell = {"dataset_idx": None, "ref_batch": {}}
                         for k, v in v_batch.items():
-                            fixed_same_shell[k] = v[idx_in_batch:idx_in_batch+1] if isinstance(v, torch.Tensor) else ([v[idx_in_batch]] if isinstance(v, list) else v)
-                        print("  🎯 [Sucesso] Patch de referência Same-Shell isolado!", flush=True)
-                        
-                    # Captura o Cross-Shell apenas se estivermos na fase correta e ainda não tiver
-                    elif is_cross and fixed_cross_shell is None and fase >= 2:
-                        fixed_cross_shell = {}
+                            fixed_same_shell["ref_batch"][k] = (
+                                v[idx_in_batch:idx_in_batch+1]
+                                if isinstance(v, torch.Tensor)
+                                else ([v[idx_in_batch]] if isinstance(v, list) else v)
+                            )
+                        print(f"  🎯 [Sucesso] Patch Same-Shell isolado! w_dominant={w_dom:.2f}", flush=True)
+
+                    elif is_cross and fixed_cross_shell is None and fase >= 2 and w_dom > 0.35:
+                        fixed_cross_shell = {"dataset_idx": None, "ref_batch": {}}
                         for k, v in v_batch.items():
-                            fixed_cross_shell[k] = v[idx_in_batch:idx_in_batch+1] if isinstance(v, torch.Tensor) else ([v[idx_in_batch]] if isinstance(v, list) else v)
-                        print("  🎯 [Sucesso] Patch de referência Cross-Shell real isolado!", flush=True)
-                
-                # Critério de parada do DataLoader rápido
+                            fixed_cross_shell["ref_batch"][k] = (
+                                v[idx_in_batch:idx_in_batch+1]
+                                if isinstance(v, torch.Tensor)
+                                else ([v[idx_in_batch]] if isinstance(v, list) else v)
+                            )
+                        print(f"  🎯 [Sucesso] Patch Cross-Shell isolado! w_dominant={w_dom:.2f}", flush=True)
+
                 if fixed_same_shell is not None and (fase == 1 or fixed_cross_shell is not None):
                     break
-
-        if fixed_same_shell is not None:
-            # Sua função de plot para o Same-Shell aqui...
-            pass
-            
-        if fixed_cross_shell is not None and fase >= 2:
-            # Sua função de plot para o Cross-Shell aqui...
-            pass
 
         print(f"🔥 Epoch {epoch+1}/{epochs} | Fase {fase}", flush=True)
         model.train()
@@ -474,6 +498,7 @@ def train(dic_config):
                 output_final, res_predito, media_viz = model(neighbors, query, n_coords)
                 t2 = time.time()
 
+                res_scale = torch.nn.functional.softplus(model.res_scale)
                 loss, loss_dict = criterion(
                     output_final.float(), target.float(),
                     mask.float(), maskWM.float(),
@@ -483,8 +508,12 @@ def train(dic_config):
                 t3 = time.time()
 
             scaler.scale(loss).backward()
+
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+
             t4 = time.time()
 
             origin_b = batch["origin_bval"]
@@ -533,25 +562,27 @@ def train(dic_config):
                 print(f"DEBUG VISUAL FIXO {global_step}")
                 model.eval()
                 with torch.no_grad():
-                    # Loop simples para gerar o debug dos dois cenários fixos
-                    for nome_fase, ref_batch in [("same_shell", fixed_same_shell), ("cross_shell", fixed_cross_shell)]:
-                        if ref_batch is None: 
+                    for nome_fase, fixed_ref in [("same_shell", fixed_same_shell), ("cross_shell", fixed_cross_shell)]:
+                        if fixed_ref is None:
                             continue
-                        
-                        # Envia dados do patch fixo atual para o device
+
+                        # ref_batch: tensores fixos capturados uma vez do val_loader.
+                        # Média, target e coords são sempre os mesmos — o que evolui
+                        # a cada step é apenas o OUTPUT do modelo dado esses inputs,
+                        # mostrando o aprendizado isolado de qualquer mudança de dados.
+                        ref_batch = fixed_ref["ref_batch"]
+
                         neighbors = ref_batch["source_neighbors"].to(device)
                         query     = ref_batch["target_query"].to(device)
                         n_coords  = ref_batch["neighbors_coords"].to(device)
                         target    = ref_batch["target_real"].to(device)
                         mask      = ref_batch["mask"].to(device)
-                        
-                        # Garante que os b-values documentados sejam os deste patch fixo
+
                         origin_b_fix = ref_batch["origin_bval"]
                         target_b_fix = ref_batch["target_bval"]
-                        
-                        # Forward
+
                         output_final, res_predito, media_vizinhos = model(neighbors, query, n_coords)
-                        
+
                         subj_id          = str(ref_batch["id"][0])
                         target_idx       = ref_batch["target_idx"][0].item()
                         neighbor_indices = ref_batch["neighbor_indices"][0].cpu().numpy()

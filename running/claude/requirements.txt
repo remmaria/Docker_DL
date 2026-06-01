@@ -1,0 +1,17 @@
+torch>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+nibabel>=5.0.0
+scikit-learn>=1.3.0
+pandas>=2.0.0
+tensorboard>=2.13.0
+wandb>=0.15.0
+dipy>=1.7.0
+umap-learn>=0.5.3
+tqdm>=4.65.0
+
+# Opcionais mas recomendados:
+# dipy>=1.7.0          → FA/MD fitting, SH features, gradient_table
+# umap-learn>=0.5.3    → visualização do espaço latente
+# wandb>=0.15.0        → logging alternativo ao TensorBoard
+# tqdm>=4.65.0         → progress bars

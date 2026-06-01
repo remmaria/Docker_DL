@@ -291,6 +291,92 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
         return entry
 
     # ------------------------------------------------------------------
+    # Seleção de vizinhos — estratégia por fase
+    # ------------------------------------------------------------------
+
+    def _select_neighbors(
+        self,
+        idx_input_valid: np.ndarray,
+        distancias: np.ndarray,
+        pool_vecs_hemi: np.ndarray,
+        target_v: np.ndarray,
+        k: int,
+        fase: int,
+    ) -> list:
+        """
+        Seleciona K vizinhos com estratégia adaptada à fase de treino.
+
+        Fase 1 — Concentrado (same-shell, interpolação angular pura)
+        ------------------------------------------------------------
+        Pega os K vizinhos angularmente mais próximos do target.
+        Garante w_dominante > 0.4, preserva estrutura direcional fina
+        e dá ao decoder resíduo real para aprender.
+        A estratégia anterior de bins distribuía por 360° e forçava
+        w_max ~0.15, suavizando toda a anisotropia do tecido.
+
+        Fase 2 — Misto (cross-shell: k_close próximos + k_diverse diversos)
+        -------------------------------------------------------------------
+        Para harmonização cross-shell, o decoder precisa:
+          - Vizinhos angularmente próximos: âncora para a direção do sinal
+          - Vizinhos angularmente diversos: contexto do perfil de decaimento
+            T2 (necessário para estimar delta_b corretamente)
+        Divide K em: metade próximos + metade diversos (quadrantes de 90°).
+
+        Fase 3 — Igual à fase 2 (refinamento, mesma estratégia)
+        """
+        ordem = np.argsort(distancias)  # crescente por distância angular
+
+        if fase == 1:
+            # Fase 1: K mais próximos angularmente
+            selecionados = ordem[:k]
+            return [int(idx_input_valid[i]) for i in selecionados]
+
+        else:
+            # Fases 2 e 3: metade próximos + metade diversos
+            k_close   = k // 2       # ex: k=8 -> 4 próximos
+            k_diverse = k - k_close  # ex: k=8 -> 4 diversos
+
+            close_indices = [int(idx_input_valid[i]) for i in ordem[:k_close]]
+
+            # Diversos: quadrantes no plano tangente ao target
+            v_ref  = np.array([1, 0, 0]) if abs(target_v[0]) < 0.9 else np.array([0, 1, 0])
+            orto_x = np.cross(target_v, v_ref)
+            orto_x /= np.linalg.norm(orto_x) + 1e-8
+            orto_y  = np.cross(target_v, orto_x)
+
+            angulos = np.degrees(np.arctan2(
+                np.dot(pool_vecs_hemi, orto_y),
+                np.dot(pool_vecs_hemi, orto_x),
+            )) % 360
+
+            bins = np.linspace(0, 360, k_diverse + 1)
+            diverse_indices = []
+            close_set = set(close_indices)
+
+            for i_bin in range(len(bins) - 1):
+                mask_bin = (angulos >= bins[i_bin]) & (angulos < bins[i_bin + 1])
+                candidatos = [c for c in np.where(mask_bin)[0]
+                              if int(idx_input_valid[c]) not in close_set]
+                if candidatos:
+                    melhor = candidatos[int(np.argmin(distancias[candidatos]))]
+                    idx_global = int(idx_input_valid[melhor])
+                    if idx_global not in close_set and idx_global not in diverse_indices:
+                        diverse_indices.append(idx_global)
+
+            # fallback: completa com os mais próximos restantes
+            if len(diverse_indices) < k_diverse:
+                usados = close_set | set(diverse_indices)
+                for i in ordem:
+                    if len(diverse_indices) >= k_diverse:
+                        break
+                    cand = int(idx_input_valid[i])
+                    if cand not in usados:
+                        diverse_indices.append(cand)
+                        usados.add(cand)
+
+            return (close_indices + diverse_indices)[:k]
+
+    # ------------------------------------------------------------------
     # __getitem__
     # ------------------------------------------------------------------
 
@@ -393,105 +479,27 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
             for v in bvecs[idx_input_valid]
         ])
 
-        # base ortogonal
-        v_ref = (
-            np.array([1, 0, 0])
-            if abs(target_v[0]) < 0.9
-            else np.array([0, 1, 0])
-        )
-
-        orto_x = np.cross(target_v, v_ref)
-        orto_x /= (np.linalg.norm(orto_x) + 1e-8)
-
-        orto_y = np.cross(target_v, orto_x)
-
-        # ângulo polar no plano tangente
-        angulos = np.degrees(np.arctan2(
-            np.dot(pool_vecs_hemi, orto_y),
-            np.dot(pool_vecs_hemi, orto_x)
-        )) % 360
-
-        # DISTÂNCIA ANGULAR REAL
-        dots = np.abs(
-            np.sum(
-                pool_vecs_hemi * target_v,
-                axis=1
-            )
-        )
-
+        # DISTÂNCIA ANGULAR REAL para todos os candidatos
+        dots = np.abs(np.sum(pool_vecs_hemi * target_v, axis=1))
         dots = np.clip(dots, -1.0, 1.0)
+        distancias = np.arccos(dots)   # radianos, 0 = idêntico
 
-        distancias = np.arccos(dots)
-
-        # bins angulares
-        bins = np.linspace(
-            0,
-            360,
-            self.k_neighbors + 1
+        neighbor_indices = self._select_neighbors(
+            idx_input_valid=idx_input_valid,
+            distancias=distancias,
+            pool_vecs_hemi=pool_vecs_hemi,
+            target_v=target_v,
+            k=self.k_neighbors,
+            fase=self.fase,
         )
-
-        neighbor_indices = []
-
-        for i_bin in range(len(bins) - 1):
-
-            mask_q = (
-                (angulos >= bins[i_bin]) &
-                (angulos < bins[i_bin + 1])
-            )
-
-            if np.any(mask_q):
-
-                idx_q = np.where(mask_q)[0]
-
-                # menor distância angular
-                best_local = idx_q[
-                    np.argmin(distancias[idx_q])
-                ]
-
-                candidate = int(
-                    idx_input_valid[best_local]
-                )
-
-                if candidate not in neighbor_indices:
-                    neighbor_indices.append(candidate)
-
-        # fallback global angular
-        if len(neighbor_indices) < self.k_neighbors:
-
-            faltam = self.k_neighbors - len(neighbor_indices)
-
-            restantes_mask = np.array([
-                idx not in neighbor_indices
-                for idx in idx_input_valid
-            ])
-
-            restantes = idx_input_valid[restantes_mask]
-
-            restantes_dist = distancias[restantes_mask]
-
-            ordem = np.argsort(restantes_dist)
-
-            extras = restantes[ordem]
-
-            neighbor_indices.extend(
-                extras[:faltam].tolist()
-            )
-
-        # segurança final
-        neighbor_indices = neighbor_indices[:self.k_neighbors]
 
         # fallback extremo
         if len(neighbor_indices) == 0:
-
-            neighbor_indices = [
-                int(target_idx)
-            ] * self.k_neighbors
+            neighbor_indices = [int(target_idx)] * self.k_neighbors
 
         # completa se faltar
         while len(neighbor_indices) < self.k_neighbors:
-            neighbor_indices.append(
-                neighbor_indices[0]
-            )
+            neighbor_indices.append(neighbor_indices[0])
 
         self._log(
             f"[TIMER] neighbor search: "
@@ -595,6 +603,19 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
             neighbors_coords.append([bvals[n_idx] / self.bval_max, *v])
         self._log(f"[TIMER] neighbor coords: {time.time()-t0:.4f}s")
 
+        # ---- peso dominante (para monitorar qualidade da seleção) -----------
+        # Calcula os mesmos pesos que o modelo vai usar (temperatura 0.1, fase 1)
+        # para expor o w_dominante no batch e detectar patches com seleção ruim.
+        nc_arr   = np.array(neighbors_coords, dtype=np.float32)  # (K, 4)
+        neigh_vs = nc_arr[:, 1:]                                  # (K, 3)
+        dots_w   = np.abs(neigh_vs @ target_v)
+        dots_w   = np.clip(dots_w, 0.0, 1.0)
+        scores_w = dots_w / 0.1
+        exp_w    = np.exp(scores_w - scores_w.max())
+        softmax_w = exp_w / exp_w.sum()
+        w_dominant = float(softmax_w.max())
+        self._log(f"[TIMER] neighbor coords: {time.time()-t0:.4f}s")
+
         # ---- conversão para torch -------------------------------------------
         t0 = time.time()
         result = {
@@ -634,6 +655,12 @@ class QSpaceDatasetCoord_KNearest_Shell(Dataset):
                 neighbor_indices,
                 dtype=torch.long
             ),
+
+            # Peso do vizinho dominante — útil para filtrar patches ruins no debug
+            # e monitorar se a seleção por K-próximos está funcionando.
+            # Com bins angulares: w_dominant ~ 0.15
+            # Com K-próximos:     w_dominant > 0.40
+            "w_dominant": torch.tensor(w_dominant, dtype=torch.float32),
         }
 
         self._log(f"[TIMER] torch conversion: {time.time()-t0:.4f}s")

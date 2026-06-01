@@ -325,7 +325,7 @@ def save_debug_documentation_png(
     axes[1, 0].set_title(f"Target Real (b{int(b_out)})")
 
     axes[1, 1].imshow(pred_img, cmap='jet', vmin=0, vmax=vmax)
-    axes[1, 1].set_title("Predição Final")
+    axes[1, 1].set_title("Predição Final - {pred_img:.6f}")
 
     im_pred = axes[1, 2].imshow(
         diff_pred_target, cmap='seismic',
@@ -420,6 +420,7 @@ def backup_code(folder_checkpoint):
         "losses.py",
         "metrics.py",
         "model.py",
+        "model_v2.py"
         "run_inf.sh",
         "run_train.sh",
         "train_config.yaml",
