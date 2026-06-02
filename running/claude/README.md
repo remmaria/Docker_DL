@@ -27,9 +27,8 @@ source venv/bin/activate   # Linux/Mac
 # Dependências
 pip install -r requirements.txt
 
-# Com suporte a GPU (CUDA 11.8):
-pip install torch --index-url https://download.pytorch.org/whl/cu118
-```
+# Com suporte a GPU (CUDA 12.9):
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 # versão compatível com CUDA 12.9 (l40s e a100 - CUDA 12.9)```
 
 ---
 
@@ -53,10 +52,10 @@ tensorboard --logdir runs/test_synth/tensorboard
 ```
 /data/subjects/
 ├── sub-001/
-│   ├── dwi.nii.gz          # (X, Y, Z, N_dwi) — float32
-│   ├── bvals               # uma linha, N_dwi valores em s/mm²
-│   ├── bvecs               # (3 x N_dwi) ou (N_dwi x 3) — FSL convention
-│   └── brain_mask.nii.gz   # (X, Y, Z) — binária
+│   ├── bgpdwis_PA_geomcorr.nii          # (X, Y, Z, N_dwi) — float32
+│   ├── bgpdwis_PA_geomcorr.bval               # uma linha, N_dwi valores em s/mm²
+│   ├── bgpdwis_PA_geomcorr.bvec               # (3 x N_dwi) ou (N_dwi x 3) — FSL convention
+│   └── bgpdwis_PA_geomcorr_mask3d.nii.gz   # (X, Y, Z) — binária
 ├── sub-002/
 │   └── ...
 ```
@@ -123,7 +122,7 @@ Troque no config: `"masking_strategy": "angular"`
 
 ---
 
-## Diagnóstico — o que observar no TensorBoard
+## Diagnóstico — o que observar no wandb
 
 ### Sinal saudável de treino:
 - `train/loss_epoch` decresce suavemente nas primeiras 20 épocas
@@ -149,7 +148,7 @@ runs/experiment_01/
 ├── config.json             # Config salva
 ├── best_model.pt           # Melhor checkpoint (menor val_loss)
 ├── last_checkpoint.pt      # Último checkpoint
-└── tensorboard/            # Logs do TensorBoard
+└── wandb/                  # Logs do W&B
 ```
 
 ### Conteúdo do checkpoint:

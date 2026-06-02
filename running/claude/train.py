@@ -166,6 +166,7 @@ DEFAULT_CONFIG = {
     "query_dim":     4,
     "hidden_dim":    256,
     "latent_dim":    128,
+    "protocol_dim": 32,
     "n_enc_layers":  5,
     "n_dec_layers":  4,
     "omega_0":       30.0,

@@ -320,6 +320,17 @@ class MaskedQSpaceDataset(Dataset):
                 valid_voxels = np.argwhere(mask).astype(np.int32)
                 shells = np.unique(np.round(bvals, -2).astype(int))
 
+                shells = np.unique(
+                    np.round(bvals[bvals >= 50], -2)
+                )
+
+                protocol_features = np.array([
+                    len(bvals),
+                    len(shells),
+                    bvals.max(),
+                    np.sum(bvals < 50),
+                ], dtype=np.float32)
+
                 self.meta.append({
                     "subject_dir":  str(sdir),
                     "protocol_id":  pid,
@@ -330,6 +341,8 @@ class MaskedQSpaceDataset(Dataset):
                     "valid_voxels": valid_voxels,
                     "shape_xyz":    mask.shape,
                     "N_dwi":        len(bvals),
+
+                    "protocol_features": protocol_features,
                 })
                 n_ok += 1
                 if n_ok % 50 == 0 or n_ok == 1:
@@ -555,12 +568,15 @@ class MaskedQSpaceDataset(Dataset):
             bvecs[query_mask],
         ], axis=-1)
 
+        protocol_features = meta["protocol_features"]
+
         return {
             "x_context":   torch.from_numpy(x_context).float(),
             "q_query":     torch.from_numpy(q_query).float(),
             "S_target":    torch.from_numpy(S_all[query_mask]).float(),
             "protocol_id": torch.tensor(meta["protocol_id"], dtype=torch.long),
             "bvals_query": torch.from_numpy(bvals[query_mask]).float(),
+            "protocol_features": torch.from_numpy(protocol_features).float(),
         }
 
     def _random_rotation(self, bvecs: np.ndarray) -> np.ndarray:
@@ -601,6 +617,8 @@ def collate_variable_dwi(batch: List[dict]) -> dict:
     protocol_ids = torch.zeros(B, dtype=torch.long)
     bvals_q_pad = torch.zeros(B, max_q)
 
+    protocol_features = torch.zeros(B, 4)
+
     for i, item in enumerate(batch):
         n_ctx = item["x_context"].shape[0]
         n_q   = item["q_query"].shape[0]
@@ -614,6 +632,8 @@ def collate_variable_dwi(batch: List[dict]) -> dict:
         protocol_ids[i]          = item["protocol_id"]
         bvals_q_pad[i, :n_q]     = item["bvals_query"]
 
+        protocol_features[i] = item["protocol_features"]
+
     return {
         "x_context":    x_ctx_pad,
         "ctx_mask":     ctx_mask,
@@ -622,6 +642,7 @@ def collate_variable_dwi(batch: List[dict]) -> dict:
         "q_mask":       q_mask,
         "protocol_id":  protocol_ids,
         "bvals_query":  bvals_q_pad,
+        "protocol_features": protocol_features
     }
 
 

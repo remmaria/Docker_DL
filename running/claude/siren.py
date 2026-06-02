@@ -147,6 +147,29 @@ class SIRENEncoder(nn.Module):
         return z
 
 
+class ProtocolEncoder(nn.Module):
+
+    def __init__(
+        self,
+        in_dim=4,
+        hidden_dim=64,
+        protocol_dim=32,
+    ):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+
+            nn.Linear(hidden_dim, protocol_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 # ---------------------------------------------------------------------------
 # Decoder: (z_tecido, b_query, g_query) → S_predito
 # ---------------------------------------------------------------------------
@@ -166,8 +189,9 @@ class SIRENDecoder(nn.Module):
 
     def __init__(
         self,
-        query_dim: int = 4,         # [b_norm, gx, gy, gz]
+        query_dim: int = 4,
         latent_dim: int = 128,
+        protocol_dim: int = 32,
         hidden_dim: int = 256,
         n_layers: int = 4,
         omega_0: float = 30.0,
@@ -186,11 +210,13 @@ class SIRENDecoder(nn.Module):
             )
 
         # FiLM generators: um por camada oculta (não na primeira)
+        condition_dim = latent_dim + protocol_dim
         self.film_generators = nn.ModuleList([
-            nn.Linear(latent_dim, 2 * hidden_dim)   # → (γ, β)
+            nn.Linear(condition_dim,
+                    2 * hidden_dim)
             for _ in range(n_layers - 1)
         ])
-
+        
         # Saída final: sinal escalar (ou multi-canal se quiser prever vários b0s)
         self.output_layer = nn.Sequential(
             nn.Linear(hidden_dim, 64),

@@ -25,7 +25,11 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-from siren import SIRENEncoder, SIRENDecoder
+from siren import (
+    SIRENEncoder,
+    SIRENDecoder,
+    ProtocolEncoder,
+)
 from losses import QSpaceLoss
 from dataset import MaskedQSpaceDataset, collate_variable_dwi
 
@@ -105,22 +109,49 @@ class QSpaceModel(nn.Module):
         self.decoder = SIRENDecoder(
             query_dim=query_dim,
             latent_dim=latent_dim,
+            protocol_dim=32,
             hidden_dim=hidden_dim,
             n_layers=n_dec_layers,
             omega_0=omega_0,
         )
 
+        self.protocol_encoder = ProtocolEncoder(
+            in_dim=4,
+            protocol_dim=32,
+        )
+
+
     def forward(
         self,
-        x_context: torch.Tensor,
-        q_query: torch.Tensor,
-        ctx_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        x_context,
+        q_query,
+        protocol_features,
+        ctx_mask=None,
+    ):
+
         if ctx_mask is not None:
-            x_context = x_context.masked_fill(ctx_mask.unsqueeze(-1), 0.0)
-        z = self.encoder(x_context)
-        S_pred = self.decoder(z, q_query)
-        return S_pred, z
+            x_context = x_context.masked_fill(
+                ctx_mask.unsqueeze(-1),
+                0.0
+            )
+
+        z_tissue = self.encoder(x_context)
+
+        z_protocol = self.protocol_encoder(
+            protocol_features
+        )
+
+        z_cond = torch.cat(
+            [z_tissue, z_protocol],
+            dim=-1
+        )
+
+        S_pred = self.decoder(
+            z_cond,
+            q_query
+        )
+
+        return S_pred, z_tissue
 
     def encode(self, x_context, ctx_mask=None):
         if ctx_mask is not None:
@@ -299,10 +330,18 @@ class Trainer:
             q_mask   = batch["q_mask"].to(self.device)
             b_vals   = batch["bvals_query"].to(self.device)
 
+            protocol_features = batch["protocol_features"].to(self.device)
+
             self.optimizer.zero_grad(set_to_none=True)
 
             with autocast("cuda", enabled=self.use_amp):
-                S_pred, z = self.model(x_ctx, q_query, ctx_mask)
+                
+                S_pred, z = self.model(
+                    x_ctx,
+                    q_query,
+                    protocol_features,
+                    ctx_mask
+                )
                 losses = self.criterion(S_pred, S_target, q_query, q_mask, b_vals)
 
             self.scaler.scale(losses["total"]).backward()
@@ -361,8 +400,16 @@ class Trainer:
             q_mask   = batch["q_mask"].to(self.device)
             b_vals   = batch["bvals_query"].to(self.device)
 
+            protocol_features = batch["protocol_features"].to(self.device)
+
             with autocast("cuda", enabled=self.use_amp):
-                S_pred, z = self.model(x_ctx, q_query, ctx_mask)
+                
+                S_pred, z = self.model(
+                    x_ctx,
+                    q_query,
+                    protocol_features,
+                    ctx_mask
+                )                
                 losses = self.criterion(S_pred, S_target, q_query, q_mask, b_vals)
 
             for k in accum:
