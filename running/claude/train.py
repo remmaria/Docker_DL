@@ -193,8 +193,8 @@ DEFAULT_CONFIG = {
 
     # Losses
     "lambda_recon":   1.0,
-    "lambda_mono":    0.1,
-    "lambda_smooth":  0.05,
+    "lambda_mono":    0.2,
+    "lambda_smooth":  0.2,
 
     # Debug
     "debug_every":    5,    # salva PNGs a cada N épocas (e sempre que houver novo best)
