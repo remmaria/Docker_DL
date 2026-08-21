@@ -106,19 +106,39 @@ def _tile_origins(mask: np.ndarray, ps: int) -> list:
     sinal nenhum pra aprender).
 
     Devolve lista de (origin, coverage) -- coverage = fracao de voxels
-    DENTRO da mascara nesse tile especifico (0 a 1). O tile (0,0,0) (o
-    PRIMEIRO da grade, em ordem crescente de eixo) costuma cair bem no
-    canto da imagem, quase sempre fundo puro (o cerebro raramente comeca
-    exatamente na origem do volume) -- so passa no filtro ">=1 voxel de
-    mascara" por pouco, com cobertura pertinho de zero. Isso importa
-    porque o antigo codigo em scripts/04_train_rcae.py pegava sempre
-    `val_ds[0]` (== o tile 0 do primeiro sujeito) como "o patch fixo" de
-    debug -- ou seja, seguidamente escolhia um patch quase sem sinal
-    nenhum pra acompanhar a evolucao do treino, o que inutilizava essa
-    serie de snapshots. `coverage` aqui e o que permite ao script de
+    DENTRO da mascara, calculada sobre o PATCH INTEIRO ja com zero-padding
+    (ps**3 no denominador), NAO so sobre a regiao recortada real (ex-ox)*
+    (ey-oy)*(ez-oz). Isso importa muito pra tiles de BORDA: um tile que so
+    tem, digamos, 2 fatias reais antes de bater no limite do volume (o
+    resto vira padding de zero em `_extract`) podia ter essas 2 fatias
+    100% dentro da mascara e ainda assim reportar coverage=1.0 com
+    `tile_mask.mean()` (que divide pelo tamanho da regiao RECORTADA, so
+    2*ps*ps voxels) -- passando folgado em qualquer filtro de
+    --min-tile-coverage, mesmo que o patch de verdade entregue a rede
+    (ps,ps,ps, com 8 das 10 fatias zeradas por padding) seja quase todo
+    fundo. Dividindo por ps**3 (o tamanho real do patch pos-padding), esse
+    mesmo tile cai pra coverage=0.2*(2/10)=0.02 -- corretamente abaixo do
+    filtro. Bug real encontrado via inspecao de um snapshot de debug com
+    input/target/pred TODOS zerados (step 4800, epoca 1) apesar do
+    --min-tile-coverage 0.15 estar ativo -- confirma que esse era
+    exatamente o mecanismo (tile de borda com coverage superestimado pela
+    formula antiga). Tiles interiores (ex-ox==ey-oy==ez-oz==ps, sem
+    padding) tem o mesmo valor de coverage nas duas formulas -- so tiles de
+    borda mudam.
+
+    O tile (0,0,0) (o PRIMEIRO da grade, em ordem crescente de eixo) costuma
+    cair bem no canto da imagem, quase sempre fundo puro (o cerebro
+    raramente comeca exatamente na origem do volume) -- so passa no filtro
+    ">=1 voxel de mascara" por pouco, com cobertura pertinho de zero. Isso
+    importa porque o antigo codigo em scripts/04_train_rcae.py pegava
+    sempre `val_ds[0]` (== o tile 0 do primeiro sujeito) como "o patch
+    fixo" de debug -- ou seja, seguidamente escolhia um patch quase sem
+    sinal nenhum pra acompanhar a evolucao do treino, o que inutilizava
+    essa serie de snapshots. `coverage` aqui e o que permite ao script de
     treino escolher um tile de verdade representativo (maior cobertura de
     cerebro) em vez do indice 0 cego."""
     shape = mask.shape
+    patch_volume = ps ** 3
     origins = []
     for ox in range(0, shape[0], ps):
         ex = min(ox + ps, shape[0])
@@ -128,7 +148,7 @@ def _tile_origins(mask: np.ndarray, ps: int) -> list:
                 ez = min(oz + ps, shape[2])
                 tile_mask = mask[ox:ex, oy:ey, oz:ez]
                 if tile_mask.any():
-                    coverage = float(tile_mask.mean())
+                    coverage = float(tile_mask.sum()) / patch_volume
                     origins.append(((ox, oy, oz), coverage))
     return origins
 

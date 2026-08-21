@@ -1,4 +1,13 @@
 
+#------------02b_baseline_reconstruct.sh
+
+sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1500 10
+
+
+#------------03_train_rcae.sh
+
+sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1500 10
 
 #------------04_reconstruct_rcae.sh
 

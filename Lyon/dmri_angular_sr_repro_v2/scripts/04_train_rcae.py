@@ -610,12 +610,23 @@ def main():
                 if epochs_no_improve >= args.patience:
                     print(f"Early stopping na epoca {epoch} (sem melhora ha {args.patience} epocas)")
                     break
+
+            # last.pt AGORA e salvo a cada epoca (nao so uma vez no final, fora
+            # do try/finally) -- ANTES, se o job morresse no meio do treino
+            # (OOM killer do SLURM, timeout, no cluster mata o processo com
+            # SIGKILL -- nao da tempo nem do 'finally' rodar), o codigo que
+            # salvava last.pt (depois do loop inteiro) nunca era alcancado, e
+            # last.pt ficava simplesmente inexistente pra qualquer treino que
+            # nao terminasse "limpo". Salvando a cada epoca, mesmo um job que
+            # morre no meio deixa o last.pt da ULTIMA epoca que terminou
+            # completa -- util pra continuar de onde parou ou so inspecionar
+            # o estado mais recente, mesmo sem ter sido o melhor val_loss.
+            torch.save({"model_state": model.state_dict(), "args": vars(args), "epoch": epoch,
+                        "val_loss": val_loss}, out_dir / "last.pt")
+            shutil.copy2(out_dir / "last.pt", run_dir / "last.pt")
     finally:
         batch_log_f.close()
 
-    torch.save({"model_state": model.state_dict(), "args": vars(args), "epoch": epoch},
-               out_dir / "last.pt")
-    shutil.copy2(out_dir / "last.pt", run_dir / "last.pt")
     print("Treino concluido. Melhor val_loss:", best_val, "-> checkpoint em", out_dir / "best.pt")
     print(f"Copia permanente deste run em: {run_dir / 'best.pt'} (job_id={run_id})")
     print("Log por batch salvo em:", batch_log_path)
