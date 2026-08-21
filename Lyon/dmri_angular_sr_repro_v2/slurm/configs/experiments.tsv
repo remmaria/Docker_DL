@@ -1,0 +1,44 @@
+# Uma linha por experimento (shell_b, n_level). Colunas separadas por TAB.
+# Preenchido com base no seu shell_availability_summary.csv real:
+#
+#   b_value   n_subjects  n_directions (min-median-max)
+#   1000.0    845         14-64-64   <- maior N, resultado principal
+#   1500.0    407         64-64-64   <- N alto, super uniforme (todo mundo 64 dir)
+#   500.0     356         16-16-16   <- N alto, mas so 16 direcoes -- niveis baixos
+#   700.0      63         35-35-35  <- N ok, secundario/generalizacao
+#   2000.0     63         77-77-77  <- N ok, secundario/generalizacao
+#   750.0      51         28-28-28  <- N ok, secundario/generalizacao
+#
+# === Experimentos principais (rode primeiro) ===
+1000	6
+1000	10
+1000	15
+1000	20
+1000	30
+1000	40
+1500	6
+1500	10
+1500	15
+1500	20
+1500	30
+1500	40
+1500	50
+500	6
+500	10
+#
+# === Secundarios / generalizacao (rode depois, se quiser cobrir mais no texto) ===
+700	6
+700	10
+700	15
+700	20
+700	30
+2000	6
+2000	10
+2000	15
+2000	20
+2000	30
+2000	40
+750	6
+750	10
+750	15
+750	20

@@ -1,0 +1,12 @@
+numpy
+scipy
+scikit-learn
+scikit-image
+pandas
+matplotlib
+nibabel
+dipy
+torch
+# opcionais (validacao downstream):
+# dmri-amico      # NODDI (etapa 07 com --run-noddi)
+# MRtrix3 deve ser instalado separadamente (nao e pacote pip) para a etapa 08
