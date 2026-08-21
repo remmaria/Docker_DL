@@ -55,6 +55,18 @@ def main():
     ap.add_argument("--stride", type=int, default=16)
     ap.add_argument("--mask-suffix", default="_mask3d.nii.gz")
     ap.add_argument("--shell-tol", type=float, default=100.0)
+    ap.add_argument("--subjects", default=None,
+                     help="lista separada por virgula de 'tag' de sujeito (subject, ou "
+                          "subject_session se houver sessao -- o mesmo 'tag' que aparece nas "
+                          "colunas dos CSVs de metricas/POC) para restringir a reconstrucao a "
+                          "esses sujeitos especificos, em vez do split inteiro. Util pra "
+                          "testar rapido com 1-2 sujeitos (ex.: os mesmos que ja apareceram "
+                          "numa rodada da POC) sem esperar reconstruir todo o split.")
+    ap.add_argument("--limit", type=int, default=None,
+                     help="processa so os N primeiros sujeitos (apos filtrar por --split e "
+                          "--subjects, se usado) -- outra forma rapida de testar com poucos "
+                          "sujeitos sem editar o manifesto. Sem --subjects nem --limit, "
+                          "comportamento antigo inalterado (todo o split).")
     args = ap.parse_args()
 
     import nibabel as nib
@@ -74,11 +86,32 @@ def main():
     print(f"Checkpoint carregado (epoca {ckpt.get('epoch')}, val_loss {ckpt.get('val_loss')})")
 
     entries = [e for e in load_manifest(args.manifest) if e.split == args.split]
+
+    def _tag_of(e):
+        return e.subject if not e.session else f"{e.subject}_{e.session}"
+
+    if args.subjects:
+        wanted = {t.strip() for t in args.subjects.split(",") if t.strip()}
+        entries = [e for e in entries if _tag_of(e) in wanted]
+        found = {_tag_of(e) for e in entries}
+        missing = wanted - found
+        if missing:
+            print(f"[aviso] --subjects pediu {sorted(missing)}, mas nao encontrei no split "
+                  f"{args.split!r} do manifesto (confira o 'tag' certo -- e subject, ou "
+                  f"subject_session se houver sessao).", flush=True)
+        if not entries:
+            sys.exit(f"Nenhum dos sujeitos pedidos em --subjects foi encontrado no split "
+                      f"{args.split!r} -- nada a fazer.")
+    if args.limit is not None:
+        entries = entries[: args.limit]
+
+    print(f"Reconstruindo {len(entries)} sujeito(s): {[_tag_of(e) for e in entries]}", flush=True)
+
     scheme_dir = Path(args.scheme_dir)
     out_dir = Path(args.out_dir)
 
     for e in entries:
-        tag = e.subject if not e.session else f"{e.subject}_{e.session}"
+        tag = _tag_of(e)
         scheme_path = scheme_dir / f"{tag}_scheme.npz"
         key = f"{args.shell_b}__{args.n_level}"
         if not scheme_path.exists():

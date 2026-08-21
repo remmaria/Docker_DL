@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=dmri_eval
-#SBATCH --cluster=htc
-#SBATCH --partition=preempt
+#SBATCH --cluster=gpu
+#SBATCH --partition=l40s
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -11,12 +11,19 @@
 #SBATCH --error=logs/eval.%A_%a.err
 #SBATCH --output=logs/eval.%A_%a.out
 #
-
-# sbatch --array=1-127 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 # Metricas de sinal (etapa 6) + downstream DTI/NODDI (etapa 7). So CPU
 # (nao pedimos --gres=gpu). Mesmo esquema de array das etapas anteriores.
 # Adicione --run-noddi (variavel RUN_NODDI=1) se tiver o pacote `amico`
 # instalado no env -- so tem efeito para sujeitos com >=2 shells.
+#
+# ROI_TRACTS="FX,CGC,CGH,UF" (variavel de ambiente, lista separada por
+# virgula) restringe as metricas de DTI/NODDI da etapa 7 tambem aos tratos
+# JHU-ICBM pedidos (alem da mascara inteira, que continua sendo calculada
+# sempre) -- ver utils/masking.py:load_roi_masks e scripts/07_downstream_dti_noddi.py.
+# Cada trato precisa de um arquivo
+# "JHU-ICBM-labels-1mm_warped_s_<TRATO>_<R/L>.nii.gz" (ou sem sufixo de
+# lado, ex. FX) na mesma pasta do dwi de cada sujeito. Sem essa variavel,
+# comportamento antigo inalterado (so 'whole_mask').
 #
 # CLEANUP_AFTER=1 apaga os recon_target.nii.gz (baseline + RCAE) desse
 # combo logo depois de calcular as metricas -- eles ja nao servem pra mais
@@ -123,6 +130,12 @@ if [[ "${RUN_NODDI:-0}" == "1" ]]; then
     NODDI_FLAG="--run-noddi"
 fi
 
+ROI_FLAG=()
+if [[ -n "${ROI_TRACTS:-}" ]]; then
+    ROI_FLAG=(--roi-tracts "$ROI_TRACTS")
+    echo "ROI_TRACTS=$ROI_TRACTS -- metricas da etapa 7 tambem restritas a esses tratos"
+fi
+
 python scripts/07_downstream_dti_noddi.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --baseline-dir "$WORK_DIR/baseline_recon" \
@@ -130,7 +143,7 @@ python scripts/07_downstream_dti_noddi.py \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT" \
     --out-dir "$WORK_DIR/downstream" \
-    $NODDI_FLAG
+    $NODDI_FLAG "${ROI_FLAG[@]}"
 
 if [[ "${CLEANUP_AFTER:-0}" == "1" ]]; then
     if [[ "$SHARD_COUNT" -gt 1 ]]; then

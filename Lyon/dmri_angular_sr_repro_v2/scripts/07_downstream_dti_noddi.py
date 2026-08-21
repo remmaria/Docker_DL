@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.manifest import load_manifest
 from utils.gradients import load_dwi, load_bval_bvec, split_shells
-from utils.masking import load_or_build_mask
+from utils.masking import load_or_build_mask, load_roi_masks, JHU_TRACT_LABELS
 
 
 def build_full_volume(gt_data, target_idx, recon_dir, tag, shell_b, n_level):
@@ -128,6 +128,16 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--split", default="test")
     ap.add_argument("--run-noddi", action="store_true")
+    ap.add_argument("--roi-tracts", default=None,
+                     help="lista separada por virgula de tratos JHU-ICBM para restringir "
+                          "as metricas alem da mascara inteira (ex.: 'FX,CGC,CGH,UF' -- "
+                          "relevantes para Alzheimer). Cada trato precisa de um arquivo "
+                          "'JHU-ICBM-labels-1mm_warped_s_<TRATO>_<R/L>.nii.gz' (ou sem "
+                          "sufixo de lado, ex. FX) na mesma pasta do dwi do sujeito. "
+                          "Tratos disponiveis conhecidos: " + ", ".join(
+                              f"{k} ({v})" for k, v in JHU_TRACT_LABELS.items()) +
+                          ". Sem essa flag, so a metrica de mascara inteira ('whole_mask') "
+                          "e calculada (comportamento antigo, inalterado).")
     ap.add_argument("--mask-suffix", default="_mask3d.nii.gz")
     ap.add_argument("--shell-tol", type=float, default=100.0)
     ap.add_argument("--shard-index", type=int, default=0,
@@ -141,6 +151,7 @@ def main():
     args = ap.parse_args()
     if not (0 <= args.shard_index < max(args.shard_count, 1)):
         sys.exit(f"--shard-index ({args.shard_index}) fora do intervalo [0, {args.shard_count})")
+    roi_tracts = [t.strip() for t in args.roi_tracts.split(",") if t.strip()] if args.roi_tracts else []
 
     entries = [e for e in load_manifest(args.manifest) if e.split == args.split]
     if args.shard_count > 1:
@@ -160,6 +171,11 @@ def main():
             continue
         b0_mean = gt_data[..., shells[0]].mean(axis=-1)
         mask = load_or_build_mask(e.dwi_path, b0_mean, mask_suffix=args.mask_suffix)
+
+        rois = {"whole_mask": mask.astype(bool)}
+        if roi_tracts:
+            tract_masks = load_roi_masks(e.dwi_path, roi_tracts, base_mask=mask)
+            rois.update(tract_masks)
 
         variants = {"ground_truth": gt_data}
         for method, recon_dir in (("baseline_sh", args.baseline_dir), ("rcae", args.rcae_dir)):
@@ -191,24 +207,29 @@ def main():
                                                          out_dir / "noddi_tmp" / tag / method)
 
         gt_dti = dti_maps["ground_truth"]
-        for method in variants:
-            if method == "ground_truth":
-                continue
-            m = mask.astype(bool)
-            row = {"subject": e.subject, "method": method, "shell": args.shell_b, "n_level": args.n_level,
-                   "acquisition_context": "from_multishell" if e.is_multishell else "native_single_shell"}
-            for metric in ("FA", "MD", "AD", "RD"):
-                diff = dti_maps[method][metric][m] - gt_dti[metric][m]
-                row[f"{metric}_mae"] = float(np.nanmean(np.abs(diff)))
-                row[f"{metric}_corr"] = float(np.corrcoef(
-                    dti_maps[method][metric][m], gt_dti[metric][m])[0, 1])
-            if args.run_noddi and noddi_maps.get(method) and noddi_maps.get("ground_truth"):
-                for metric in ("NDI", "ODI", "ISOVF"):
-                    diff = noddi_maps[method][metric][m] - noddi_maps["ground_truth"][metric][m]
+        for roi_name, roi_mask in rois.items():
+            m = roi_mask
+            n_vox = int(m.sum())
+            for method in variants:
+                if method == "ground_truth":
+                    continue
+                row = {"subject": e.subject, "method": method, "shell": args.shell_b,
+                       "n_level": args.n_level, "roi": roi_name, "n_voxels": n_vox,
+                       "acquisition_context": "from_multishell" if e.is_multishell else "native_single_shell"}
+                for metric in ("FA", "MD", "AD", "RD"):
+                    diff = dti_maps[method][metric][m] - gt_dti[metric][m]
                     row[f"{metric}_mae"] = float(np.nanmean(np.abs(diff)))
+                    # correlacao pixel-a-pixel exige pelo menos 2 voxels validos
+                    # (ROIs pequenas de trato podem ter poucos voxels)
                     row[f"{metric}_corr"] = float(np.corrcoef(
-                        noddi_maps[method][metric][m], noddi_maps["ground_truth"][metric][m])[0, 1])
-            rows.append(row)
+                        dti_maps[method][metric][m], gt_dti[metric][m])[0, 1]) if n_vox >= 2 else np.nan
+                if args.run_noddi and noddi_maps.get(method) and noddi_maps.get("ground_truth"):
+                    for metric in ("NDI", "ODI", "ISOVF"):
+                        diff = noddi_maps[method][metric][m] - noddi_maps["ground_truth"][metric][m]
+                        row[f"{metric}_mae"] = float(np.nanmean(np.abs(diff)))
+                        row[f"{metric}_corr"] = float(np.corrcoef(
+                            noddi_maps[method][metric][m], noddi_maps["ground_truth"][metric][m])[0, 1]) if n_vox >= 2 else np.nan
+                rows.append(row)
 
         # salva os mapas DTI do sujeito (todas as variantes) para inspecao visual
         import nibabel as nib
@@ -219,7 +240,8 @@ def main():
                 nib.save(nib.Nifti1Image(arr.astype(np.float32), affine),
                           maps_dir / f"{method}_{metric}.nii.gz")
 
-        print(f"{tag}: DTI ajustado para {list(variants.keys())}")
+        print(f"{tag}: DTI ajustado para {list(variants.keys())}; ROIs avaliadas: "
+              f"{list(rois.keys())}")
 
     out_csv = out_dir / f"dti_noddi_metrics_shell{int(args.shell_b)}_n{args.n_level}.csv"
     if args.shard_count > 1:
@@ -236,7 +258,7 @@ def main():
             print(f"[shard {args.shard_index}/{args.shard_count}] nenhum resultado neste "
                   f"shard -- gravando CSV vazio em {out_csv}", flush=True)
             out_csv.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(columns=["subject", "method", "shell", "n_level",
+            pd.DataFrame(columns=["subject", "method", "shell", "n_level", "roi", "n_voxels",
                                    "acquisition_context"]).to_csv(out_csv, index=False)
             return
         sys.exit("Nenhum resultado -- confira os diretorios de reconstrucao e a shell/nivel pedidos")
@@ -245,7 +267,7 @@ def main():
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
     print("Metricas downstream salvas em", out_csv)
-    print(df.groupby("method")[[c for c in df.columns if c.endswith("_mae")]].mean())
+    print(df.groupby(["roi", "method"])[[c for c in df.columns if c.endswith("_mae")]].mean())
 
 
 if __name__ == "__main__":

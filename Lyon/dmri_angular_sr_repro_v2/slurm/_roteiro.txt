@@ -1,0 +1,30 @@
+
+
+#------------04_reconstruct_rcae.sh
+
+RECON_LIMIT=1 \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3496007_0/best.pt \
+    sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+ou
+RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3496007_0/best.pt \
+    sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+
+
+
+#------------poc_csd_direction_count.sh
+
+POC_SUBJECTS="20170920171326_616_20170920171326_616" \
+    ROI_TRACTS="FX,CGC,CGH,UF" \
+    sbatch poc_csd_direction_count.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+ROI_TRACTS="FX,CGC,CGH,UF" \
+    sbatch --array=1-20 poc_csd_direction_count.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10 20
+
+# Se alguma falhar
+ROI_TRACTS="FX,CGC,CGH,UF" \
+    SHARD_COUNT_OVERRIDE=20 \
+    sbatch --array=3,7 poc_csd_direction_count.sh <work_dir> 1000 10 20
+
+python merge_shard_csvs.py --dir /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/metrics

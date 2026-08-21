@@ -29,6 +29,14 @@
 #   sbatch slurm/04_reconstruct_rcae.sh <work_dir> <shell_b> <n_level>   # sem array
 #   CKPT_JOB_ID=10972424_0 sbatch slurm/04_reconstruct_rcae.sh <work_dir> <shell_b> <n_level>
 #   CKPT_PATH=/caminho/explicito/best.pt sbatch slurm/04_reconstruct_rcae.sh <work_dir> <shell_b> <n_level>
+#
+# RECON_SUBJECTS="tag1,tag2" e/ou RECON_LIMIT=1 (variaveis de ambiente)
+# restringem a reconstrucao a poucos sujeitos -- util pra testar rapido um
+# checkpoint preliminar sem esperar o split de teste inteiro reconstruir.
+# 'tag' e subject (ou subject_session, se houver sessao) -- o mesmo que
+# aparece nas colunas dos CSVs de metricas/POC. Ex.:
+#   RECON_LIMIT=1 sbatch slurm/04_reconstruct_rcae.sh <work_dir> 1000 10
+#   RECON_SUBJECTS="20170920171326_616_20170920171326_616" sbatch slurm/04_reconstruct_rcae.sh <work_dir> 1000 10
 
 set -euo pipefail
 mkdir -p logs
@@ -69,10 +77,22 @@ if [[ ! -f "$CKPT" ]]; then
     exit 1
 fi
 
+SUBJECTS_FLAG=()
+if [[ -n "${RECON_SUBJECTS:-}" ]]; then
+    SUBJECTS_FLAG=(--subjects "$RECON_SUBJECTS")
+    echo "RECON_SUBJECTS=$RECON_SUBJECTS -- restringindo reconstrucao a esse(s) sujeito(s)"
+fi
+LIMIT_FLAG=()
+if [[ -n "${RECON_LIMIT:-}" ]]; then
+    LIMIT_FLAG=(--limit "$RECON_LIMIT")
+    echo "RECON_LIMIT=$RECON_LIMIT -- restringindo reconstrucao aos primeiros $RECON_LIMIT sujeito(s)"
+fi
+
 python scripts/05_reconstruct_rcae.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --scheme-dir "$WORK_DIR/subsampling" \
     --checkpoint "$CKPT" \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --out-dir "$WORK_DIR/rcae_recon" \
-    --split test --patch-size 24 --stride 16
+    --split test --patch-size 24 --stride 16 \
+    "${SUBJECTS_FLAG[@]}" "${LIMIT_FLAG[@]}"

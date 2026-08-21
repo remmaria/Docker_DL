@@ -67,7 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.manifest import load_manifest
 from utils.gradients import load_bval_bvec, load_dwi, split_shells
-from utils.masking import load_or_build_mask
+from utils.masking import load_or_build_mask, load_roi_masks, JHU_TRACT_LABELS
 
 
 def max_order_for_n_directions(n_dirs: int) -> int:
@@ -269,6 +269,11 @@ def process_subject(e, tag, args):
             conditions["preenchido_rcae"] = (filled[..., idx_filled], bvals[idx_filled],
                                               bvecs[idx_filled], args.sh_order)
 
+    # AJUSTE do CSD (a parte cara) acontece UMA VEZ por condicao, sobre o
+    # cerebro inteiro -- igual antes. As ROIs (se pedidas) so restringem
+    # QUAIS VOXELS entram nas metricas depois, reaproveitando o mesmo
+    # ajuste (shm_coeff e os mapas de pico) -- nao reajusta CSD por ROI,
+    # so re-mascara arrays numpy ja calculados (barato).
     results = {}
     fit_errors = []
     for name, (vol, bv, bvc, order) in conditions.items():
@@ -276,8 +281,7 @@ def process_subject(e, tag, args):
             n_peaks_map, peak_dirs, peak_vals, shm_coeff = fit_csd_peaks(
                 vol, bv, bvc, mask, order, args.npeaks,
                 args.relative_peak_threshold, args.min_separation_angle)
-            energy_by_l = sh_energy_by_order(shm_coeff, order, mask)
-            results[name] = (n_peaks_map, peak_dirs, peak_vals, len(bv), order, energy_by_l)
+            results[name] = (n_peaks_map, peak_dirs, peak_vals, len(bv), order, shm_coeff)
         except Exception as exc:
             fit_errors.append(f"{name}: {type(exc).__name__}: {exc}")
             results[name] = None
@@ -285,71 +289,81 @@ def process_subject(e, tag, args):
     if results.get("referencia") is None:
         return None, f"{tag}: CSD falhou na REFERENCIA ({fit_errors}) -- sujeito descartado"
 
-    ref_peaks, ref_dirs, _ref_vals, ref_n, ref_order, ref_energy_by_l = results["referencia"]
-    ref_mask = mask.astype(bool)
+    ref_peaks, ref_dirs, _ref_vals, ref_n, ref_order, ref_shm_coeff = results["referencia"]
+    brain_mask = mask.astype(bool)
     ref_class = classify(ref_peaks)
 
+    # ROIs: sempre inclui 'whole_mask' (comportamento antigo, sem
+    # restricao); --roi-tracts adiciona uma rodada extra de metricas por
+    # trato JHU pedido, cada uma intersectada com a mascara de cerebro.
+    rois = {"whole_mask": brain_mask}
+    if args.roi_tracts:
+        tract_masks = load_roi_masks(e.dwi_path, args.roi_tracts, base_mask=brain_mask)
+        rois.update(tract_masks)
+
     rows = []
-    for name in ("bruto_n", "bruto_n_ordem_max", "preenchido_sh", "preenchido_rcae"):
-        if name not in results:
-            continue
-        n_dirs_used = conditions[name][1].shape[0] if name in conditions else None
-        order_used = conditions[name][3] if name in conditions else None
-        if results[name] is None:
-            rows.append({"subject": e.subject, "tag": tag, "condition": name,
-                         "shell": args.shell_b, "n_level": args.n_level,
-                         "n_dirs_used": n_dirs_used, "sh_order_used": order_used,
-                         "fit_failed": True})
-            continue
-        cond_peaks, cond_dirs, _cond_vals, cond_n, cond_order, cond_energy_by_l = results[name]
-        cond_class = classify(cond_peaks)
+    for roi_name, roi_bool in rois.items():
+        ref_mask = brain_mask & roi_bool
+        ref_energy_by_l = sh_energy_by_order(ref_shm_coeff, ref_order, ref_mask)
 
-        both_valid = ref_mask & (cond_peaks >= 0)
-        n_voxels = int(both_valid.sum())
+        for name in ("bruto_n", "bruto_n_ordem_max", "preenchido_sh", "preenchido_rcae"):
+            if name not in results:
+                continue
+            n_dirs_used = conditions[name][1].shape[0] if name in conditions else None
+            order_used = conditions[name][3] if name in conditions else None
+            if results[name] is None:
+                rows.append({"subject": e.subject, "tag": tag, "condition": name, "roi": roi_name,
+                             "shell": args.shell_b, "n_level": args.n_level,
+                             "n_dirs_used": n_dirs_used, "sh_order_used": order_used,
+                             "fit_failed": True})
+                continue
+            cond_peaks, cond_dirs, _cond_vals, cond_n, cond_order, cond_shm_coeff = results[name]
+            cond_class = classify(cond_peaks)
+            cond_energy_by_l = sh_energy_by_order(cond_shm_coeff, cond_order, ref_mask)
 
-        # confusao "tem cruzamento" (>=2 picos) vs referencia
-        ref_crossing = (ref_class == "crossing") & both_valid
-        cond_crossing = (cond_class == "crossing") & both_valid
-        true_pos = int((ref_crossing & cond_crossing).sum())
-        false_neg = int((ref_crossing & ~cond_crossing).sum())
-        false_pos = int((~ref_crossing & cond_crossing).sum())
-        true_neg = int((~ref_crossing & ~cond_crossing).sum())
-        n_ref_crossing = int(ref_crossing.sum())
-        recall_crossing = true_pos / n_ref_crossing if n_ref_crossing else float("nan")
-        precision_crossing = true_pos / (true_pos + false_pos) if (true_pos + false_pos) else float("nan")
+            both_valid = ref_mask & (cond_peaks >= 0)
+            n_voxels = int(both_valid.sum())
 
-        both_have_peak = both_valid & (ref_peaks >= 1) & (cond_peaks >= 1)
-        ang_err = angular_error_primary_peak(ref_dirs, cond_dirs, both_have_peak)
+            # confusao "tem cruzamento" (>=2 picos) vs referencia
+            ref_crossing = (ref_class == "crossing") & both_valid
+            cond_crossing = (cond_class == "crossing") & both_valid
+            true_pos = int((ref_crossing & cond_crossing).sum())
+            false_neg = int((ref_crossing & ~cond_crossing).sum())
+            false_pos = int((~ref_crossing & cond_crossing).sum())
+            true_neg = int((~ref_crossing & ~cond_crossing).sum())
+            n_ref_crossing = int(ref_crossing.sum())
+            recall_crossing = true_pos / n_ref_crossing if n_ref_crossing else float("nan")
+            precision_crossing = true_pos / (true_pos + false_pos) if (true_pos + false_pos) else float("nan")
 
-        row = {
-            "subject": e.subject, "tag": tag, "condition": name,
-            "shell": args.shell_b, "n_level": args.n_level,
-            "n_dirs_used": n_dirs_used, "sh_order_used": order_used, "fit_failed": False,
-            "n_voxels": n_voxels, "n_ref_crossing_voxels": n_ref_crossing,
-            "recall_crossing": recall_crossing, "precision_crossing": precision_crossing,
-            "true_pos": true_pos, "false_neg": false_neg, "false_pos": false_pos, "true_neg": true_neg,
-            "primary_peak_angular_error_mean_deg": float(np.mean(ang_err)) if ang_err.size else float("nan"),
-            "primary_peak_angular_error_median_deg": float(np.median(ang_err)) if ang_err.size else float("nan"),
-            "n_voxels_both_have_peak": int(both_have_peak.sum()),
-        }
+            both_have_peak = both_valid & (ref_peaks >= 1) & (cond_peaks >= 1)
+            ang_err = angular_error_primary_peak(ref_dirs, cond_dirs, both_have_peak)
 
-        # energia SH por ordem l (0,2,4,6,8) -- da condicao e da referencia
-        # lado a lado, pra comparar direto na mesma linha sem precisar de
-        # join. "energy_frac_high_order" soma as fracoes de l>=4 (a parte
-        # que sozinha poderia representar cruzamento) -- ver resposta que
-        # motivou essa adicao: mostra se o ajuste de ordem alta realmente
-        # tem energia sustentada por dado, ou se e so ruido/prior.
-        for l, (energy_mean, energy_frac) in cond_energy_by_l.items():
-            row[f"energy_l{l}_mean"] = energy_mean
-            row[f"energy_l{l}_frac"] = energy_frac
-        row["energy_frac_high_order"] = float(sum(
-            frac for l, (_e, frac) in cond_energy_by_l.items() if l >= 4)) if cond_energy_by_l else float("nan")
-        for l, (energy_mean, energy_frac) in ref_energy_by_l.items():
-            row[f"ref_energy_l{l}_frac"] = energy_frac
-        row["ref_energy_frac_high_order"] = float(sum(
-            frac for l, (_e, frac) in ref_energy_by_l.items() if l >= 4)) if ref_energy_by_l else float("nan")
+            row = {
+                "subject": e.subject, "tag": tag, "condition": name, "roi": roi_name,
+                "shell": args.shell_b, "n_level": args.n_level,
+                "n_dirs_used": n_dirs_used, "sh_order_used": order_used, "fit_failed": False,
+                "n_voxels": n_voxels, "n_ref_crossing_voxels": n_ref_crossing,
+                "recall_crossing": recall_crossing, "precision_crossing": precision_crossing,
+                "true_pos": true_pos, "false_neg": false_neg, "false_pos": false_pos, "true_neg": true_neg,
+                "primary_peak_angular_error_mean_deg": float(np.mean(ang_err)) if ang_err.size else float("nan"),
+                "primary_peak_angular_error_median_deg": float(np.median(ang_err)) if ang_err.size else float("nan"),
+                "n_voxels_both_have_peak": int(both_have_peak.sum()),
+            }
 
-        rows.append(row)
+            # energia SH por ordem l (0,2,4,6,8) -- da condicao e da
+            # referencia lado a lado, JA restrita a essa ROI -- ver
+            # sh_energy_by_order pro racional completo.
+            for l, (energy_mean, energy_frac) in cond_energy_by_l.items():
+                row[f"energy_l{l}_mean"] = energy_mean
+                row[f"energy_l{l}_frac"] = energy_frac
+            row["energy_frac_high_order"] = float(sum(
+                frac for l, (_e, frac) in cond_energy_by_l.items() if l >= 4)) if cond_energy_by_l else float("nan")
+            for l, (energy_mean, energy_frac) in ref_energy_by_l.items():
+                row[f"ref_energy_l{l}_frac"] = energy_frac
+            row["ref_energy_frac_high_order"] = float(sum(
+                frac for l, (_e, frac) in ref_energy_by_l.items() if l >= 4)) if ref_energy_by_l else float("nan")
+
+            rows.append(row)
     return rows, ("; ".join(fit_errors) if fit_errors else None)
 
 
@@ -376,19 +390,74 @@ def main():
     ap.add_argument("--min-separation-angle", type=float, default=25.0)
     ap.add_argument("--n-subjects", type=int, default=8,
                      help="amostra aleatoria de sujeitos do split (default 8 -- CSD x3-4 "
-                          "condicoes por sujeito e caro; 0 = todos os sujeitos do split).")
+                          "condicoes por sujeito e caro; 0 = todos os sujeitos do split). "
+                          "Ignorado se --subjects for passado.")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--subjects", default=None,
+                     help="lista separada por virgula de 'tag' de sujeito (subject, ou "
+                          "subject_session se houver sessao -- mesmo 'tag' das colunas dos "
+                          "CSVs) para rodar em sujeitos ESPECIFICOS em vez de uma amostra "
+                          "aleatoria -- por exemplo, os mesmos sujeitos pra quem voce ja "
+                          "reconstruiu com --subjects/--limit em 05_reconstruct_rcae.py, "
+                          "pra garantir que a condicao preenchido_rcae apareca sem depender "
+                          "de --seed/--n-subjects reamostrarem os mesmos sujeitos por "
+                          "coincidencia. Quando usado, ignora --n-subjects/--seed.")
+    ap.add_argument("--roi-tracts", default=None,
+                     help="lista separada por virgula de tratos JHU-ICBM (ex.: 'FX,CGC,CGH,UF') "
+                          "para TAMBEM calcular as metricas de crossing-fiber restritas a esses "
+                          "tratos, alem do cerebro inteiro ('whole_mask', sempre calculado). "
+                          "Mesma convencao de arquivo do --roi-tracts em "
+                          "07_downstream_dti_noddi.py (ver utils/masking.py:load_roi_masks). "
+                          "Tratos conhecidos: " + ", ".join(
+                              f"{k} ({v})" for k, v in JHU_TRACT_LABELS.items()) +
+                          ". NAO reajusta o CSD por ROI (caro) -- so re-mascara os mapas de "
+                          "pico/coeficientes SH ja ajustados no cerebro inteiro, entao e barato "
+                          "mesmo pedindo varios tratos de uma vez.")
+    ap.add_argument("--shard-index", type=int, default=0,
+                     help="CSD x3-4 condicoes x (1 + N ROIs) por sujeito e caro -- sharding "
+                          "por sujeito (mesmo padrao de crossing_fiber_stratified_eval.py e "
+                          "05_evaluate_and_downstream.sh) deixa cada array task processar so "
+                          "uma fatia dos sujeitos AMOSTRADOS (apos --n-subjects/--subjects), "
+                          "em paralelo. Junte os CSVs depois com merge_shard_csvs.py.")
+    ap.add_argument("--shard-count", type=int, default=1)
     ap.add_argument("--out-csv", required=True)
     args = ap.parse_args()
+    roi_tracts_list = [t.strip() for t in args.roi_tracts.split(",") if t.strip()] if args.roi_tracts else []
+    args.roi_tracts = roi_tracts_list
+    if not (0 <= args.shard_index < max(args.shard_count, 1)):
+        sys.exit(f"--shard-index ({args.shard_index}) fora do intervalo [0, {args.shard_count})")
 
     entries = [e for e in load_manifest(args.manifest) if e.split == args.split]
     if not entries:
         sys.exit(f"Nenhum sujeito no split={args.split!r}")
-    if args.n_subjects and args.n_subjects > 0:
+
+    def _tag_of(e):
+        return e.subject if not e.session else f"{e.subject}_{e.session}"
+
+    if args.subjects:
+        wanted = {t.strip() for t in args.subjects.split(",") if t.strip()}
+        entries = [e for e in entries if _tag_of(e) in wanted]
+        missing = wanted - {_tag_of(e) for e in entries}
+        if missing:
+            print(f"[aviso] --subjects pediu {sorted(missing)}, mas nao encontrei no split "
+                  f"{args.split!r} do manifesto.", flush=True)
+        if not entries:
+            sys.exit(f"Nenhum dos sujeitos pedidos em --subjects foi encontrado no split "
+                      f"{args.split!r} -- nada a fazer.")
+    elif args.n_subjects and args.n_subjects > 0:
         rng = np.random.default_rng(args.seed)
         idx = rng.choice(len(entries), size=min(args.n_subjects, len(entries)), replace=False)
         entries = [entries[i] for i in sorted(idx)]
-    print(f"Rodando prova de conceito em {len(entries)} sujeito(s) "
+
+    # sharding acontece DEPOIS da amostragem/selecao de sujeitos -- cada
+    # array task pega uma fatia do MESMO conjunto de sujeitos que uma
+    # rodada sem sharding processaria (nao reamostra por task).
+    if args.shard_count > 1:
+        entries = entries[args.shard_index::args.shard_count]
+        print(f"[shard {args.shard_index}/{args.shard_count}] {len(entries)} sujeito(s) "
+              f"neste shard", flush=True)
+
+    print(f"Rodando prova de conceito em {len(entries)} sujeito(s): {[_tag_of(e) for e in entries]} "
           f"(shell={args.shell_b}, n_level={args.n_level}, sh_order={args.sh_order})", flush=True)
 
     all_rows = []
@@ -409,10 +478,19 @@ def main():
             traceback.print_exc()
 
     out_csv = Path(args.out_csv)
+    if args.shard_count > 1:
+        out_csv = out_csv.with_name(
+            f"{out_csv.stem}.shard{args.shard_index}of{args.shard_count}{out_csv.suffix}")
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     if not all_rows:
-        print("Nenhum resultado -- gravando CSV vazio em", out_csv, flush=True)
-        pd.DataFrame(columns=["subject", "tag", "condition", "shell", "n_level", "n_dirs_used",
+        # mesmo raciocinio de 06_evaluate_reconstruction.py/07_downstream_dti_noddi.py: um
+        # shard sem nenhum resultado (sujeito(s) sem combo/scheme pra essa shell/nivel, ou
+        # cuja REFERENCIA falhou) e valido, nao erro, quando sharded -- grava CSV vazio em
+        # vez de so imprimir, senao merge_shard_csvs.py fica esperando pra sempre por esse
+        # shard.
+        print(f"[shard {args.shard_index}/{args.shard_count}] nenhum resultado neste shard -- "
+              f"gravando CSV vazio em {out_csv}", flush=True)
+        pd.DataFrame(columns=["subject", "tag", "condition", "roi", "shell", "n_level", "n_dirs_used",
                                "fit_failed", "n_voxels", "recall_crossing", "precision_crossing",
                                "primary_peak_angular_error_mean_deg"]).to_csv(out_csv, index=False)
         return
@@ -421,12 +499,17 @@ def main():
     df.to_csv(out_csv, index=False)
     print("\nResultados salvos em", out_csv)
 
-    print("\n=== resumo (media entre sujeitos, por condicao) ===")
+    if args.shard_count > 1:
+        print(f"\n[shard {args.shard_index}/{args.shard_count}] resumo abaixo e SO deste "
+              f"shard -- junte todos os shards com merge_shard_csvs.py antes de olhar o "
+              f"resumo agregado de verdade.")
+    print("\n=== resumo (media entre sujeitos, por ROI x condicao) ===")
     ok = df[~df["fit_failed"].fillna(False)]
     if not ok.empty:
         summary_cols = ["n_dirs_used", "sh_order_used", "recall_crossing", "precision_crossing",
                         "primary_peak_angular_error_mean_deg", "energy_frac_high_order"]
-        summary = ok.groupby("condition")[[c for c in summary_cols if c in ok.columns]].mean()
+        group_cols = ["roi", "condition"] if "roi" in ok.columns else ["condition"]
+        summary = ok.groupby(group_cols)[[c for c in summary_cols if c in ok.columns]].mean()
         print(summary)
         if "ref_energy_frac_high_order" in ok.columns:
             print(f"\n(referencia: fracao media de energia SH em ordem l>=4 = "
