@@ -148,12 +148,33 @@ def main():
                      help="numero total de shards (default 1 = sem sharding). Com "
                           "shard-count>1 o CSV final ganha sufixo '.shardIofN' -- junte "
                           "depois com scripts/merge_shard_csvs.py.")
+    ap.add_argument("--subjects", default=None,
+                     help="lista separada por virgula de 'tag' de sujeito (subject, ou "
+                          "subject_session se houver sessao) para restringir o downstream a "
+                          "esses sujeitos especificos -- mesma convencao de --subjects em "
+                          "scripts/05_reconstruct_rcae.py e 06_evaluate_reconstruction.py. "
+                          "Util pra nao rodar DTI/NODDI em sujeitos que nao tem reconstrucao "
+                          "'rcae' de qualquer forma (ex.: um checkpoint reconstruido so num "
+                          "sujeito via RECON_SUBJECTS pra smoke test).")
     args = ap.parse_args()
     if not (0 <= args.shard_index < max(args.shard_count, 1)):
         sys.exit(f"--shard-index ({args.shard_index}) fora do intervalo [0, {args.shard_count})")
     roi_tracts = [t.strip() for t in args.roi_tracts.split(",") if t.strip()] if args.roi_tracts else []
 
     entries = [e for e in load_manifest(args.manifest) if e.split == args.split]
+    if args.subjects:
+        wanted = {t.strip() for t in args.subjects.split(",") if t.strip()}
+        def _tag_of(e):
+            return e.subject if not e.session else f"{e.subject}_{e.session}"
+        entries = [e for e in entries if _tag_of(e) in wanted]
+        found = {_tag_of(e) for e in entries}
+        missing = wanted - found
+        if missing:
+            print(f"[aviso] --subjects pediu {sorted(missing)}, mas nao encontrei no split "
+                  f"{args.split!r} do manifesto.", flush=True)
+        if not entries:
+            sys.exit(f"Nenhum dos sujeitos pedidos em --subjects foi encontrado no split "
+                      f"{args.split!r} -- nada a fazer.")
     if args.shard_count > 1:
         entries = entries[args.shard_index::args.shard_count]
         print(f"[shard {args.shard_index}/{args.shard_count}] {len(entries)} sujeitos "

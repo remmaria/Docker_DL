@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=dmri_eval
-#SBATCH --cluster=gpu
-#SBATCH --partition=l40s
+#SBATCH --cluster=htc
+#SBATCH --partition=preempt
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -54,6 +54,24 @@
 # n_level E estiver dentro de um array, o script entende que o array e
 # sharding por sujeito (usa --shard-index/--shard-count nos scripts de
 # Python) em vez de repetir o combo inteiro em cada task.
+#
+# RECON_TAG="algumnome" (variavel de ambiente, MESMO nome usado em
+# slurm/04_reconstruct_rcae.sh na hora de reconstruir) -- le de
+# "$WORK_DIR/rcae_recon_<tag>" em vez do caminho fixo "$WORK_DIR/rcae_recon",
+# e grava as metricas em arquivos/pastas com o mesmo sufixo (para nao
+# misturar avaliacoes de checkpoints diferentes reconstruidos com tags
+# diferentes no MESMO work_dir). Sem RECON_TAG, comportamento identico a
+# antes -- so funciona se voce reconstruiu com o MESMO RECON_TAG antes.
+#
+# RECON_SUBJECTS="tag1,tag2" (variavel de ambiente, MESMA convencao do
+# RECON_SUBJECTS em slurm/04_reconstruct_rcae.sh) restringe a etapa 6+7 a
+# esses sujeitos -- use os MESMOS sujeitos que voce reconstruiu com
+# RECON_SUBJECTS na etapa anterior, senao o script perde tempo calculando
+# DTI/NODDI do baseline_sh/ground_truth em sujeitos que nem tem
+# reconstrucao 'rcae' pra comparar (o resultado ainda sai certo sem isso,
+# so mais lento). Ex.:
+#   RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+#     sbatch slurm/05_evaluate_and_downstream.sh <work_dir> 1000 10
 
 set -euo pipefail
 mkdir -p logs
@@ -117,13 +135,30 @@ fi
 
 source "./00_env_common.sh"
 
+RCAE_DIR="$WORK_DIR/rcae_recon"
+METRICS_SUFFIX=""
+DOWNSTREAM_DIR="$WORK_DIR/downstream"
+if [[ -n "${RECON_TAG:-}" ]]; then
+    RCAE_DIR="$WORK_DIR/rcae_recon_${RECON_TAG}"
+    METRICS_SUFFIX=".${RECON_TAG}"
+    DOWNSTREAM_DIR="$WORK_DIR/downstream_${RECON_TAG}"
+    echo "RECON_TAG=$RECON_TAG -- lendo de $RCAE_DIR, gravando metricas em $DOWNSTREAM_DIR"
+fi
+
+SUBJECTS_FLAG=()
+if [[ -n "${RECON_SUBJECTS:-}" ]]; then
+    SUBJECTS_FLAG=(--subjects "$RECON_SUBJECTS")
+    echo "RECON_SUBJECTS=$RECON_SUBJECTS -- restringindo etapas 6+7 a esse(s) sujeito(s)"
+fi
+
 python scripts/06_evaluate_reconstruction.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --baseline-dir "$WORK_DIR/baseline_recon" \
-    --rcae-dir "$WORK_DIR/rcae_recon" \
+    --rcae-dir "$RCAE_DIR" \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT" \
-    --out-csv "$WORK_DIR/metrics/signal_metrics_shell${SHELL_B%.*}_n${N_LEVEL}.csv"
+    --out-csv "$WORK_DIR/metrics/signal_metrics_shell${SHELL_B%.*}_n${N_LEVEL}${METRICS_SUFFIX}.csv" \
+    "${SUBJECTS_FLAG[@]}"
 
 NODDI_FLAG=""
 if [[ "${RUN_NODDI:-0}" == "1" ]]; then
@@ -139,14 +174,18 @@ fi
 python scripts/07_downstream_dti_noddi.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --baseline-dir "$WORK_DIR/baseline_recon" \
-    --rcae-dir "$WORK_DIR/rcae_recon" \
+    --rcae-dir "$RCAE_DIR" \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT" \
-    --out-dir "$WORK_DIR/downstream" \
-    $NODDI_FLAG "${ROI_FLAG[@]}"
+    --out-dir "$DOWNSTREAM_DIR" \
+    $NODDI_FLAG "${ROI_FLAG[@]}" "${SUBJECTS_FLAG[@]}"
 
 if [[ "${CLEANUP_AFTER:-0}" == "1" ]]; then
-    if [[ "$SHARD_COUNT" -gt 1 ]]; then
+    if [[ -n "${RECON_TAG:-}" ]]; then
+        echo "CLEANUP_AFTER=1 ignorado com RECON_TAG definido -- scripts/10_cleanup_reconstructions.py "
+        echo "so conhece o caminho fixo (rcae_recon/baseline_recon), nao as pastas rotuladas por tag. "
+        echo "Apague $RCAE_DIR manualmente quando nao precisar mais dela."
+    elif [[ "$SHARD_COUNT" -gt 1 ]]; then
         echo "CLEANUP_AFTER=1 ignorado neste shard ($SHARD_INDEX/$SHARD_COUNT) -- rode a" \
              "limpeza manualmente DEPOIS de juntar todos os shards com merge_shard_csvs.py," \
              "senao outros shards ainda em andamento perdem os recon_target.nii.gz que precisam."

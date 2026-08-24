@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=dmri_rcae_recon
 #SBATCH --cluster=gpu
-#SBATCH --partition=l40s
+#SBATCH --partition=h200
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -37,6 +37,24 @@
 # aparece nas colunas dos CSVs de metricas/POC. Ex.:
 #   RECON_LIMIT=1 sbatch slurm/04_reconstruct_rcae.sh <work_dir> 1000 10
 #   RECON_SUBJECTS="20170920171326_616_20170920171326_616" sbatch slurm/04_reconstruct_rcae.sh <work_dir> 1000 10
+#
+# ATENCAO -- a saida (--out-dir abaixo) e SEMPRE "$WORK_DIR/rcae_recon",
+# INDEPENDENTE de qual CKPT_PATH/CKPT_JOB_ID voce passou: reconstruir duas
+# vezes pro MESMO shell_b/n_level com checkpoints DIFERENTES sobrescreve a
+# reconstrucao anterior, sem deixar rastro de qual .pt gerou o que esta la.
+# slurm/05_evaluate_and_downstream.sh so le o que estiver em rcae_recon
+# nesse momento -- ele nao sabe (nem tem como saber) qual checkpoint
+# reconstruiu aquilo.
+#
+# RECON_TAG="algumnome" (variavel de ambiente) evita essa sobrescrita:
+# grava em "$WORK_DIR/rcae_recon_<tag>" em vez do caminho fixo -- use o
+# MESMO RECON_TAG depois em slurm/05_evaluate_and_downstream.sh (mesma
+# variavel de ambiente, ver comentario la) pra ele ler dessa pasta rotulada
+# em vez da generica. Ex., pra manter varios checkpoints avaliados lado a
+# lado no MESMO work_dir sem um apagar o outro:
+#   RECON_TAG=job3498743 CKPT_JOB_ID=3498743_0 sbatch slurm/04_reconstruct_rcae.sh <work_dir> 1000 10
+#   RECON_TAG=job3498743 sbatch slurm/05_evaluate_and_downstream.sh <work_dir> 1000 10
+# Sem RECON_TAG, comportamento identico a antes (rcae_recon fixo).
 
 set -euo pipefail
 mkdir -p logs
@@ -88,11 +106,17 @@ if [[ -n "${RECON_LIMIT:-}" ]]; then
     echo "RECON_LIMIT=$RECON_LIMIT -- restringindo reconstrucao aos primeiros $RECON_LIMIT sujeito(s)"
 fi
 
+RECON_OUT_DIR="$WORK_DIR/rcae_recon"
+if [[ -n "${RECON_TAG:-}" ]]; then
+    RECON_OUT_DIR="$WORK_DIR/rcae_recon_${RECON_TAG}"
+    echo "RECON_TAG=$RECON_TAG -- gravando em $RECON_OUT_DIR (nao sobrescreve rcae_recon nem outras tags)"
+fi
+
 python scripts/05_reconstruct_rcae.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --scheme-dir "$WORK_DIR/subsampling" \
     --checkpoint "$CKPT" \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
-    --out-dir "$WORK_DIR/rcae_recon" \
+    --out-dir "$RECON_OUT_DIR" \
     --split test --patch-size 24 --stride 16 \
     "${SUBJECTS_FLAG[@]}" "${LIMIT_FLAG[@]}"

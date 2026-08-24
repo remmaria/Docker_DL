@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=dmri_baseline_recon
 #SBATCH --cluster=htc
-#SBATCH --partition=htc
+#SBATCH --partition=preempt
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -13,6 +13,7 @@
 #
 
 # sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
 # Reconstrucao do baseline SH (etapa 3) para UM combo (shell_b, n_level) por
 # vez -- roda por array, igual treino/reconstrucao do RCAE, em vez de gerar
 # os 30 combos de uma vez num job so. So CPU (nao pedimos --gres=gpu).

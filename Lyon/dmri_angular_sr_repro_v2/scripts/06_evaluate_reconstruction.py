@@ -103,6 +103,14 @@ def main():
                           "ganha um sufixo '.shardIofN' automaticamente (evita 2+ processos "
                           "escrevendo por cima do mesmo arquivo ao mesmo tempo) -- junte os "
                           "shards depois com scripts/merge_shard_csvs.py.")
+    ap.add_argument("--subjects", default=None,
+                     help="lista separada por virgula de 'tag' de sujeito (subject, ou "
+                          "subject_session se houver sessao) para restringir a avaliacao a "
+                          "esses sujeitos especificos, em vez do split inteiro -- mesma "
+                          "convencao de --subjects em scripts/05_reconstruct_rcae.py. Util "
+                          "pra avaliar rapido um checkpoint reconstruido com "
+                          "--subjects/RECON_SUBJECTS restrito, sem esperar o resto do split "
+                          "(que nao tem reconstrucao 'rcae' mesmo) ser processado a toa.")
     args = ap.parse_args()
 
     if args.baseline_dir is None and args.rcae_dir is None:
@@ -111,6 +119,19 @@ def main():
         sys.exit(f"--shard-index ({args.shard_index}) fora do intervalo [0, {args.shard_count})")
 
     entries = [e for e in load_manifest(args.manifest) if e.split == args.split]
+    if args.subjects:
+        wanted = {t.strip() for t in args.subjects.split(",") if t.strip()}
+        def _tag_of(e):
+            return e.subject if not e.session else f"{e.subject}_{e.session}"
+        entries = [e for e in entries if _tag_of(e) in wanted]
+        found = {_tag_of(e) for e in entries}
+        missing = wanted - found
+        if missing:
+            print(f"[aviso] --subjects pediu {sorted(missing)}, mas nao encontrei no split "
+                  f"{args.split!r} do manifesto.", flush=True)
+        if not entries:
+            sys.exit(f"Nenhum dos sujeitos pedidos em --subjects foi encontrado no split "
+                      f"{args.split!r} -- nada a fazer.")
     if args.shard_count > 1:
         entries = entries[args.shard_index::args.shard_count]
         print(f"[shard {args.shard_index}/{args.shard_count}] {len(entries)} sujeitos "

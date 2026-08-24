@@ -1,7 +1,19 @@
 
+
+sbatch 01_prepare_data.sh /ix1/tibrahim/rmm270/DATA/DWIs/studies/all_bias /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
+sbatch 01_prepare_data.sh /ix1/tibrahim/rmm270/DATA/DWIs/studies/all_bias /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh
+
+sbatch 02_baseline_sh.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
+sbatch 02_baseline_sh.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh
+
 #------------02b_baseline_reconstruct.sh
 
+sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1500 10
+
+sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
+sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1500 10
+
 
 
 #------------03_train_rcae.sh
@@ -9,17 +21,41 @@ sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/
 sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1500 10
 
+ANGULAR_LOSS_WEIGHT=0.5 \
+    SH_LOSS_HIGH_ORDER_MIN=2 \
+    sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+ANGULAR_LOSS_WEIGHT=0.5 \
+    SH_LOSS_HIGH_ORDER_MIN=2 \
+    sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1500 10
+
+ANGULAR_LOSS_WEIGHT=0.5 \
+    SH_LOSS_HIGH_ORDER_MIN=2 \
+    RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rcae_checkpoints/shell1000_n10/runs/3498743_0/last.pt \
+    sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
+
+RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3498740_0/best.pt \
+    sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+
+
 #------------04_reconstruct_rcae.sh
 
 RECON_LIMIT=1 \
     CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3496007_0/best.pt \
     sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 ou
-RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
-    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3496007_0/best.pt \
-    sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+RECON_TAG=3498743_0 \
+    RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rcae_checkpoints/shell1000_n10/runs/3498743_0/best.pt \
+    sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
 
 
+#------------05_evaluate_and_downstream.sh
+RECON_TAG=3498743_0 \
+    ROI_TRACTS="FX,CGC,CGH,UF" \
+    RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+    sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
 
 
 #------------poc_csd_direction_count.sh
@@ -37,3 +73,14 @@ ROI_TRACTS="FX,CGC,CGH,UF" \
     sbatch --array=3,7 poc_csd_direction_count.sh <work_dir> 1000 10 20
 
 python merge_shard_csvs.py --dir /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/metrics
+
+
+
+
+##
+RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+sbatch 09_compare_sh_loss.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10 3497479_0 3497625_0
+
+python scripts/compare_sh_loss_variants.py \
+    --sem-sh <work_dir>/downstream_semSH/dti_noddi_metrics_shell1000_n10.csv \
+    --com-sh <work_dir>/downstream_comSH/dti_noddi_metrics_shell1000_n10.csv

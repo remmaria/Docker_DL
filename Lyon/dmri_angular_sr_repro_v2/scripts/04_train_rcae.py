@@ -33,7 +33,97 @@ from utils.dataset import (
     DWIPatchDataset, collate_variable_targets, SubjectGroupedSampler, worker_init_fn,
 )
 from utils.viz import save_patch_debug_png
+from utils.sh_basis import real_sh_matrix, max_order_for_n_directions, cart2sphere
 from model.rcae import RCAE
+
+
+def n_coeffs_even(l_max: int) -> int:
+    """Numero de coeficientes de uma base SH real so com ordens PARES ate
+    `l_max` (inclusive): R = sum_{l=0,2,...,l_max} (2l+1) = (l_max+1)(l_max+2)/2.
+    Mesma formula usada implicitamente em utils/sh_basis.py
+    (max_order_for_n_directions/real_sh_matrix), so exposta aqui separada
+    pra usar no aviso de startup sem precisar montar a matriz inteira."""
+    return (l_max + 1) * (l_max + 2) // 2
+
+
+def _sh_column_degrees(l_max: int) -> np.ndarray:
+    """Grau `l` de cada coluna da matriz devolvida por
+    utils.sh_basis.real_sh_matrix -- essa funcao NAO devolve os graus
+    junto (ao contrario da versao alternativa em spherical_harmonics.py),
+    entao replicamos aqui o MESMO laco de enumeracao de colunas usado
+    dentro dela (`for l in range(0, l_max+1, 2): for m in range(-l, l+1)`)
+    pra saber quais colunas sao "ordem alta" sem duplicar a matematica da
+    base em si."""
+    ls = []
+    for l in range(0, l_max + 1, 2):
+        for _m in range(-l, l + 1):
+            ls.append(l)
+    return np.array(ls, dtype=np.float64)
+
+
+def compute_sh_angular_loss(pred, target_vols, target_bvecs, target_mask,
+                             l_max_cap=8, high_order_min=4):
+    """Termo de loss opcional no dominio angular/SH (ver protocolo, secao 9,
+    prioridade 1): alem da MAE sobre o sinal bruto (que pesa TODO voxel
+    igual, dominado pelos voxels de fibra unica que sao maioria do volume),
+    penaliza tambem o erro nos coeficientes SH de ordem >= `high_order_min`
+    (default l>=4) da FOD reconstruida -- exatamente os coeficientes que
+    carregam a informacao de fibra cruzando que a POC de CSD
+    (poc_csd_direction_count.py / sh_energy_by_order) mostrou serem onde o
+    RCAE ja leva vantagem sobre o baseline SH.
+
+    Projeta pred/target nas MESMAS direcoes-alvo (target_bvecs) usando a
+    mesma base SH real do baseline classico (utils/sh_basis.py), por item
+    do batch (cada item pode ter um subconjunto valido diferente de
+    direcoes-alvo, por causa do padding de collate_variable_targets quando
+    sujeitos do batch tem N_out diferente). A projecao (pseudo-inversa da
+    matriz de base, calculada a partir dos bvecs, sem gradiente) e um
+    mapeamento LINEAR nas direcoes -- o matmul com pred/target continua
+    totalmente diferenciavel.
+
+    Limitacao importante: com q_out=10 (default do treino, ver
+    slurm/03_train_rcae.sh), so ha direcoes-alvo suficientes pra sustentar
+    ate ordem l=2 (R=6 coeficientes; l=4 precisaria de 15). Ou seja, com o
+    q_out atual esse termo captura a componente anisotropica de ordem 2
+    (ja mais informativa que MAE puro, que mistura l=0 e l=2 com peso
+    igual por voxel), mas NAO chega a l>=4 de verdade -- pra isso e
+    preciso aumentar --q-out. Itens do batch sem direcoes-alvo validas
+    suficientes pra sustentar `high_order_min` sao pulados (nao contribuem
+    pra este termo; a loss de sinal continua normal pra eles)."""
+    device = pred.device
+    losses = []
+    target_mask_cpu = target_mask.detach().cpu().numpy()
+    for b in range(pred.shape[0]):
+        valid = target_mask_cpu[b].astype(bool)
+        n_valid = int(valid.sum())
+        if n_valid == 0:  # item totalmente padding (collate_variable_targets) -- sem direcao valida
+            continue
+        bvecs_b = target_bvecs[b, valid].detach().cpu().numpy()
+        l_max = min(max_order_for_n_directions(n_valid), l_max_cap)
+        if l_max < high_order_min:
+            # direcoes-alvo validas neste item nao sustentam a ordem pedida
+            # -- pula (nao inventa coeficiente de ordem alta sem dado pra
+            # sustentar), so a loss de sinal cobre este item.
+            continue
+        theta, phi = cart2sphere(bvecs_b)
+        Bmat = real_sh_matrix(theta, phi, l_max)  # (n_valid, R)
+        ls = _sh_column_degrees(l_max)            # (R,) -- mesma ordem de colunas
+        high_idx = np.nonzero(ls >= high_order_min)[0]
+        if high_idx.size == 0:
+            continue
+        Bmat_t = torch.as_tensor(Bmat, dtype=pred.dtype, device=device)
+        pinv = torch.linalg.pinv(Bmat_t)  # (R, n_valid)
+        valid_idx = torch.as_tensor(np.nonzero(valid)[0], device=device, dtype=torch.long)
+        pred_b = pred[b, valid_idx].reshape(n_valid, -1)          # (n_valid, voxels)
+        target_b = target_vols[b, valid_idx].reshape(n_valid, -1)
+        coeffs_pred = pinv @ pred_b        # (R, voxels)
+        coeffs_target = pinv @ target_b
+        high_idx_t = torch.as_tensor(high_idx, device=device, dtype=torch.long)
+        err = (coeffs_pred[high_idx_t] - coeffs_target[high_idx_t]).abs()
+        losses.append(err.mean())
+    if not losses:
+        return torch.zeros((), device=device, dtype=pred.dtype)
+    return torch.stack(losses).mean()
 
 
 def _tensor_stats(x: torch.Tensor, outlier_threshold: float = None) -> tuple:
@@ -61,7 +151,8 @@ def _tensor_stats(x: torch.Tensor, outlier_threshold: float = None) -> tuple:
 
 def run_epoch(model, loader, optimizer, device, train: bool, b_ref: float,
               epoch: int, batch_log_f=None, debug_state=None, outlier_threshold: float = 3.0,
-              batch_log_every: int = 5):
+              batch_log_every: int = 5, angular_loss_weight: float = 0.0,
+              sh_loss_high_order_min: int = 4, sh_loss_lmax_cap: int = 8):
     """debug_state (opcional): dict com "dir" (Path), "every" (int, a cada
     quantos batches de TREINO salvar um snapshot) e "step" (contador
     global, mutavel entre chamadas -- por isso e um dict e nao um int).
@@ -132,7 +223,19 @@ def run_epoch(model, loader, optimizer, device, train: bool, b_ref: float,
             # empurrar o modelo a "jogar seguro" e prever perto da media
             # entre direcoes justamente nos voxels mais variaveis).
             err = (pred - target_vols).abs()
-            loss = (err * mask).sum() / mask.sum().clamp(min=1.0)
+            loss_signal = (err * mask).sum() / mask.sum().clamp(min=1.0)
+            # termo angular/SH opcional (ver protocolo, secao 9, prioridade 1) --
+            # desativado por padrao (angular_loss_weight=0.0), loss identica a
+            # antes. Com peso > 0, soma-se a MAE dos coeficientes SH de ordem
+            # alta (compute_sh_angular_loss acima) -- ver limitacao de q_out ali.
+            if angular_loss_weight > 0:
+                loss_angular = compute_sh_angular_loss(
+                    pred, target_vols, target_bvecs, target_mask,
+                    l_max_cap=sh_loss_lmax_cap, high_order_min=sh_loss_high_order_min)
+                loss = loss_signal + angular_loss_weight * loss_angular
+            else:
+                loss_angular = None
+                loss = loss_signal
             if train:
                 optimizer.zero_grad()
                 loss.backward()
@@ -173,11 +276,18 @@ def run_epoch(model, loader, optimizer, device, train: bool, b_ref: float,
             # "significancia" nenhum aqui -- o dado bruto fica todo salvo,
             # e SEM aviso nenhum no stdout (isso ficava repetitivo demais).
             tags_str = ";".join(subject_tags)
+            # loss_signal/loss_angular: colunas novas no FIM (nao mudam a posicao
+            # das colunas antigas) -- loss_angular fica vazia quando o termo esta
+            # desativado (angular_loss_weight=0.0), pra deixar claro no CSV que
+            # aquele run nao usou o termo, em vez de escrever 0.0 (que poderia
+            # ser confundido com "termo ativo mas convergiu pra zero").
+            loss_angular_str = f"{loss_angular.item():.6f}" if loss_angular is not None else ""
             batch_log_f.write(
                 f"{epoch},{split},{n_batches},{loss.item():.6f},"
                 f"{in_mean:.4f},{in_std:.4f},{in_min:.4f},{in_max:.4f},{in_n_out},"
                 f"{tg_mean:.4f},{tg_std:.4f},{tg_min:.4f},{tg_max:.4f},{tg_n_out},"
-                f"{wait_s:.3f},{compute_s:.3f},{tags_str}\n"
+                f"{wait_s:.3f},{compute_s:.3f},{tags_str},"
+                f"{loss_signal.item():.6f},{loss_angular_str}\n"
             )
             batch_log_f.flush()
 
@@ -345,6 +455,46 @@ def main():
                           "da epoca). Default 5 -- gravar TODO batch deixava o CSV enorme em "
                           "treinos longos (muitas epocas x muitos batches/epoca). Use 1 para "
                           "voltar a granularidade total.")
+    ap.add_argument("--angular-loss-weight", type=float, default=0.0,
+                     help="lambda do termo de loss opcional no dominio angular/SH (ver "
+                          "protocolo, secao 9, prioridade 1) -- soma lambda*erro_SH_ordem_alta "
+                          "a MAE do sinal bruto (loss = loss_signal + lambda*loss_angular). "
+                          "Default 0.0 = DESATIVADO, comportamento identico ao treino sem esse "
+                          "termo (a checagem 'com ou sem' e so passar/nao passar essa flag). "
+                          "Valores tipicos pra experimentar: 0.1-1.0 (a escala relativa dos "
+                          "dois termos depende do numero de coeficientes SH de ordem alta, "
+                          "ver --sh-loss-high-order-min). Ver compute_sh_angular_loss() acima "
+                          "pra limitacao importante: com --q-out 10 (default), so ha direcoes-"
+                          "alvo suficientes pra sustentar ate l=2 -- pra alcancar de fato "
+                          "--sh-loss-high-order-min=4 e preciso tambem aumentar --q-out "
+                          "(>=15).")
+    ap.add_argument("--sh-loss-high-order-min", type=int, default=4,
+                     help="grau l MINIMO (par) considerado 'ordem alta' no termo angular -- "
+                          "coeficientes SH com l >= este valor entram na loss_angular. Default "
+                          "4 (a partir da 1a ordem que carrega estrutura de fibra cruzando, "
+                          "ver sh_energy_by_order em scripts/poc_csd_direction_count.py). So "
+                          "tem efeito se --angular-loss-weight > 0.")
+    ap.add_argument("--sh-loss-lmax-cap", type=int, default=8,
+                     help="teto de l_max tentado por item de batch no termo angular (mesmo "
+                          "papel do teto em max_order_for_n_directions no baseline SH). Default 8. "
+                          "So tem efeito se --angular-loss-weight > 0.")
+    ap.add_argument("--no-resume", action="store_true",
+                     help="por padrao, se out_dir/<shell>_<n>/last.pt ja existir (de um "
+                          "treino anterior do MESMO combo shell/n_level que morreu no meio -- "
+                          "OOM, preempcao, timeout etc.), o treino RETOMA automaticamente "
+                          "dali (pesos do modelo, estado do otimizador Adam, estado do "
+                          "scheduler, epoca, best_val e contador de patience -- so a epoca "
+                          "que estava em andamento quando o job morreu e perdida, nunca uma "
+                          "epoca inteira ja concluida, ja que last.pt so e escrito no fim de "
+                          "cada epoca). Passe --no-resume pra ignorar qualquer last.pt "
+                          "existente e comecar do zero (equivalente ao comportamento antigo, "
+                          "antes desta mudanca).")
+    ap.add_argument("--resume-checkpoint", default=None,
+                     help="caminho explicito de um checkpoint pra retomar (em vez do "
+                          "out_dir/<shell>_<n>/last.pt 'canonico' -- por exemplo, a copia "
+                          "permanente em .../runs/<job_id_antigo>/last.pt, se quiser retomar "
+                          "de um run especifico em vez do mais recente). Ignorado se "
+                          "--no-resume for passado.")
     ap.add_argument("--debug-max-dirs", type=int, default=0,
                      help="quantas direcoes (colunas) mostrar nos PNGs de debug. 0 (default) "
                           "= automatico, usa max(n_level, q_out) pra sempre mostrar TODAS as "
@@ -366,6 +516,21 @@ def main():
     if device.type == "cpu":
         print(f"[cpu] torch.get_num_threads()={torch.get_num_threads()} "
               f"(cpus-per-task do SLURM: {os.environ.get('SLURM_CPUS_PER_TASK', '?')})")
+
+    if args.angular_loss_weight > 0:
+        max_l = min(max_order_for_n_directions(args.q_out), args.sh_loss_lmax_cap)
+        print(f"[angular-loss] ATIVO: lambda={args.angular_loss_weight}, "
+              f"high_order_min={args.sh_loss_high_order_min}, lmax_cap={args.sh_loss_lmax_cap}", flush=True)
+        if max_l < args.sh_loss_high_order_min:
+            print(f"[angular-loss][aviso] --q-out {args.q_out} so sustenta ate l={max_l} "
+                  f"(precisaria de {n_coeffs_even(args.sh_loss_high_order_min)} direcoes-alvo "
+                  f"pra chegar em l={args.sh_loss_high_order_min}) -- este termo vai ficar "
+                  f"ZERADO em praticamente todos os batches (nenhuma direcao-alvo suficiente "
+                  f"pra sustentar a ordem pedida). Aumente --q-out se quiser este termo com "
+                  f"efeito real, ou reduza --sh-loss-high-order-min.", flush=True)
+    else:
+        print("[angular-loss] desativado (--angular-loss-weight 0.0, default) -- "
+              "treino identico ao MAE puro sobre o sinal.", flush=True)
 
     entries = load_manifest(args.manifest)
     train_entries = [e for e in entries if e.split == "train"]
@@ -494,6 +659,14 @@ def main():
                          b_ref=args.shell_b)
             err = (pred - target_vols).abs()  # MAE, ver comentario em run_epoch
             loss = (err * mask).sum() / mask.sum().clamp(min=1.0)
+            # exercita tambem o termo angular aqui (se ativado) -- assim um erro
+            # nele (ex.: bvecs degenerados, singularidade no pinv) aparece no
+            # sanity check em segundos, nao so depois de uma epoca inteira.
+            if args.angular_loss_weight > 0:
+                loss_angular = compute_sh_angular_loss(
+                    pred, target_vols, target_bvecs, target_mask,
+                    l_max_cap=args.sh_loss_lmax_cap, high_order_min=args.sh_loss_high_order_min)
+                loss = loss + args.angular_loss_weight * loss_angular
             if do_backward:
                 optimizer.zero_grad()
                 loss.backward()
@@ -528,12 +701,78 @@ def main():
           f"usado pela etapa 5)")
     print(f"[resumo] logs/debug deste run em: {run_dir}")
 
-    # baseline: snapshot ANTES de treinar nada, com o modelo recem-criado
-    # (pesos aleatorios) -- pra voce ja ver como e o ponto de partida sem
-    # esperar a primeira epoca terminar.
+    # resume automatico (ver --no-resume/--resume-checkpoint): por padrao,
+    # se ja existir um last.pt do MESMO combo (shell,n_level) -- de um
+    # treino anterior morto no meio (OOM, preempcao, timeout, etc., ver
+    # discussao no protocolo secao 9 prioridade 3) -- carrega dali em vez
+    # de comecar do zero. So a epoca que estava em andamento na hora da
+    # morte e perdida (last.pt so e escrito no FIM de cada epoca).
+    start_epoch = 1
+    best_val = float("inf")
+    epochs_no_improve = 0
+    resume_ckpt_path = None
+    if not args.no_resume:
+        if args.resume_checkpoint:
+            resume_ckpt_path = Path(args.resume_checkpoint)
+        elif (out_dir / "last.pt").exists():
+            resume_ckpt_path = out_dir / "last.pt"
+
+    if resume_ckpt_path is not None:
+        if not resume_ckpt_path.exists():
+            raise FileNotFoundError(
+                f"--resume-checkpoint {resume_ckpt_path} nao existe (confira o caminho, ou "
+                f"use --no-resume pra comecar do zero sem retomar de checkpoint nenhum)")
+        print(f"[resume] carregando checkpoint existente: {resume_ckpt_path}", flush=True)
+        ckpt = torch.load(resume_ckpt_path, map_location=device)
+        # checagem de sanidade -- so um AVISO, nao impede o resume, porque
+        # n_level/q_out/patch_size/shell_b nao mudam o SHAPE dos pesos (os
+        # canais do modelo sao fixos, ver model/rcae.py), so mudariam o
+        # SIGNIFICADO do que o modelo ja aprendeu. lstm_size SIM muda o
+        # shape -- se estiver diferente, model.load_state_dict abaixo vai
+        # falhar sozinho com um erro claro de mismatch de shape.
+        old_args = ckpt.get("args", {})
+        for key in ("shell_b", "n_level", "patch_size", "q_out", "lstm_size"):
+            old_val, new_val = old_args.get(key), vars(args).get(key)
+            if old_val is not None and old_val != new_val:
+                print(f"[resume][aviso] --{key.replace('_','-')} mudou entre o checkpoint "
+                      f"({old_val}) e esta chamada ({new_val}) -- confira se e intencional.",
+                      flush=True)
+        model.load_state_dict(ckpt["model_state"])
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+        else:
+            print("[resume][aviso] checkpoint antigo sem optimizer_state (salvo antes desta "
+                  "mudanca) -- otimizador reinicia do zero (momentos do Adam perdidos, mas os "
+                  "PESOS do modelo continuam retomados normalmente).", flush=True)
+        if "scheduler_state" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        best_val = float(ckpt.get("best_val", ckpt.get("val_loss", float("inf"))))
+        epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
+        print(f"[resume] retomando da epoca {start_epoch} (best_val={best_val:.6f}, "
+              f"epochs_no_improve={epochs_no_improve}) -- treino ia ate a epoca "
+              f"{args.epochs}", flush=True)
+        if start_epoch > args.epochs:
+            print(f"[resume] epoca de retomada ({start_epoch}) ja passa de --epochs "
+                  f"({args.epochs}) -- nada a fazer, treino ja estava concluido.", flush=True)
+    else:
+        print("[resume] nenhum checkpoint anterior encontrado (ou --no-resume passado) -- "
+              "comecando do zero.", flush=True)
+
+    # snapshot ANTES do loop de epocas -- com pesos aleatorios (baseline de
+    # verdade) se NAO houve resume, ou com os pesos JA RETOMADOS se houve
+    # (rotulado com a epoca de retomada em vez de 0, senao pareceria um
+    # baseline aleatorio quando na verdade ja e o estado da epoca
+    # start_epoch-1). Movido pra DEPOIS do bloco de resume acima --
+    # antes desta mudanca este snapshot rodava sempre com o modelo recem-
+    # criado, mesmo quando o resume ja tinha carregado os pesos retomados,
+    # o que deixava o primeiro PNG enganoso (mostrava pesos aleatorios
+    # rotulados como o estado atual do treino retomado).
     if debug_fixed_batch is not None:
+        snapshot_epoch = 0 if start_epoch == 1 else start_epoch - 1
         plot_fixed_debug_patch(model, debug_fixed_batch, device, args.shell_b, debug_plot_dir,
-                                epoch=0, val_loss=None, shell_b=args.shell_b, n_level=args.n_level,
+                                epoch=snapshot_epoch, val_loss=(best_val if start_epoch > 1 else None),
+                                shell_b=args.shell_b, n_level=args.n_level,
                                 max_dirs=debug_max_dirs)
 
     # contador global de batches de treino (mutavel via dict, atravessa as
@@ -545,8 +784,6 @@ def main():
         debug_state = {"dir": debug_plot_dir, "every": args.debug_plot_every_batches, "step": 0,
                         "max_dirs": debug_max_dirs}
 
-    best_val = float("inf")
-    epochs_no_improve = 0
     log_path = run_dir / "train_log.csv"
     with open(log_path, "w") as f:
         f.write("epoch,train_loss,val_loss,lr\n")
@@ -562,20 +799,27 @@ def main():
         "epoch,split,batch,loss,"
         "input_mean,input_std,input_min,input_max,input_n_outliers,"
         "target_mean,target_std,target_min,target_max,target_n_outliers,"
-        "wait_s,compute_s,subject_tags\n"
+        "wait_s,compute_s,subject_tags,"
+        "loss_signal,loss_angular\n"
     )
 
     try:
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(start_epoch, args.epochs + 1):
             train_sampler.set_epoch(epoch)  # ordem de sujeitos diferente a cada epoca
             train_loss = run_epoch(model, train_loader, optimizer, device, train=True,
                                     b_ref=args.shell_b, epoch=epoch, batch_log_f=batch_log_f,
                                     debug_state=debug_state, outlier_threshold=args.outlier_threshold,
-                                    batch_log_every=args.batch_log_every)
+                                    batch_log_every=args.batch_log_every,
+                                    angular_loss_weight=args.angular_loss_weight,
+                                    sh_loss_high_order_min=args.sh_loss_high_order_min,
+                                    sh_loss_lmax_cap=args.sh_loss_lmax_cap)
             val_loss = run_epoch(model, val_loader, optimizer, device, train=False,
                                   b_ref=args.shell_b, epoch=epoch, batch_log_f=batch_log_f,
                                   outlier_threshold=args.outlier_threshold,
-                                  batch_log_every=args.batch_log_every)
+                                  batch_log_every=args.batch_log_every,
+                                  angular_loss_weight=args.angular_loss_weight,
+                                  sh_loss_high_order_min=args.sh_loss_high_order_min,
+                                  sh_loss_lmax_cap=args.sh_loss_lmax_cap)
             scheduler.step(val_loss)
             current_lr = optimizer.param_groups[0]["lr"]
 
@@ -594,9 +838,13 @@ def main():
                 epochs_no_improve = 0
                 torch.save({
                     "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
                     "args": vars(args),
                     "epoch": epoch,
                     "val_loss": val_loss,
+                    "best_val": best_val,
+                    "epochs_no_improve": epochs_no_improve,
                 }, out_dir / "best.pt")
                 # copia (nao re-serializa) pra dentro de runs/<job_id>/ --
                 # historico permanente desse run especifico, que o
@@ -621,8 +869,12 @@ def main():
             # morre no meio deixa o last.pt da ULTIMA epoca que terminou
             # completa -- util pra continuar de onde parou ou so inspecionar
             # o estado mais recente, mesmo sem ter sido o melhor val_loss.
-            torch.save({"model_state": model.state_dict(), "args": vars(args), "epoch": epoch,
-                        "val_loss": val_loss}, out_dir / "last.pt")
+            torch.save({"model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "scheduler_state": scheduler.state_dict(),
+                        "args": vars(args), "epoch": epoch,
+                        "val_loss": val_loss, "best_val": best_val,
+                        "epochs_no_improve": epochs_no_improve}, out_dir / "last.pt")
             shutil.copy2(out_dir / "last.pt", run_dir / "last.pt")
     finally:
         batch_log_f.close()
