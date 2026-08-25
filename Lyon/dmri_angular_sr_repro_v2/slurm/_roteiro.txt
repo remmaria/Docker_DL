@@ -12,8 +12,21 @@ sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/
 sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1500 10
 
 sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
+sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 32
+sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 16
+
+
+
 sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1500 10
 
+
+#------------03_train02b_build_rrin_triplets_rcae.sh
+python -m model.rrin3d
+MAX_RESIDUAL_DEG=5 sbatch 02b_build_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh
+
+
+#------------02c_diagnose_rrin_triplets.sh
+sbatch 02c_diagnose_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh
 
 
 #------------03_train_rcae.sh
@@ -38,6 +51,18 @@ RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/
     sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 
 
+#------------04b_train_rrin.sh
+
+sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
+
+#------------05b_reconstruct_rrin.sh
+
+# --- b1000
+RECON_TAG=3503365_0 \
+    RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rrin_checkpoints/shell1000_n10/runs/3503365_0/best.pt \
+    sbatch 05b_reconstruct_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
+
 
 #------------04_reconstruct_rcae.sh
 
@@ -45,18 +70,40 @@ RECON_LIMIT=1 \
     CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3496007_0/best.pt \
     sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 ou
-RECON_TAG=3498743_0 \
+
+# --- b1000
+RECON_TAG=3501293_0 \
     RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
-    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rcae_checkpoints/shell1000_n10/runs/3498743_0/best.pt \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3501293_0/best.pt \
+    sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+# --- b1000 SH
+RECON_TAG=3501014_0 \
+    RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rcae_checkpoints/shell1000_n10/runs/3501014_0/best.pt \
     sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
 
 
 #------------05_evaluate_and_downstream.sh
-RECON_TAG=3498743_0 \
-    ROI_TRACTS="FX,CGC,CGH,UF" \
+
+# --- b1000
+RECON_TAG=3501293_0 \
+    ROI_TRACTS="FX,CGC,CGH,UF,WM,CbWM_L,CbWM_R,Ctx_L,Ctx_R,Hipp_L,Hipp_R,SubCtx_R,SubCtx_L" \
+    RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+    sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+# --- b1000 SH
+RECON_TAG=3501014_0 \
+    ROI_TRACTS="FX,CGC,CGH,UF,WM,CbWM_L,CbWM_R,Ctx_L,Ctx_R,Hipp_L,Hipp_R,SubCtx_R,SubCtx_L" \
     RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
     sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
 
+# --- b1000 baseline, rcae, rcae_sh, rrin
+
+EXTRA_METHOD="rrin=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rrin_recon_3503365_0,rcae=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rcae_recon_3501293_0,rcae_sh=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rcae_recon_3501014_0" \
+    ROI_TRACTS="FX,CGC,CGH,UF,WM,CbWM_L,CbWM_R,Ctx_L,Ctx_R,Hipp_L,Hipp_R,SubCtx_R,SubCtx_L" \
+    RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+    sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
 
 #------------poc_csd_direction_count.sh
 

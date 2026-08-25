@@ -86,6 +86,16 @@ def main():
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--baseline-dir", default=None)
     ap.add_argument("--rcae-dir", default=None)
+    ap.add_argument("--extra-method", action="append", default=[],
+                     help="metodo(s) adicional(is) a avaliar, no formato NOME=CAMINHO -- "
+                          "por exemplo, a linha RRIN/VFI-por-triplets (ver protocolo secao "
+                          "10.1): --extra-method rrin=work_dir/rrin_recon. Pode repetir a "
+                          "flag pra mais de um metodo extra. Cada CAMINHO precisa ter a MESMA "
+                          "estrutura de --baseline-dir/--rcae-dir "
+                          "(<tag>/shell<B>/n<N>/recon_target.nii.gz + target_idx.npy + "
+                          "mask.npy em shell<B>/), gerada por scripts/05b_reconstruct_rrin.py "
+                          "ou equivalente. NOME vira o valor da coluna 'method' no CSV de "
+                          "saida, igual 'baseline_sh'/'rcae'.")
     ap.add_argument("--shell-b", type=float, required=True)
     ap.add_argument("--n-level", type=int, required=True)
     ap.add_argument("--split", default="test")
@@ -113,8 +123,18 @@ def main():
                           "(que nao tem reconstrucao 'rcae' mesmo) ser processado a toa.")
     args = ap.parse_args()
 
-    if args.baseline_dir is None and args.rcae_dir is None:
-        sys.exit("Passe pelo menos --baseline-dir ou --rcae-dir")
+    extra_methods = []  # lista de (nome, caminho), parseada de --extra-method NOME=CAMINHO
+    for spec in args.extra_method:
+        if "=" not in spec:
+            sys.exit(f"--extra-method invalido: {spec!r} (esperado NOME=CAMINHO)")
+        name, path = spec.split("=", 1)
+        name, path = name.strip(), path.strip()
+        if not name or not path:
+            sys.exit(f"--extra-method invalido: {spec!r} (NOME e CAMINHO nao podem ser vazios)")
+        extra_methods.append((name, path))
+
+    if args.baseline_dir is None and args.rcae_dir is None and not extra_methods:
+        sys.exit("Passe pelo menos --baseline-dir, --rcae-dir ou --extra-method")
     if not (0 <= args.shard_index < max(args.shard_count, 1)):
         sys.exit(f"--shard-index ({args.shard_index}) fora do intervalo [0, {args.shard_count})")
 
@@ -144,7 +164,8 @@ def main():
         tag = e.subject if not e.session else f"{e.subject}_{e.session}"
         gt_data, _, _ = load_dwi(e.dwi_path)
 
-        for method, recon_dir in (("baseline_sh", args.baseline_dir), ("rcae", args.rcae_dir)):
+        methods_to_try = [("baseline_sh", args.baseline_dir), ("rcae", args.rcae_dir)] + extra_methods
+        for method, recon_dir in methods_to_try:
             if recon_dir is None:
                 continue
             acq_ctx = "from_multishell" if e.is_multishell else "native_single_shell"

@@ -20,6 +20,11 @@ Uso:
         --out-dir work_dir/downstream \
         --run-noddi   # opcional, requer pacote AMICO instalado e configurado
 
+Metodo(s) adicional(is) alem de baseline_sh/rcae (ex.: a linha RRIN/VFI-por-
+triplets, ver protocolo secao 10.1/10.2) via --extra-method NOME=CAMINHO,
+repetivel -- mesma convencao de 06_evaluate_reconstruction.py, ex.:
+    --extra-method rrin=work_dir/rrin_recon
+
 DTI usa DIPY (obrigatorio). NODDI usa AMICO (opcional; se nao instalado, a
 etapa e pulada com aviso, o resto do script continua normalmente).
 """
@@ -123,6 +128,15 @@ def main():
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--baseline-dir", default=None)
     ap.add_argument("--rcae-dir", default=None)
+    ap.add_argument("--extra-method", action="append", default=[],
+                     help="metodo(s) adicional(is) a avaliar em DTI/NODDI, no formato "
+                          "NOME=CAMINHO -- mesma convencao de --extra-method em "
+                          "06_evaluate_reconstruction.py (ex.: a linha RRIN/VFI-por-triplets, "
+                          "ver protocolo secao 10.1/10.2): --extra-method rrin=work_dir/rrin_recon. "
+                          "Pode repetir a flag pra mais de um metodo extra. Cada CAMINHO precisa "
+                          "ter a mesma estrutura de --baseline-dir/--rcae-dir "
+                          "(<tag>/shell<B>/n<N>/recon_target.nii.gz + target_idx.npy). NOME vira "
+                          "o valor da coluna 'method' no CSV de saida.")
     ap.add_argument("--shell-b", type=float, required=True)
     ap.add_argument("--n-level", type=int, required=True)
     ap.add_argument("--out-dir", required=True)
@@ -157,6 +171,19 @@ def main():
                           "'rcae' de qualquer forma (ex.: um checkpoint reconstruido so num "
                           "sujeito via RECON_SUBJECTS pra smoke test).")
     args = ap.parse_args()
+
+    extra_methods = []  # lista de (nome, caminho), parseada de --extra-method NOME=CAMINHO
+    for spec in args.extra_method:
+        if "=" not in spec:
+            sys.exit(f"--extra-method invalido: {spec!r} (esperado NOME=CAMINHO)")
+        name, path = spec.split("=", 1)
+        name, path = name.strip(), path.strip()
+        if not name or not path:
+            sys.exit(f"--extra-method invalido: {spec!r} (NOME e CAMINHO nao podem ser vazios)")
+        extra_methods.append((name, path))
+
+    if args.baseline_dir is None and args.rcae_dir is None and not extra_methods:
+        sys.exit("Passe pelo menos --baseline-dir, --rcae-dir ou --extra-method")
     if not (0 <= args.shard_index < max(args.shard_count, 1)):
         sys.exit(f"--shard-index ({args.shard_index}) fora do intervalo [0, {args.shard_count})")
     roi_tracts = [t.strip() for t in args.roi_tracts.split(",") if t.strip()] if args.roi_tracts else []
@@ -199,7 +226,8 @@ def main():
             rois.update(tract_masks)
 
         variants = {"ground_truth": gt_data}
-        for method, recon_dir in (("baseline_sh", args.baseline_dir), ("rcae", args.rcae_dir)):
+        methods_to_try = [("baseline_sh", args.baseline_dir), ("rcae", args.rcae_dir)] + extra_methods
+        for method, recon_dir in methods_to_try:
             if recon_dir is None:
                 continue
             sub_dir = Path(recon_dir) / tag / f"shell{int(args.shell_b)}" / f"n{args.n_level}"

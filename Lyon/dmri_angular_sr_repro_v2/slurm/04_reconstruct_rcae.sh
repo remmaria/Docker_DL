@@ -1,8 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=dmri_rcae_recon
 #SBATCH --cluster=gpu
-#SBATCH --partition=h200
+#SBATCH --partition=preempt
 #SBATCH --gres=gpu:1
+#SBATCH --constraint=l40s
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8

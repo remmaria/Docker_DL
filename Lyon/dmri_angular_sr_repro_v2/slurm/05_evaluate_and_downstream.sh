@@ -17,13 +17,21 @@
 # instalado no env -- so tem efeito para sujeitos com >=2 shells.
 #
 # ROI_TRACTS="FX,CGC,CGH,UF" (variavel de ambiente, lista separada por
-# virgula) restringe as metricas de DTI/NODDI da etapa 7 tambem aos tratos
-# JHU-ICBM pedidos (alem da mascara inteira, que continua sendo calculada
-# sempre) -- ver utils/masking.py:load_roi_masks e scripts/07_downstream_dti_noddi.py.
-# Cada trato precisa de um arquivo
-# "JHU-ICBM-labels-1mm_warped_s_<TRATO>_<R/L>.nii.gz" (ou sem sufixo de
-# lado, ex. FX) na mesma pasta do dwi de cada sujeito. Sem essa variavel,
-# comportamento antigo inalterado (so 'whole_mask').
+# virgula) restringe as metricas de DTI/NODDI da etapa 7 tambem as ROIs
+# pedidas (alem da mascara inteira 'whole_mask', que continua sendo
+# calculada sempre) -- ver utils/masking.py:load_roi_masks e
+# scripts/07_downstream_dti_noddi.py. Cada nome da lista pode ser:
+#   1. um trato do atlas JHU-ICBM (combina R+L automaticamente) -- precisa
+#      de "JHU-ICBM-labels-1mm_warped_s_<TRATO>_<R/L>.nii.gz" (ou sem
+#      sufixo de lado, ex. FX) na mesma pasta do dwi; ou
+#   2. uma mascara de SEGMENTACAO por sujeito (ja lateralizada quando
+#      aplicavel, ver utils/masking.py:SEG_ROI_LABELS) -- precisa de
+#      "<dwi_sem_extensao>_maskseg_<NOME>_e1.nii.gz" (ou sem "_e1") na
+#      mesma pasta do dwi, ex. dwi="bgpdwis_PA_geomcorr.nii" + NOME=CbWM_L
+#      -> "bgpdwis_PA_geomcorr_maskseg_CbWM_L_e1.nii.gz".
+# Os dois tipos podem ser misturados na mesma lista, ex.:
+#   ROI_TRACTS="FX,CGC,CGH,UF,WM,CbWM_L,Ctx_R,Hipp_R,SubCtx_L"
+# Sem essa variavel, comportamento antigo inalterado (so 'whole_mask').
 #
 # CLEANUP_AFTER=1 apaga os recon_target.nii.gz (baseline + RCAE) desse
 # combo logo depois de calcular as metricas -- eles ja nao servem pra mais
@@ -71,6 +79,17 @@
 # reconstrucao 'rcae' pra comparar (o resultado ainda sai certo sem isso,
 # so mais lento). Ex.:
 #   RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+#     sbatch slurm/05_evaluate_and_downstream.sh <work_dir> 1000 10
+#
+# EXTRA_METHOD="nome=caminho" (repetivel, separe por virgula pra mais de um,
+# ex. "rrin=/caminho/rrin_recon,rrin_qc=/caminho/rrin_recon_qc") -- inclui
+# metodo(s) adicional(is) alem de baseline_sh/rcae nas etapas 6 (sinal) e 7
+# (DTI/NODDI), repassado como --extra-method NOME=CAMINHO para os dois
+# scripts (ver protocolo secao 10.1/10.2 -- pensado pra linha RRIN/VFI).
+# CAMINHO precisa ter a mesma estrutura de --baseline-dir/--rcae-dir
+# (<tag>/shell<B>/n<N>/recon_target.nii.gz + target_idx.npy), gerada por
+# scripts/05b_reconstruct_rrin.py ou equivalente. Ex.:
+#   EXTRA_METHOD="rrin=$WORK_DIR/rrin_recon" \
 #     sbatch slurm/05_evaluate_and_downstream.sh <work_dir> 1000 10
 
 set -euo pipefail
@@ -144,11 +163,35 @@ if [[ -n "${RECON_TAG:-}" ]]; then
     DOWNSTREAM_DIR="$WORK_DIR/downstream_${RECON_TAG}"
     echo "RECON_TAG=$RECON_TAG -- lendo de $RCAE_DIR, gravando metricas em $DOWNSTREAM_DIR"
 fi
+# RCAE_DIR_OVERRIDE (variavel de ambiente, caminho ABSOLUTO) -- sobrepoe o
+# RCAE_DIR calculado acima (que so sabe montar caminhos DENTRO do mesmo
+# WORK_DIR desta chamada, via rcae_recon/rcae_recon_<tag>). Util quando a
+# reconstrucao 'rcae' que voce quer usar como referencia mora em outro
+# work_dir inteiramente (ex.: work_dir vs. work_dir_sh) -- sem isso, nao
+# tem como o metodo canonico 'rcae' apontar pra fora do WORK_DIR passado
+# como argumento 1. Ex.:
+#   RCAE_DIR_OVERRIDE=/outro/work_dir/rcae_recon_3501293_0 \
+#     sbatch slurm/05_evaluate_and_downstream.sh <work_dir> 1000 10
+# METRICS_SUFFIX/DOWNSTREAM_DIR continuam seguindo RECON_TAG (se setado)
+# normalmente -- so o caminho de LEITURA da reconstrucao muda.
+if [[ -n "${RCAE_DIR_OVERRIDE:-}" ]]; then
+    RCAE_DIR="$RCAE_DIR_OVERRIDE"
+    echo "RCAE_DIR_OVERRIDE=$RCAE_DIR_OVERRIDE -- lendo 'rcae' desse caminho absoluto"
+fi
 
 SUBJECTS_FLAG=()
 if [[ -n "${RECON_SUBJECTS:-}" ]]; then
     SUBJECTS_FLAG=(--subjects "$RECON_SUBJECTS")
     echo "RECON_SUBJECTS=$RECON_SUBJECTS -- restringindo etapas 6+7 a esse(s) sujeito(s)"
+fi
+
+EXTRA_METHOD_FLAGS=()
+if [[ -n "${EXTRA_METHOD:-}" ]]; then
+    IFS=',' read -ra _EXTRA_SPECS <<< "$EXTRA_METHOD"
+    for spec in "${_EXTRA_SPECS[@]}"; do
+        EXTRA_METHOD_FLAGS+=(--extra-method "$spec")
+    done
+    echo "EXTRA_METHOD=$EXTRA_METHOD -- incluindo metodo(s) adicional(is) nas etapas 6+7"
 fi
 
 python scripts/06_evaluate_reconstruction.py \
@@ -158,7 +201,7 @@ python scripts/06_evaluate_reconstruction.py \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT" \
     --out-csv "$WORK_DIR/metrics/signal_metrics_shell${SHELL_B%.*}_n${N_LEVEL}${METRICS_SUFFIX}.csv" \
-    "${SUBJECTS_FLAG[@]}"
+    "${SUBJECTS_FLAG[@]}" "${EXTRA_METHOD_FLAGS[@]}"
 
 NODDI_FLAG=""
 if [[ "${RUN_NODDI:-0}" == "1" ]]; then
@@ -178,7 +221,7 @@ python scripts/07_downstream_dti_noddi.py \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT" \
     --out-dir "$DOWNSTREAM_DIR" \
-    $NODDI_FLAG "${ROI_FLAG[@]}" "${SUBJECTS_FLAG[@]}"
+    $NODDI_FLAG "${ROI_FLAG[@]}" "${SUBJECTS_FLAG[@]}" "${EXTRA_METHOD_FLAGS[@]}"
 
 if [[ "${CLEANUP_AFTER:-0}" == "1" ]]; then
     if [[ -n "${RECON_TAG:-}" ]]; then

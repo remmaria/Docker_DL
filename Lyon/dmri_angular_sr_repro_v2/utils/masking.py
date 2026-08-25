@@ -20,6 +20,23 @@ JHU_TRACT_LABELS = {
     "UF": "Fasciculo uncinado",
 }
 
+# Rotulos legiveis das mascaras de SEGMENTACAO por sujeito (ja lateralizadas
+# quando aplicavel, ao contrario dos tratos JHU acima que sao combinados
+# R+L) -- nomes seguem exatamente o meio do nome de arquivo do usuario, ex.
+# ".../bgpdwis_PA_geomcorr_maskseg_CbWM_L_e1.nii.gz" -> nome "CbWM_L".
+# So documentacao/leitura -- find_seg_roi_mask nao depende deste dict.
+SEG_ROI_LABELS = {
+    "WM": "Substancia branca (mascara inteira)",
+    "CbWM_L": "Substancia branca cerebelar (esquerda)",
+    "CbWM_R": "Substancia branca cerebelar (direita)",
+    "Ctx_L": "Cortex (esquerdo)",
+    "Ctx_R": "Cortex (direito)",
+    "Hipp_L": "Hipocampo (esquerdo)",
+    "Hipp_R": "Hipocampo (direito)",
+    "SubCtx_L": "Substancia cinzenta subcortical (esquerda)",
+    "SubCtx_R": "Substancia cinzenta subcortical (direita)",
+}
+
 
 def simple_brain_mask(b0_mean: np.ndarray, percentile: float = 40.0) -> np.ndarray:
     nonzero = b0_mean[b0_mean > 0]
@@ -120,38 +137,80 @@ def find_jhu_roi_mask(dwi_path: str, tract: str) -> tuple[np.ndarray | None, lis
     return mask, sides
 
 
-def load_roi_masks(dwi_path: str, tracts: list[str], base_mask: np.ndarray | None = None):
-    """Carrega e combina (R+L) as mascaras JHU pedidas em `tracts` para um
-    sujeito, intersectando cada uma com `base_mask` (tipicamente a mascara
-    de cerebro/substancia branca) quando fornecida -- isso evita que erros
-    de registro do atlas (bordas fora do cerebro) contaminem as metricas.
+def find_seg_roi_mask(dwi_path: str, name: str) -> np.ndarray | None:
+    """Procura uma mascara de SEGMENTACAO por sujeito (tipo de arquivo
+    diferente do atlas JHU: aqui o nome do arquivo DERIVA do nome do dwi,
+    igual find_mask_path, so que com um meio de nome extra) seguindo o
+    padrao observado nos arquivos do usuario:
+        "<dwi_sem_extensao>_maskseg_<name>_e1.nii.gz"  (a maioria)
+        "<dwi_sem_extensao>_maskseg_<name>.nii.gz"     (alguns, sem "_e1")
+    Ex.: dwi=".../bgpdwis_PA_geomcorr.nii" + name="CbWM_L" ->
+    ".../bgpdwis_PA_geomcorr_maskseg_CbWM_L_e1.nii.gz".
 
-    Devolve um dict {tract: mascara_bool} SOMENTE para os tratos cujo
-    arquivo foi encontrado; tratos ausentes sao pulados com um aviso
-    explicito no stdout (nao um erro -- o script continua sem esse trato
-    para esse sujeito).
+    Ao contrario de find_jhu_roi_mask, cada `name` aqui ja e uma mascara
+    unica e completa (as vezes ja lateralizada, ex. "CbWM_L", "Ctx_R" --
+    ver SEG_ROI_LABELS) -- nao ha combinacao R+L automatica; se quiser as
+    duas mascaras separadas, peca os dois nomes em ROI_TRACTS (ex.
+    "CbWM_L,CbWM_R"); se quiser R+L juntos, junte-as voce mesmo (ex. com
+    fslmaths antes) e trate como um `name` novo.
+
+    Devolve a mascara bool, ou None se nenhum dos dois padroes de nome
+    existir.
+    """
+    import nibabel as nib
+    stem = strip_nii_ext(str(dwi_path))
+    for suffix in (f"_maskseg_{name}_e1.nii.gz", f"_maskseg_{name}.nii.gz"):
+        candidate = Path(stem + suffix)
+        if candidate.exists():
+            return nib.load(str(candidate)).get_fdata() > 0.5
+    return None
+
+
+def load_roi_masks(dwi_path: str, tracts: list[str], base_mask: np.ndarray | None = None):
+    """Carrega as mascaras de ROI pedidas em `tracts` para um sujeito,
+    intersectando cada uma com `base_mask` (tipicamente a mascara de
+    cerebro/substancia branca) quando fornecida -- isso evita que erros de
+    registro/segmentacao (bordas fora do cerebro) contaminem as metricas.
+
+    Cada nome em `tracts` pode ser (tentados nesta ordem):
+    1. um trato do atlas JHU-ICBM (find_jhu_roi_mask -- combina R+L
+       automaticamente, ex. "FX", "CGC", "CGH", "UF"); ou
+    2. uma mascara de segmentacao por sujeito (find_seg_roi_mask -- ja
+       lateralizada quando aplicavel, ver SEG_ROI_LABELS, ex. "WM",
+       "CbWM_L", "Ctx_R", "Hipp_R", "SubCtx_L").
+    Os dois tipos podem ser misturados na mesma lista (ex.
+    ROI_TRACTS="FX,CGC,CGH,UF,WM,CbWM_L,Ctx_R,Hipp_R,SubCtx_L").
+
+    Devolve um dict {nome: mascara_bool} SOMENTE para as ROIs cujo arquivo
+    foi encontrado (em qualquer uma das duas convencoes); ROIs ausentes sao
+    puladas com um aviso explicito no stdout (nao um erro -- o script
+    continua sem essa ROI para esse sujeito).
     """
     rois: dict[str, np.ndarray] = {}
     for tract in tracts:
         mask, sides = find_jhu_roi_mask(dwi_path, tract)
-        if mask is None:
-            print(f"[aviso] ROI '{tract}' nao encontrada para {dwi_path!r} "
-                  f"(procurado em JHU-ICBM-labels-1mm_warped_s_{tract}[_R/_L].nii.gz "
-                  f"na mesma pasta) -- pulando esse trato para esse sujeito.",
-                  flush=True)
-            continue
-        if sides == ["R"] or sides == ["L"]:
+        if mask is not None and (sides == ["R"] or sides == ["L"]):
             print(f"[aviso] ROI '{tract}' para {dwi_path!r}: so encontrou o "
                   f"lado {sides[0]} (esperado R+L, a menos que este seja um "
                   f"trato de linha media) -- confira se nao falta arquivo.",
                   flush=True)
+        if mask is None:
+            mask = find_seg_roi_mask(dwi_path, tract)
+        if mask is None:
+            print(f"[aviso] ROI '{tract}' nao encontrada para {dwi_path!r} "
+                  f"(procurado como trato JHU "
+                  f"'JHU-ICBM-labels-1mm_warped_s_{tract}[_R/_L].nii.gz' e como "
+                  f"mascara de segmentacao '<dwi>_maskseg_{tract}[_e1].nii.gz', "
+                  f"ambos na mesma pasta) -- pulando essa ROI para esse sujeito.",
+                  flush=True)
+            continue
         if base_mask is not None:
             mask = mask & base_mask.astype(bool)
         n_vox = int(mask.sum())
         if n_vox == 0:
             print(f"[aviso] ROI '{tract}' para {dwi_path!r}: 0 voxels apos "
-                  f"intersectar com a mascara base -- pulando (registro do "
-                  f"atlas pode ter falhado para esse sujeito).", flush=True)
+                  f"intersectar com a mascara base -- pulando (registro/"
+                  f"segmentacao pode ter falhado para esse sujeito).", flush=True)
             continue
         rois[tract] = mask
     return rois

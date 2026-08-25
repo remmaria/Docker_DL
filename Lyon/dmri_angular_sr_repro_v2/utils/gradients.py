@@ -144,6 +144,319 @@ def build_subsampling_scheme(bvals: np.ndarray, bvecs: np.ndarray, n_levels: lis
     return scheme
 
 
+def spherical_triplet_residual(v_a: np.ndarray, v_b: np.ndarray, v_t: np.ndarray):
+    """Mede o quanto v_t esta "entre" v_a e v_b num arco geodesico comum,
+    tratando antipodais (v e -v) como identicos (simetria de dMRI).
+
+    Usado para a linha RRIN/VFI-por-trincas (ver protocolo, secao 10.1):
+    RRIN assume que a direcao-alvo e uma interpolacao temporal entre duas
+    direcoes "vizinhas" (como quadro do meio em video), mas em q-space isso
+    so faz sentido geometricamente se as tres direcoes forem aproximadamente
+    colineares num grande circulo da esfera -- ao contrario de quadros de
+    video, tres direcoes de gradiente quaisquer normalmente NAO sao.
+
+    O "residuo" retornado e a distancia angular PERPENDICULAR de v_t ate o
+    PLANO do grande circulo que passa por v_a e v_b (a circunferencia que
+    se obtem cortando a esfera por esse plano) -- ou seja, literalmente "a
+    quantos graus esse ponto esta desta linha", nao uma aproximacao. Formula:
+    se n = v_a x v_b (normal ao plano, invariante a trocar o sinal de v_a
+    ou v_b -- flipar qualquer um dos dois so troca o sinal de n, nao o
+    plano em si, entao a simetria antipodal de a/b ja sai de graca), entao
+    sin(residuo) = |v_t . n_hat|. Isto SUBSTITUI uma versao anterior deste
+    calculo que usava o "excesso" da desigualdade triangular esferica
+    (ang(a,t)+ang(t,b)-ang(a,b)) como proxy -- essa proxy SUBESTIMA bastante
+    o desvio perpendicular real quanto maior o angulo entre a e b (ex.:
+    com gap(a,b)=90 graus, um desvio perpendicular real de 20 graus dava um
+    "residuo" antigo de so ~6.7 graus) -- exatamente o regime em que
+    normalmente operamos aqui (gap(a,b) tipico observado nos dados: ~70-90
+    graus, ver protocolo secao 10.1), entao a proxy antiga tornava
+    --max-residual-deg bem mais permissivo do que o numero sugeria. Corrigido
+    pra a distancia perpendicular exata, que e o que o nome do parametro
+    sempre pretendeu dizer.
+
+    v_t tambem precisa estar "entre" a e b ao longo do arco (nao so no MESMO
+    grande circulo, que sozinho nao garante isso -- um ponto no lado oposto
+    do circulo tambem teria residuo perpendicular zero) -- isso e checado
+    separadamente via t_frac (ver abaixo): t_frac fora de aproximadamente
+    [0,1] indica que v_t, mesmo perto do plano, NAO esta no arco menor entre
+    v_a e v_b. Quem usa esta funcao (find_best_bracket) nao filtra por
+    t_frac hoje -- ver ressalva no docstring de find_best_bracket.
+
+    Retorna (residual_rad, ang_ab_rad, t_frac), onde t_frac = ang(a,t)/ang(a,b)
+    (calculado com os SIGNOS de a/b/t fixados de forma consistente -- ver
+    codigo) e a posicao relativa de v_t no arco (0 = coincide com v_a, 1 =
+    com v_b) -- usada como o parametro de tempo `t` da interpolacao, quando
+    a rede de VFI usada suportar `t` arbitrario.
+    """
+    a = np.asarray(v_a, dtype=float)
+    b = np.asarray(v_b, dtype=float)
+    t = np.asarray(v_t, dtype=float)
+    a = a / (np.linalg.norm(a) or 1.0)
+    b = b / (np.linalg.norm(b) or 1.0)
+    t = t / (np.linalg.norm(t) or 1.0)
+
+    if np.dot(a, b) < 0:
+        b = -b
+    if np.dot(a, t) < 0:
+        t = -t
+
+    ang_ab = np.arccos(np.clip(np.dot(a, b), -1.0, 1.0))
+    ang_at = np.arccos(np.clip(np.dot(a, t), -1.0, 1.0))
+    t_frac = float(ang_at / ang_ab) if ang_ab > 1e-8 else 0.0
+
+    # distancia perpendicular real de t ao PLANO que passa por a e b (e pela
+    # origem) -- n = a x b e a normal desse plano; sin(residuo) = |t . n_hat|.
+    # Caso degenerado (a e b quase paralelos/coincidentes, |n|~0): o "plano
+    # que passa por a e b" fica mal definido (infinitos planos contem dois
+    # pontos quase coincidentes) -- trata como residuo maximo (90 graus),
+    # sinalizando "este par nao serve de referencia geometrica" em vez de
+    # dividir por quase-zero.
+    n = np.cross(a, b)
+    n_norm = np.linalg.norm(n)
+    if n_norm < 1e-8:
+        residual = np.pi / 2
+    else:
+        n_hat = n / n_norm
+        residual = np.arcsin(np.clip(abs(np.dot(t, n_hat)), 0.0, 1.0))
+
+    return float(residual), float(ang_ab), t_frac
+
+
+def find_best_bracket(candidate_bvecs: np.ndarray, target_bvec: np.ndarray,
+                       max_residual_deg: float | None = None,
+                       require_between: bool = True):
+    """Entre todos os pares (i,j) de candidate_bvecs, acha o par que melhor
+    "abraca" target_bvec num arco geodesico comum (baixo residuo de
+    colinearidade, ver spherical_triplet_residual) -- e, ENTRE os pares
+    aceitaveis, o mais "parecido com vizinhos de video" (menor gap_deg).
+
+    candidate_bvecs: (M,3), tipicamente as direcoes de ENTRADA disponiveis
+    (input_idx de um scheme.npz) para uma dada shell/n_level -- ou seja, a
+    mesma informacao que o RCAE recebe nesse nivel de subamostragem, para
+    manter a comparacao justa entre metodos.
+
+    max_residual_deg: quando informado, a selecao vira em DUAS etapas: (1)
+    filtra os pares com residual_deg <= max_residual_deg (os "validos" pelo
+    mesmo criterio usado por scripts/02b_build_rrin_triplets.py); (2) entre
+    esses, escolhe o de MENOR gap_deg (par mais proximo entre si), nao mais
+    o de menor residuo absoluto. Motivacao (ver protocolo secao 10.1): um
+    levantamento nos dados reais mostrou que, mesmo entre trincas "validas"
+    (residuo baixo), o gap_deg mediano fica perto do maximo teorico (~90,
+    limite da simetria antipodal), quase nao caindo com n_level maior --
+    ou seja, so minimizar residuo tende a escolher pares bem AFASTADOS
+    (que por acaso caem quase colineares com o alvo), nao pares "vizinhos"
+    no sentido de video (deslocamento pequeno). Preferir o menor gap_deg
+    ENTRE os validos da a hipotese de fluxo a melhor chance disponivel nos
+    dados -- se mesmo assim o gap tipico continuar alto, e porque pares
+    realmente proximos e colineares com o alvo raramente existem nesse
+    esquema de gradiente, nao um artefato da escolha de selecao. Se nenhum
+    par passar no teto, cai no fallback de minimizar o residuo global
+    (mesmo comportamento de antes, sem o parametro) -- quem chama decide
+    se trata isso como invalido (e o que 02b_build_rrin_triplets.py faz).
+
+    require_between: (default True -- ATENCAO, muda o comportamento default
+    em relacao a versoes anteriores desta funcao) exige, entre os pares
+    aceitaveis pelo teto de residuo, que o alvo esteja de fato ENTRE a e b
+    no arco (0 <= t_frac <= 1), nao so no mesmo plano/grande circulo.
+    Motivo: residuo baixo garante colinearidade (mesmo plano), mas NAO
+    garante que o alvo esteja "no meio" do par -- um alvo fora do arco
+    (t_frac<0 ou >1) esta sendo EXTRAPOLADO a partir do par, nao
+    interpolado entre eles, o que quebra a premissa de "quadro do meio"
+    que da sentido a analogia com VFI (RRIN/RIFE sao treinadas para
+    interpolar t em [0,1], nao extrapolar). Achado empirico que motivou
+    isso (ver protocolo secao 10.2): ao minimizar gap_deg apenas entre
+    pares colineares (sem checar t_frac), a selecao converge para pares
+    CADA VEZ MAIS PROXIMOS conforme n_level cresce (bom), mas o t_frac
+    mediano do par escolhido ULTRAPASSA 1 ja em n_level>=15 e chega a ~3 em
+    n_level=50 -- ou seja, a maioria dos "melhores pares apertados"
+    encontrados dessa forma na verdade extrapolam bem para fora do
+    segmento (a,b), nao interpolam. Com require_between=True, a busca
+    prioriza: (1) pares com residuo <= teto E 0<=t_frac<=1 (interpolacao
+    genuina), escolhendo entre esses o de menor gap_deg; (2) se nenhum
+    pareamento colinear tiver o alvo entre os dois candidatos, cai para o
+    mesmo fallback de antes (menor gap_deg entre os aceitaveis por
+    residuo, mesmo que extrapole) e marca isso no campo "between"=False do
+    retorno, para quem consome poder filtrar/reportar separadamente. Passe
+    False para reproduzir o comportamento anterior (so residuo+gap, sem
+    checar betweenness) -- usado por quem quiser comparar as duas versoes.
+
+    Retorna dict com indices LOCAIS i,j (relativos a candidate_bvecs),
+    residual_deg, gap_deg (=ang_ab em graus), t_frac e between (bool,
+    0<=t_frac<=1 do par retornado -- SEMPRE presente, independente de
+    require_between ter encontrado um par "between" ou caido no
+    fallback). Levanta ValueError se candidate_bvecs tiver menos de 2
+    direcoes.
+    """
+    candidate_bvecs = np.asarray(candidate_bvecs, dtype=float)
+    m = candidate_bvecs.shape[0]
+    if m < 2:
+        raise ValueError("find_best_bracket precisa de pelo menos 2 direcoes candidatas")
+
+    candidates = []
+    for i in range(m):
+        for j in range(i + 1, m):
+            residual, ang_ab, t_frac = spherical_triplet_residual(
+                candidate_bvecs[i], candidate_bvecs[j], target_bvec)
+            candidates.append((residual, i, j, ang_ab, t_frac))
+
+    def _is_between(c):
+        return 0.0 <= c[4] <= 1.0
+
+    if max_residual_deg is not None:
+        max_residual_rad = np.radians(max_residual_deg)
+        acceptable = [c for c in candidates if c[0] <= max_residual_rad]
+        if acceptable:
+            chosen_pool = acceptable
+            if require_between:
+                between_pool = [c for c in acceptable if _is_between(c)]
+                if between_pool:
+                    chosen_pool = between_pool
+                # senao (nenhum aceitavel tem o alvo entre os dois): cai
+                # para todos os aceitaveis mesmo, so pra ter uma resposta
+                # (marcado between=False abaixo).
+            # entre o pool escolhido, menor gap_deg (ang_ab); empate
+            # quebrado pelo menor residuo.
+            residual, i, j, ang_ab, t_frac = min(chosen_pool, key=lambda c: (c[3], c[0]))
+        else:
+            # nenhum par passa no teto -- fallback: menor residuo global
+            # (comportamento identico ao de antes deste parametro existir),
+            # pra quem chama ainda ter o "menos pior" e poder marcar invalido.
+            residual, i, j, ang_ab, t_frac = min(candidates, key=lambda c: c[0])
+    else:
+        residual, i, j, ang_ab, t_frac = min(candidates, key=lambda c: c[0])
+
+    return {
+        "i": i, "j": j,
+        "residual_deg": float(np.degrees(residual)),
+        "gap_deg": float(np.degrees(ang_ab)),
+        "t_frac": t_frac,
+        "between": bool(0.0 <= t_frac <= 1.0),
+    }
+
+
+def find_best_bracket_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarray,
+                             max_residual_deg: float | None = None,
+                             require_between: bool = True):
+    """Equivalente VETORIZADO de chamar find_best_bracket uma vez por linha
+    de target_bvecs (mesmos candidate_bvecs para todos os alvos) -- usado
+    por scripts/02b_build_rrin_triplets.py, que precisava disso pra cada
+    (shell,n_level,sujeito) de um dataset de ~1000 sujeitos e ficava lento
+    de mais (o loop Python duplo -- pares x alvos -- de find_best_bracket
+    reavaliava do zero, PARA CADA ALVO, todo par (i,j), incluindo os
+    produtos vetoriais/normalizacoes de spherical_triplet_residual, que sao
+    baratos individualmente mas o overhead de chamada numpy em vetores de
+    3 elementos domina quando repetido milhoes de vezes).
+
+    Ideia da vetorizacao: com a convencao de sinal antipodal usada em
+    spherical_triplet_residual (fixar sinais via VALOR ABSOLUTO do produto
+    escalar), da pra mostrar que:
+      - ang_ab (angulo entre os dois candidatos de um par) NAO depende do
+        alvo -- calculavel UMA VEZ para todos os pares (i,j), i<j.
+      - o plano/normal de cada par (usado no residuo) tambem nao depende
+        do alvo -- so o produto escalar final com o alvo muda.
+      - ang_at (usado no t_frac) so depende do candidato i (nao do par
+        completo nem de j) -- ang_at[i,alvo] = arccos(|U[i] . alvo|).
+    Ou seja, os unicos termos que realmente cruzam pares x alvos sao
+    produtos escalares -- viram DOIS produtos de matrizes (numpy BLAS) em
+    vez de milhoes de chamadas Python: `U @ alvos.T` (M x K) e
+    `normais_dos_pares @ alvos.T` (n_pares x K). Depois disso, a escolha do
+    melhor par por alvo e so indexacao/argmin em arrays ja prontos.
+
+    candidate_bvecs: (M,3). target_bvecs: (K,3) -- um ou mais alvos, MESMO
+    conjunto de candidatos para todos.
+
+    Retorna dict de arrays, cada um com shape (K,): "i", "j" (indices
+    LOCAIS em candidate_bvecs, um inteiro por alvo), "residual_deg",
+    "gap_deg", "t_frac", "between" -- exatamente os mesmos campos e a
+    MESMA semantica de find_best_bracket (verificado por equivalencia
+    numerica contra chamadas individuais em utils/tests, nao so por
+    inspecao).
+    """
+    candidate_bvecs = np.asarray(candidate_bvecs, dtype=float)
+    target_bvecs = np.atleast_2d(np.asarray(target_bvecs, dtype=float))
+    m = candidate_bvecs.shape[0]
+    if m < 2:
+        raise ValueError("find_best_bracket_batch precisa de pelo menos 2 direcoes candidatas")
+    k_targets = target_bvecs.shape[0]
+
+    u_norm = np.linalg.norm(candidate_bvecs, axis=1, keepdims=True)
+    u_norm[u_norm == 0] = 1.0
+    U = candidate_bvecs / u_norm
+
+    t_norm = np.linalg.norm(target_bvecs, axis=1, keepdims=True)
+    t_norm[t_norm == 0] = 1.0
+    T = target_bvecs / t_norm
+
+    iu, ju = np.triu_indices(m, k=1)  # mesma ordem de enumeracao de find_best_bracket
+    n_pairs = iu.shape[0]
+
+    dot_ij = np.sum(U[iu] * U[ju], axis=1)
+    ang_ab = np.arccos(np.clip(np.abs(dot_ij), 0.0, 1.0))  # (n_pairs,) -- nao depende do alvo
+
+    cross_ij = np.cross(U[iu], U[ju])  # (n_pairs, 3)
+    cross_norm = np.linalg.norm(cross_ij, axis=1)
+    degenerate = cross_norm < 1e-8
+    n_hat = np.zeros_like(cross_ij)
+    ok = ~degenerate
+    n_hat[ok] = cross_ij[ok] / cross_norm[ok, None]
+
+    dot_it = U @ T.T  # (M, K)
+    ang_it = np.arccos(np.clip(np.abs(dot_it), 0.0, 1.0))  # (M, K) -- so depende do candidato i
+
+    ang_at = ang_it[iu, :]  # (n_pairs, K) -- papel de "a" = candidato de indice menor, como no loop original
+    ang_ab_col = ang_ab[:, None]
+    t_frac = np.divide(ang_at, ang_ab_col, out=np.zeros_like(ang_at), where=ang_ab_col > 1e-8)
+
+    dot_tn = n_hat @ T.T  # (n_pairs, K)
+    residual = np.arcsin(np.clip(np.abs(dot_tn), 0.0, 1.0))
+    residual[degenerate, :] = np.pi / 2.0  # par degenerado (i~=j): sem plano bem definido
+
+    between = (t_frac >= 0.0) & (t_frac <= 1.0)
+    gap_deg_pairs = np.degrees(ang_ab)
+    residual_deg = np.degrees(residual)
+
+    out_i = np.empty(k_targets, dtype=int)
+    out_j = np.empty(k_targets, dtype=int)
+    out_residual = np.empty(k_targets)
+    out_gap = np.empty(k_targets)
+    out_tfrac = np.empty(k_targets)
+    out_between = np.empty(k_targets, dtype=bool)
+
+    acceptable = residual_deg <= max_residual_deg if max_residual_deg is not None else None
+
+    for k in range(k_targets):
+        if acceptable is not None:
+            acc_mask = acceptable[:, k]
+            if acc_mask.any():
+                pool_idx = np.nonzero(acc_mask)[0]
+                if require_between:
+                    bw_idx = pool_idx[between[pool_idx, k]]
+                    if bw_idx.size:
+                        pool_idx = bw_idx
+                # entre o pool, menor gap_deg; empate quebrado pelo menor residuo
+                order = np.lexsort((residual_deg[pool_idx, k], gap_deg_pairs[pool_idx]))
+                best = pool_idx[order[0]]
+            else:
+                best = int(np.argmin(residual_deg[:, k]))
+        else:
+            best = int(np.argmin(residual_deg[:, k]))
+
+        out_i[k] = iu[best]
+        out_j[k] = ju[best]
+        out_residual[k] = residual_deg[best, k]
+        out_gap[k] = gap_deg_pairs[best]
+        out_tfrac[k] = t_frac[best, k]
+        out_between[k] = between[best, k]
+
+    return {
+        "i": out_i, "j": out_j,
+        "residual_deg": out_residual,
+        "gap_deg": out_gap,
+        "t_frac": out_tfrac,
+        "between": out_between,
+    }
+
+
 # ---------------------------------------------------------------------------
 # I/O (depende de nibabel; import isolado para nao quebrar testes unitarios
 # que só exercitam a logica numpy acima)
