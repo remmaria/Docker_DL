@@ -23,6 +23,14 @@
 #   sbatch slurm/05b_reconstruct_rrin.sh <work_dir> <shell_b> <n_level>
 #   CKPT_JOB_ID=10972424_0 sbatch slurm/05b_reconstruct_rrin.sh <work_dir> <shell_b> <n_level>
 #   RECON_TAG=algumnome sbatch slurm/05b_reconstruct_rrin.sh <work_dir> <shell_b> <n_level>
+#
+# USE_QUALITY_COND=1 -- reconstroi com o checkpoint da variante consciente
+# da qualidade da trinca (treinada com USE_QUALITY_COND=1 em
+# slurm/04b_train_rrin.sh, salva em rrin_checkpoints/shell<B>_n<N>_qc/, ver
+# scripts/04b_train_rrin.py). Sem isso, le do checkpoint "cego" padrao
+# (shell<B>_n<N>/, sem sufixo). O proprio scripts/05b_reconstruct_rrin.py ja
+# le use_quality_cond de dentro do checkpoint (nao precisa passar de novo
+# na linha de comando) -- esta variavel so ajuda a achar o CKPT_DIR certo.
 
 set -euo pipefail
 mkdir -p logs
@@ -47,6 +55,10 @@ echo "Reconstruindo (RRIN3D) para shell_b=$SHELL_B, n_level=$N_LEVEL"
 source "./00_env_common.sh"
 
 CKPT_DIR="$WORK_DIR/rrin_checkpoints/shell${SHELL_B%.*}_n${N_LEVEL}"
+if [[ "${USE_QUALITY_COND:-0}" == "1" ]]; then
+    CKPT_DIR="${CKPT_DIR}_qc"
+    echo "USE_QUALITY_COND=1 -- lendo checkpoint da variante consciente da qualidade: $CKPT_DIR"
+fi
 if [[ -n "${CKPT_PATH:-}" ]]; then
     CKPT="$CKPT_PATH"
     echo "Usando checkpoint explicito (CKPT_PATH): $CKPT"
@@ -75,9 +87,14 @@ if [[ -n "${RECON_LIMIT:-}" ]]; then
 fi
 
 RECON_OUT_DIR="$WORK_DIR/rrin_recon"
+if [[ "${USE_QUALITY_COND:-0}" == "1" ]]; then
+    RECON_OUT_DIR="${RECON_OUT_DIR}_qc"
+fi
 if [[ -n "${RECON_TAG:-}" ]]; then
     RECON_OUT_DIR="$WORK_DIR/rrin_recon_${RECON_TAG}"
     echo "RECON_TAG=$RECON_TAG -- gravando em $RECON_OUT_DIR"
+else
+    echo "Gravando reconstrucao em $RECON_OUT_DIR"
 fi
 
 python scripts/05b_reconstruct_rrin.py \

@@ -221,7 +221,14 @@ def main():
     _sanity_step(val_loader, "validacao", do_backward=False)
     print("[sanity] ok -- comecando o loop de epocas de verdade", flush=True)
 
+    # ATENCAO: run_tag precisa refletir use_quality_cond -- sem isso, treinar
+    # a variante "consciente da qualidade" (--use-quality-cond) com o MESMO
+    # --out-dir da variante "cega" sobrescreveria o mesmo best.pt/last.pt
+    # (colisao silenciosa, sem nenhum aviso -- as duas rodadas competindo
+    # pelo mesmo checkpoint em vez de ficarem separadas para comparacao).
     run_tag = f"shell{int(args.shell_b)}_n{args.n_level}"
+    if args.use_quality_cond:
+        run_tag += "_qc"
     out_dir = Path(args.out_dir) / run_tag
     out_dir.mkdir(parents=True, exist_ok=True)
     run_id = args.job_id.replace("/", "_") if args.job_id else "sem_job_id"

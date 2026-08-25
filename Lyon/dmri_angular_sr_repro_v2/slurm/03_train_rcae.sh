@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=train_rcae
+#SBATCH --job-name=rcae_sh
 #SBATCH --cluster=gpu
-#SBATCH --partition=h200
+#SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
 # SBATCH --constraint=h200
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
-#SBATCH --time=0-23:00:00
+#SBATCH --time=2-23:00:00
 #SBATCH --account=tibrahim
 #SBATCH --error=logs/train.%A_%a.err
 #SBATCH --output=logs/train.%A_%a.out
@@ -135,9 +135,9 @@ python scripts/04_train_rcae.py \
     --scheme-dir "$WORK_DIR/subsampling" \
     --out-dir "$WORK_DIR/rcae_checkpoints" \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
-    --epochs 150 --batch-size 4 --patch-size 10 --q-out 10 \
-    --lr 1e-3 --num-workers 8 --max-cached-subjects 6 --patience 15 \
-    --debug-plot-every 1 --debug-plot-every-batches 2000 \
+    --epochs 150 --batch-size 8 --patch-size 10 --q-out 10 \
+    --lr 1e-3 --num-workers 8 --max-cached-subjects 8 --patience 15 \
+    --debug-plot-every 1 --debug-plot-every-batches 6000 \
     --val-num-workers 4 --val-max-cached-subjects 1 \
     --angular-loss-weight "$ANGULAR_LOSS_WEIGHT" \
     --sh-loss-high-order-min "$SH_LOSS_HIGH_ORDER_MIN" \

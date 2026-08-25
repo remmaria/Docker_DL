@@ -30,7 +30,7 @@ source "./00_env_common.sh"
 python scripts/02_subsample_directions.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --out-dir "$WORK_DIR/subsampling" \
-    --levels 6 10 15 20 30 40 50
+    --levels 6 10 16 20 24 32 48 54
 # uniao de todos os niveis usados em qualquer experimento (ver configs/experiments.tsv);
 # niveis maiores que as direcoes disponiveis numa shell/sujeito sao pulados
 # automaticamente (aviso no log), sem problema.

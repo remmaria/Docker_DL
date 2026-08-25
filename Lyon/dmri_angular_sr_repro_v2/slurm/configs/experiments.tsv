@@ -1,0 +1,60 @@
+# Uma linha por experimento (shell_b, n_level). Colunas separadas por TAB.
+# Preenchido com base no shell_availability_summary.csv do work_dir novo
+# (all_bias apos remocao dos outliers listados em outliers.txt):
+#
+#   b_value   n_subjects  n_directions (min-median-max)
+#   1000.0    743         32-64-64   <- maior N, resultado principal
+#   1500.0    406         64-64-64   <- N alto, super uniforme (todo mundo 64 dir)
+#   500.0     355         16-16-16   <- N alto, mas so 16 direcoes -- niveis baixos
+#   700.0      63         35-35-35  <- N ok, secundario/generalizacao
+#   2000.0     63         77-77-77  <- N ok, secundario/generalizacao
+#   750.0      51         28-28-28  <- N ok, secundario/generalizacao
+#
+# Lista de niveis atualizada (ver protocolo/chat): 6 10 16 20 24 32 48 54 --
+# substitui a lista antiga (6 10 15 20 30 40 50). Cada shell so lista os
+# niveis que cabem no numero de direcoes disponivel (min observado, ver
+# tabela acima) -- niveis maiores que o disponivel sao pulados
+# automaticamente por scripts/02_subsample_directions.py mesmo, mas nem
+# vale gastar um job de reconstrucao/treino num combo que nao vai ter
+# nenhum sujeito de verdade.
+#
+# === Experimentos principais (rode primeiro) ===
+1000	6
+1000	10
+1000	16
+1000	20
+1000	24
+1000	32
+1000	48
+1000	54
+1500	6
+1500	10
+1500	16
+1500	20
+1500	24
+1500	32
+1500	48
+1500	54
+500	6
+500	10
+#
+# === Secundarios / generalizacao (rode depois, se quiser cobrir mais no texto) ===
+700	6
+700	10
+700	16
+700	20
+700	24
+700	32
+2000	6
+2000	10
+2000	16
+2000	20
+2000	24
+2000	32
+2000	48
+2000	54
+750	6
+750	10
+750	16
+750	20
+750	24

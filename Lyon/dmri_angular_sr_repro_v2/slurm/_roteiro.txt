@@ -1,10 +1,24 @@
 
 
-sbatch 01_prepare_data.sh /ix1/tibrahim/rmm270/DATA/DWIs/studies/all_bias /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
-sbatch 01_prepare_data.sh /ix1/tibrahim/rmm270/DATA/DWIs/studies/all_bias /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh
+sbatch 01_prepare_data.sh /ix1/tibrahim/rmm270/DATA/DWIs/studies/all_bias /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir -> manidest.csv
+sbatch 02_baseline_sh.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir -> subsampling 857 (all) (scheme.npz)
+sbatch --array=1-37 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir -> baseline_recon 129 (test)
 
-sbatch 02_baseline_sh.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
-sbatch 02_baseline_sh.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh
+sbatch 09b_build_basecurve.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000
+
+RCAE
+sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+ANGULAR_LOSS_WEIGHT=0.5 \
+    SH_LOSS_HIGH_ORDER_MIN=2 \
+    sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+RRIN
+sbatch 02b_build_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir -> subsampling 857 (all) (rrin_triplets.npz)
+
+NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+USE_QUALITY_COND=1 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
 
 #------------02b_baseline_reconstruct.sh
 
@@ -15,9 +29,14 @@ sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/
 sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 32
 sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 16
 
+sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 32
 
 
-sbatch --array=1-145 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1500 10
+for n_level in 6 10 16 20 24 32 48 54; do
+    SCHEME_DIR_OVERRIDE=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_basecurve \
+    OUT_DIR_OVERRIDE=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/baseline_recon_basecurve \
+        sbatch 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 "$n_level"
+done
 
 
 #------------03_train02b_build_rrin_triplets_rcae.sh
@@ -31,36 +50,43 @@ sbatch 02c_diagnose_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_di
 
 #------------03_train_rcae.sh
 
-sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
-sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1500 10
+sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/training 1000 10
 
 ANGULAR_LOSS_WEIGHT=0.5 \
     SH_LOSS_HIGH_ORDER_MIN=2 \
-    sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+    sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/training 1000 10
 
-ANGULAR_LOSS_WEIGHT=0.5 \
-    SH_LOSS_HIGH_ORDER_MIN=2 \
-    sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1500 10
+
+
 
 ANGULAR_LOSS_WEIGHT=0.5 \
     SH_LOSS_HIGH_ORDER_MIN=2 \
     RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rcae_checkpoints/shell1000_n10/runs/3498743_0/last.pt \
     sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
 
-RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3498740_0/best.pt \
+RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3501293_0/best.pt \
     sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rcae_checkpoints/shell1000_n10/runs/3501014_0/best.pt \
+    sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
+
 
 
 #------------04b_train_rrin.sh
 
 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
 
+LR=1e-3 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
+
+USE_QUALITY_COND=1 LR=1e-3 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
+
+
 #------------05b_reconstruct_rrin.sh
 
 # --- b1000
-RECON_TAG=3503365_0 \
+RECON_TAG=3503769_0 \
     RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
-    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rrin_checkpoints/shell1000_n10/runs/3503365_0/best.pt \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rrin_checkpoints/shell1000_n10/runs/3503769_0/best.pt \
     sbatch 05b_reconstruct_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
 
 
@@ -100,7 +126,7 @@ RECON_TAG=3501014_0 \
 
 # --- b1000 baseline, rcae, rcae_sh, rrin
 
-EXTRA_METHOD="rrin=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rrin_recon_3503365_0,rcae=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rcae_recon_3501293_0,rcae_sh=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rcae_recon_3501014_0" \
+EXTRA_METHOD="rrin=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rrin_recon_3503769_0,rcae=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rcae_recon_3501293_0,rcae_sh=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh/rcae_recon_3501014_0" \
     ROI_TRACTS="FX,CGC,CGH,UF,WM,CbWM_L,CbWM_R,Ctx_L,Ctx_R,Hipp_L,Hipp_R,SubCtx_R,SubCtx_L" \
     RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
     sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
@@ -131,3 +157,8 @@ sbatch 09_compare_sh_loss.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 1
 python scripts/compare_sh_loss_variants.py \
     --sem-sh <work_dir>/downstream_semSH/dti_noddi_metrics_shell1000_n10.csv \
     --com-sh <work_dir>/downstream_comSH/dti_noddi_metrics_shell1000_n10.csv
+
+
+
+# - - - - - -  09b_build_basecurve.sh
+sbatch 09b_build_basecurve.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000
