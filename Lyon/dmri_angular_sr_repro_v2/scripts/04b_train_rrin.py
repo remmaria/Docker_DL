@@ -133,6 +133,19 @@ def main():
                           "de interpolacao. Default (desativado) mantem o teste 'cego' mais "
                           "proximo de VFI de video de verdade -- ative pra rodar a variante "
                           "'consciente da qualidade' e comparar as duas.")
+    ap.add_argument("--no-only-valid", action="store_true",
+                     help="treina/valida tambem com trincas INVALIDAS (residuo alto ou alvo "
+                          "extrapolado, ver utils/rrin_dataset.py:RRINTripletDataset e "
+                          "protocolo secao 10.1/10.2). Default (so validas) e o motivo "
+                          "confirmado de rrin/rrin_qc produzirem valores fisicamente "
+                          "implausiveis (explosao numerica, NMSE ~1e9-1e11) nos alvos "
+                          "invalidos na reconstrucao -- a rede nunca viu geometria parecida no "
+                          "treino. Ativar esta flag NAO deve fazer a rede aprender fluxo onde "
+                          "ele nao existe geometricamente (isso e uma limitacao de informacao, "
+                          "nao de capacidade), mas deve evitar a explosao numerica trocando "
+                          "'falha catastrofica' por 'degrada mal, de forma controlada' -- teste "
+                          "e compare o campo aggregate_invalid de scripts/06_evaluate_reconstruction.py "
+                          "antes/depois pra confirmar.")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--max-cached-subjects", type=int, default=2)
     ap.add_argument("--val-num-workers", type=int, default=None)
@@ -152,16 +165,18 @@ def main():
     train_entries = [e for e in entries if e.split == "train"]
     val_entries = [e for e in entries if e.split == "val"]
 
+    only_valid = not args.no_only_valid
+    print(f"[resumo] only_valid={only_valid} (--no-only-valid {'passado' if args.no_only_valid else 'nao passado'})")
     train_ds = RRINTripletDataset(train_entries, args.triplets_dir, args.shell_b, args.n_level,
                                    patch_size=args.patch_size, training=True,
-                                   mask_suffix=args.mask_suffix,
+                                   mask_suffix=args.mask_suffix, only_valid=only_valid,
                                    min_tile_coverage=args.min_tile_coverage,
                                    seed=args.seed, max_cached_subjects=args.max_cached_subjects)
     val_num_workers = args.val_num_workers if args.val_num_workers is not None \
         else min(2, args.num_workers)
     val_ds = RRINTripletDataset(val_entries, args.triplets_dir, args.shell_b, args.n_level,
                                  patch_size=args.patch_size, training=False,
-                                 mask_suffix=args.mask_suffix,
+                                 mask_suffix=args.mask_suffix, only_valid=only_valid,
                                  min_tile_coverage=args.min_tile_coverage,
                                  seed=args.seed + 1, max_cached_subjects=args.val_max_cached_subjects)
 
@@ -221,14 +236,16 @@ def main():
     _sanity_step(val_loader, "validacao", do_backward=False)
     print("[sanity] ok -- comecando o loop de epocas de verdade", flush=True)
 
-    # ATENCAO: run_tag precisa refletir use_quality_cond -- sem isso, treinar
-    # a variante "consciente da qualidade" (--use-quality-cond) com o MESMO
-    # --out-dir da variante "cega" sobrescreveria o mesmo best.pt/last.pt
-    # (colisao silenciosa, sem nenhum aviso -- as duas rodadas competindo
-    # pelo mesmo checkpoint em vez de ficarem separadas para comparacao).
+    # ATENCAO: run_tag precisa refletir use_quality_cond E only_valid -- sem
+    # isso, treinar uma variante com o MESMO --out-dir de outra sobrescreveria
+    # o mesmo best.pt/last.pt (colisao silenciosa, sem nenhum aviso -- as duas
+    # rodadas competindo pelo mesmo checkpoint em vez de ficarem separadas
+    # para comparacao).
     run_tag = f"shell{int(args.shell_b)}_n{args.n_level}"
     if args.use_quality_cond:
         run_tag += "_qc"
+    if not only_valid:
+        run_tag += "_inclinv"
     out_dir = Path(args.out_dir) / run_tag
     out_dir.mkdir(parents=True, exist_ok=True)
     run_id = args.job_id.replace("/", "_") if args.job_id else "sem_job_id"

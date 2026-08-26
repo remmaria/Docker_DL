@@ -41,10 +41,35 @@
 # DUPLICADA -- mesmo bug que existia em 05_evaluate_and_downstream.sh antes
 # da correcao. Agora, se voce passar shell_b/n_level E estiver dentro de um
 # array, o script entende que o array e sharding por sujeito.
+#
+# scheme_dir_override / out_dir_override (ARGUMENTOS POSICIONAIS 4 e 5,
+# opcionais, so fazem sentido quando shell_b/n_level -- args 2/3 -- tambem
+# sao passados) -- sobrepoe "$WORK_DIR/subsampling" e "$WORK_DIR/baseline_recon"
+# respectivamente. Uteis pra rodar uma investigacao paralela (ex.: curva de
+# baseline com uma lista de n_level diferente da canonica em
+# configs/experiments.tsv) sem tocar no esquema/reconstrucao "de producao"
+# usados pelo RCAE/RRIN -- gere o esquema alternativo com
+# scripts/02_subsample_directions.py --out-dir <outro_dir> antes, e passe o
+# caminho como arg 4 aqui. Ex.:
+#   sbatch slurm/02b_baseline_reconstruct.sh <work_dir> 1000 16 \
+#       $WORK_DIR/subsampling_basecurve $WORK_DIR/baseline_recon_basecurve
+#
+# ARGUMENTOS POSICIONAIS EM VEZ DE VARIAVEIS DE AMBIENTE: em alguns clusters
+# SLURM, "VAR=valor sbatch ..." (ou ate "sbatch --export=ALL,VAR=valor ...")
+# NAO propaga a variavel pro ambiente do job de verdade (depende de
+# configuracao do site) -- se isso acontecer, o script cai no default
+# silenciosamente, sem avisar (so o log ficaria sem a linha "lendo esquema
+# desse caminho" que apareceria se tivesse funcionado). Argumento posicional
+# NUNCA tem esse problema -- por isso e o jeito recomendado agora. As
+# variaveis SCHEME_DIR_OVERRIDE/OUT_DIR_OVERRIDE ainda sao aceitas como
+# fallback (caso o cluster propague ambiente direitinho), mas os argumentos
+# posicionais, se passados, tem prioridade.
 
 set -euo pipefail
 mkdir -p logs
-WORK_DIR="${1:?uso: sbatch 02b_baseline_reconstruct.sh <work_dir> [shell_b n_level]}"
+WORK_DIR="${1:?uso: sbatch 02b_baseline_reconstruct.sh <work_dir> [shell_b n_level [scheme_dir_override out_dir_override]]}"
+POS_SCHEME_OVERRIDE="${4:-}"
+POS_OUT_OVERRIDE="${5:-}"
 
 EXPERIMENTS_TSV="configs/experiments.tsv"
 
@@ -88,10 +113,27 @@ fi
 
 source "./00_env_common.sh"
 
+SCHEME_DIR="$WORK_DIR/subsampling"
+if [[ -n "$POS_SCHEME_OVERRIDE" ]]; then
+    SCHEME_DIR="$POS_SCHEME_OVERRIDE"
+    echo "scheme_dir_override (arg 4) = $SCHEME_DIR -- lendo esquema desse caminho"
+elif [[ -n "${SCHEME_DIR_OVERRIDE:-}" ]]; then
+    SCHEME_DIR="$SCHEME_DIR_OVERRIDE"
+    echo "SCHEME_DIR_OVERRIDE=$SCHEME_DIR_OVERRIDE -- lendo esquema desse caminho"
+fi
+OUT_DIR="$WORK_DIR/baseline_recon"
+if [[ -n "$POS_OUT_OVERRIDE" ]]; then
+    OUT_DIR="$POS_OUT_OVERRIDE"
+    echo "out_dir_override (arg 5) = $OUT_DIR -- gravando reconstrucao nesse caminho"
+elif [[ -n "${OUT_DIR_OVERRIDE:-}" ]]; then
+    OUT_DIR="$OUT_DIR_OVERRIDE"
+    echo "OUT_DIR_OVERRIDE=$OUT_DIR_OVERRIDE -- gravando reconstrucao nesse caminho"
+fi
+
 python scripts/03_baseline_sh_interpolation.py \
     --manifest "$WORK_DIR/manifest.csv" \
-    --scheme-dir "$WORK_DIR/subsampling" \
-    --out-dir "$WORK_DIR/baseline_recon" \
+    --scheme-dir "$SCHEME_DIR" \
+    --out-dir "$OUT_DIR" \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT" \
     --split test

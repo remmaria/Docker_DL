@@ -54,6 +54,25 @@ def evaluate_subject_method(recon_dir: Path, tag: str, shell_b: float, n_level: 
     # mask.npy fica um nivel acima (compartilhada entre todos os n_level dessa shell)
     mask = np.load(sub_dir.parent / "mask.npy")
 
+    # rrin_valid.npy so existe para metodos RRIN/VFI-por-triplets (ver
+    # scripts/05b_reconstruct_rrin.py) -- marca quais alvos tem trinca
+    # geometricamente valida (residuo de colinearidade dentro do teto E
+    # target "entre" o par, ver scripts/02b_build_rrin_triplets.py). Esses
+    # alvos invalidos sao reconstruidos DE PROPOSITO (ver docstring de
+    # 05b_reconstruct_rrin.py) mas NUNCA aparecem no treino (RRINTripletDataset
+    # usa only_valid=True por padrao) -- na pratica a rede extrapola mal pra
+    # essa geometria e pode produzir valores fisicamente implausiveis (visto
+    # na pratica: um unico alvo invalido gerando erro ao quadrado da ordem
+    # de 1e16, o suficiente pra tornar o NMSE agregado inteiro sem sentido).
+    # Sem esse arquivo (baseline_sh/rcae, que nao tem o conceito de trinca
+    # valida/invalida), trata tudo como valido -- comportamento antigo
+    # preservado no scope "aggregate".
+    valid_path = sub_dir / "rrin_valid.npy"
+    if valid_path.exists():
+        triplet_valid = np.load(valid_path).astype(bool)
+    else:
+        triplet_valid = np.ones(target_idx.shape[0], dtype=bool)
+
     gt_target = gt_data[..., target_idx]
 
     rows = []
@@ -64,20 +83,47 @@ def evaluate_subject_method(recon_dir: Path, tag: str, shell_b: float, n_level: 
             "subject": subject, "method": method, "shell": shell_b, "n_level": n_level,
             "acquisition_context": acquisition_context,
             "target_volume_idx": int(target_idx[t]), "metric_scope": "per_volume",
+            "triplet_valid": bool(triplet_valid[t]),
             "psnr": psnr(p, g, mask=mask), "ssim": ssim3d(p, g, mask=mask),
         })
 
     m = mask.astype(bool)
-    nmse_val = nmse(recon[m], gt_target[m])
-    rmse_val = rmse(recon[m], gt_target[m])
-    acc = angular_correlation_coefficient(recon[m], gt_target[m])
-    rows.append({
-        "subject": subject, "method": method, "shell": shell_b, "n_level": n_level,
-        "acquisition_context": acquisition_context,
-        "target_volume_idx": -1, "metric_scope": "aggregate",
-        "nmse": nmse_val, "rmse": rmse_val, "acc_mean": float(np.nanmean(acc)),
-        "acc_std": float(np.nanstd(acc)),
-    })
+
+    def _aggregate_row(scope_name, sel):
+        if not np.any(sel):
+            return None
+        recon_sel = recon[..., sel]
+        gt_sel = gt_target[..., sel]
+        nmse_val = nmse(recon_sel[m], gt_sel[m])
+        rmse_val = rmse(recon_sel[m], gt_sel[m])
+        acc = angular_correlation_coefficient(recon_sel[m], gt_sel[m])
+        return {
+            "subject": subject, "method": method, "shell": shell_b, "n_level": n_level,
+            "acquisition_context": acquisition_context,
+            "target_volume_idx": -1, "metric_scope": scope_name,
+            "n_targets": int(sel.sum()),
+            "nmse": nmse_val, "rmse": rmse_val, "acc_mean": float(np.nanmean(acc)),
+            "acc_std": float(np.nanstd(acc)),
+        }
+
+    # "aggregate": TODOS os alvos (comportamento antigo, mantido por
+    # compatibilidade -- para RRIN com alvos invalidos presentes, este
+    # numero pode ficar dominado por explosao numerica, ver nota acima).
+    # "aggregate_valid"/"aggregate_invalid": mesma coisa, mas separado por
+    # triplet_valid -- para baseline_sh/rcae (sem rrin_valid.npy),
+    # aggregate_valid == aggregate (tudo valido) e aggregate_invalid nunca
+    # aparece (nada a selecionar). Para RRIN, aggregate_valid e o numero
+    # que de fato compara "maca com maca" com baseline_sh/rcae (mesma
+    # suposicao de que a geometria sustenta a reconstrucao);
+    # aggregate_invalid quantifica especificamente o quanto/onde a hipotese
+    # de fluxo falha (ver protocolo secao 10.1).
+    all_sel = np.ones(target_idx.shape[0], dtype=bool)
+    for scope, sel in [("aggregate", all_sel),
+                       ("aggregate_valid", triplet_valid),
+                       ("aggregate_invalid", ~triplet_valid)]:
+        row = _aggregate_row(scope, sel)
+        if row is not None:
+            rows.append(row)
     return rows
 
 
@@ -195,7 +241,7 @@ def main():
                   f"nao tem essa shell) -- gravando CSV vazio em {args.out_csv}", flush=True)
             df = pd.DataFrame(columns=["subject", "method", "shell", "n_level",
                                         "acquisition_context", "target_volume_idx",
-                                        "metric_scope"])
+                                        "metric_scope", "triplet_valid", "n_targets"])
             Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(args.out_csv, index=False)
             return
@@ -205,9 +251,16 @@ def main():
     Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.out_csv, index=False)
     print("Metricas salvas em", args.out_csv)
-    agg = df[df.metric_scope == "aggregate"]
+    agg = df[df.metric_scope.isin(["aggregate", "aggregate_valid", "aggregate_invalid"])]
     if not agg.empty:
-        print(agg.groupby("method")[["nmse", "rmse", "acc_mean"]].mean())
+        # agrupado tambem por metric_scope -- pra metodos RRIN com alvos
+        # invalidos (ver evaluate_subject_method), "aggregate" pode ficar
+        # dominado por explosao numerica dos poucos alvos invalidos;
+        # "aggregate_valid" e o numero comparavel com baseline_sh/rcae,
+        # "aggregate_invalid" (se aparecer) mostra especificamente o tamanho
+        # do problema nesses poucos alvos. Para baseline_sh/rcae (sem
+        # conceito de trinca invalida), aggregate_valid == aggregate.
+        print(agg.groupby(["method", "metric_scope"])[["nmse", "rmse", "acc_mean"]].mean())
 
 
 if __name__ == "__main__":

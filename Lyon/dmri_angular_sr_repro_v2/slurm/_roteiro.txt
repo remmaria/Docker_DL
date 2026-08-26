@@ -6,6 +6,9 @@ sbatch --array=1-37 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/L
 
 sbatch 09b_build_basecurve.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000
 
+ARRAY_JOB=$(sbatch --parsable --array=1-8 09b_build_basecurve.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000)
+sbatch --dependency=afterok:$ARRAY_JOB 09c_merge_basecurve.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 8
+
 RCAE
 sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 
@@ -18,6 +21,50 @@ sbatch 02b_build_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir -
 
 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 USE_QUALITY_COND=1 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+
+#--------------
+OUT_DIR_OVERRIDE=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_basecurve \
+LEVELS_OVERRIDE="6 10 12 16 20 24 28 32 36 40 44 48 52 56 60" \
+  sbatch 02_baseline_sh.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
+
+for N in 6 10 12 16 20 24 28 32 36 40 44 48 52 56 60; do
+  sbatch 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 $N \
+    /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_basecurve \
+    /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/baseline_recon_basecurve
+done
+
+sbatch --array=1-8 09b_build_basecurve.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 \
+  6 10 12 16 20 24 28 32 36 40 44 48 52 56 60 \
+  --baseline-dir=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/baseline_recon_basecurve \
+  --out-csv=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/basecurve_metrics_shell1000_fine.csv
+
+sbatch 09c_merge_basecurve.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 8 \
+  /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/basecurve_metrics_shell1000_fine.csv
+
+
+
+
+
+SUBJ58=$(cat /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subj58.txt)
+
+RECON_SUBJECTS="$SUBJ58" CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3505418_0/best.pt RECON_TAG=rcae \
+  sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+RECON_SUBJECTS="$SUBJ58" CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3505420_0/best.pt RECON_TAG=rcae_sh \
+  sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+RECON_SUBJECTS="$SUBJ58" CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_checkpoints/shell1000_n10/runs/3505417_0/best.pt RECON_TAG=rrin \
+  sbatch 05b_reconstruct_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+RECON_SUBJECTS="$SUBJ58" CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_checkpoints/shell1000_n10_qc/runs/3505421_0/best.pt RECON_TAG=rrin_qc \
+  sbatch 05b_reconstruct_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+
+EXTRA_METHOD="rcae_recon_rcae:$( ls -d /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_recon_rcae ),rcae_sh_recon_rcae_sh:$( ls -d /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_recon_rcae_sh ),rrin_recon_rrin:$( ls -d /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin ),rrin_qc_recon_rrin_qc:$( ls -d /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin_qc )" \
+RECON_TAG=unused \
+RECON_SUBJECTS="$SUBJ58" \
+  sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 
 
 #------------02b_baseline_reconstruct.sh
