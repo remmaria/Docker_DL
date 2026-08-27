@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=rrin
+#SBATCH --job-name=rrin16k2
 #SBATCH --cluster=gpu
 #SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
@@ -54,6 +54,19 @@
 # em out_dir/shell<B>_n<N>_inclinv/ (sufixo automatico, nao colide com as
 # outras variantes).
 #   ONLY_VALID=0 sbatch slurm/04b_train_rrin.sh <work_dir> <shell_b> <n_level>
+#
+# NUM_LAYERS=<K> (variavel de ambiente, default 1) -- liga --num-layers K (ver
+# model/rrin3d.py:RRIN3DLayered e protocolo secao 13, "Toward a layered-flow
+# extension for crossing fibers"). K=1 (default) usa a arquitetura ORIGINAL
+# (RRIN3D, um unico fluxo bidirecional + 1 mapa de visibilidade). K>=2 usa
+# RRIN3DLayered: cada camada tem seu proprio par de fluxo e visibilidade, e
+# as K camadas sao combinadas por um softmax POR VOXEL (o K em si e fixo pra
+# toda a imagem; o que varia por voxel e o peso aprendido de cada camada).
+# Comece SEM nenhuma supervisao auxiliar -- so compare K=1 vs K=2 vs K=3 via
+# aggregate_valid/aggregate_invalid (scripts/06_evaluate_reconstruction.py).
+# Grava em out_dir/shell<B>_n<N>_k<K>/ (sufixo automatico, nao colide com as
+# outras variantes).
+#   NUM_LAYERS=2 sbatch slurm/04b_train_rrin.sh <work_dir> <shell_b> <n_level>
 set -euo pipefail
 mkdir -p logs
 WORK_DIR="${1:?uso: sbatch 04b_train_rrin.sh <work_dir> [shell_b n_level]}"
@@ -95,6 +108,12 @@ if [[ "${ONLY_VALID:-1}" == "0" ]]; then
     ONLY_VALID_FLAG=(--no-only-valid)
     echo "ONLY_VALID=0 -- treinando/validando tambem com trincas invalidas (checkpoint em shell${SHELL_B%.*}_n${N_LEVEL}_inclinv/)"
 fi
+NUM_LAYERS="${NUM_LAYERS:-1}"
+NUM_LAYERS_FLAG=()
+if [[ "$NUM_LAYERS" != "1" ]]; then
+    NUM_LAYERS_FLAG=(--num-layers "$NUM_LAYERS")
+    echo "NUM_LAYERS=$NUM_LAYERS -- treinando a variante em camadas RRIN3DLayered (checkpoint em shell${SHELL_B%.*}_n${N_LEVEL}_k${NUM_LAYERS}/)"
+fi
 python scripts/04b_train_rrin.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --triplets-dir "$WORK_DIR/subsampling" \
@@ -103,5 +122,5 @@ python scripts/04b_train_rrin.py \
     --epochs 150 --batch-size 8 --patch-size 10 \
     --lr "$LR" --num-workers 8 --max-cached-subjects 6 --patience 15 \
     --val-num-workers 4 --val-max-cached-subjects 1 \
-    "${RESUME_FLAG[@]}" "${QC_FLAG[@]}" "${ONLY_VALID_FLAG[@]}" \
+    "${RESUME_FLAG[@]}" "${QC_FLAG[@]}" "${ONLY_VALID_FLAG[@]}" "${NUM_LAYERS_FLAG[@]}" \
     --job-id "${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"

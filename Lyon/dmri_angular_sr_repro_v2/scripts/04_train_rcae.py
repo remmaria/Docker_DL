@@ -680,7 +680,20 @@ def main():
     print("[sanity] ok -- workers de treino e validacao ja estao de pe, comecando o loop "
           "de epocas de verdade", flush=True)
 
+    # ATENCAO (bug real ja encontrado em producao, ver protocolo): sem este
+    # sufixo, treinar a variante COM loss angular/SH (--angular-loss-weight
+    # > 0) no MESMO (shell_b, n_level) que a variante SEM ela colide no
+    # MESMO out_dir/best.pt/last.pt canonico -- as duas competem pelo mesmo
+    # arquivo (auto-resume inclusive pode fazer uma continuar da outra sem
+    # avisar, alem da corrida entre os dois processos escrevendo o mesmo
+    # caminho). O aviso de --angular-loss-weight mudou entre checkpoint e
+    # chamada (algumas linhas abaixo) so pega isso NA HORA DE RETOMAR; o
+    # sufixo aqui evita a colisao de raiz, mesmo sem nenhum resume envolvido
+    # (dois `sbatch` para o mesmo combo, um com SH outro sem, rodando em
+    # paralelo). Mesmo padrao ja usado em scripts/04b_train_rrin.py (_qc/_inclinv).
     run_tag = f"shell{int(args.shell_b)}_n{args.n_level}"
+    if args.angular_loss_weight > 0:
+        run_tag += "_sh"
     out_dir = Path(args.out_dir) / run_tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -730,13 +743,27 @@ def main():
         # SIGNIFICADO do que o modelo ja aprendeu. lstm_size SIM muda o
         # shape -- se estiver diferente, model.load_state_dict abaixo vai
         # falhar sozinho com um erro claro de mismatch de shape.
+        #
+        # angular_loss_weight/sh_loss_high_order_min/sh_loss_lmax_cap
+        # tambem entram aqui: o caminho canonico do checkpoint
+        # (out_dir/<shell>_<n>/last.pt) e o MESMO independente desses
+        # parametros -- ou seja, um run "sem SH loss" e um "com SH loss" do
+        # MESMO (shell_b, n_level) se sobrescrevem no mesmo arquivo. Sem
+        # este aviso, retomar um treino "sem SH" depois de ter rodado "com
+        # SH" nesse combo continuaria silenciosamente a partir do
+        # checkpoint ERRADO (o mais recente, seja lá qual config gerou).
         old_args = ckpt.get("args", {})
-        for key in ("shell_b", "n_level", "patch_size", "q_out", "lstm_size"):
+        for key in ("shell_b", "n_level", "patch_size", "q_out", "lstm_size",
+                    "angular_loss_weight", "sh_loss_high_order_min", "sh_loss_lmax_cap"):
             old_val, new_val = old_args.get(key), vars(args).get(key)
             if old_val is not None and old_val != new_val:
                 print(f"[resume][aviso] --{key.replace('_','-')} mudou entre o checkpoint "
-                      f"({old_val}) e esta chamada ({new_val}) -- confira se e intencional.",
-                      flush=True)
+                      f"({old_val}) e esta chamada ({new_val}) -- confira se e intencional "
+                      f"(ex.: voce pode estar prestes a continuar um treino 'sem SH loss' a "
+                      f"partir de um checkpoint que foi treinado 'com SH loss', ou vice-versa, "
+                      f"porque os dois usam o MESMO caminho canonico de checkpoint -- ver "
+                      f"protocolo secao 9). Se nao for intencional, use --no-resume ou aponte "
+                      f"--resume-checkpoint pro job certo.", flush=True)
         model.load_state_dict(ckpt["model_state"])
         if "optimizer_state" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state"])

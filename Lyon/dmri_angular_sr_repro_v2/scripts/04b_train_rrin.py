@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.manifest import load_manifest
 from utils.rrin_dataset import RRINTripletDataset
 from utils.dataset import SubjectGroupedSampler, worker_init_fn
-from model.rrin3d import RRIN3D
+from model.rrin3d import build_rrin_model
 
 
 def run_epoch(model, loader, optimizer, device, train: bool, epoch: int,
@@ -133,6 +133,31 @@ def main():
                           "de interpolacao. Default (desativado) mantem o teste 'cego' mais "
                           "proximo de VFI de video de verdade -- ative pra rodar a variante "
                           "'consciente da qualidade' e comparar as duas.")
+    ap.add_argument("--num-layers", type=int, default=1,
+                     help="numero K de camadas de fluxo independentes (ver "
+                          "model/rrin3d.py:RRIN3DLayered e protocolo secao 13, 'Toward a "
+                          "layered-flow extension for crossing fibers'). Default 1 usa a "
+                          "arquitetura ORIGINAL (model.rrin3d.RRIN3D -- um unico fluxo "
+                          "bidirecional + 1 mapa de visibilidade escalar), mantendo "
+                          "compatibilidade total com os checkpoints ja treinados. K>=2 usa "
+                          "RRIN3DLayered: cada camada tem seu proprio par de fluxo (a->t, "
+                          "b->t) e sua propria visibilidade, e as K camadas sao combinadas "
+                          "por um softmax POR VOXEL (nao e um K que 'muda' por voxel -- a "
+                          "arquitetura sempre calcula as K camadas em todo lugar; o que muda "
+                          "por voxel e o PESO de cada camada nesse softmax, aprendido sem "
+                          "nenhuma supervisao externa). Motivacao: um unico mapa de "
+                          "visibilidade so decide 'confia mais em a ou em b' (bom pra oclusao "
+                          "simples, tipo VFI de video), mas nao representa um voxel que e uma "
+                          "MISTURA de duas populacoes de fibra (crossing) -- cada camada pode "
+                          "se especializar numa populacao. Comece SEM nenhuma loss auxiliar "
+                          "(so a loss de reconstrucao já existente) e compare K=1 (baseline) "
+                          "vs K=2 vs K=3 via aggregate_valid/aggregate_invalid "
+                          "(scripts/06_evaluate_reconstruction.py); so vale a pena acrescentar "
+                          "supervisao tipo CSD/peak-count (sempre calculada da aquisicao "
+                          "COMPLETA do sujeito, nunca do n_level subamostrado -- ver protocolo, "
+                          "risco de indeterminacao/circularidade) se as camadas colapsarem "
+                          "(pi quase identico em toda a imagem, sem estrutura espacial "
+                          "reconhecivel quando comparado a regioes conhecidas de crossing).")
     ap.add_argument("--no-only-valid", action="store_true",
                      help="treina/valida tambem com trincas INVALIDAS (residuo alto ou alvo "
                           "extrapolado, ver utils/rrin_dataset.py:RRINTripletDataset e "
@@ -197,11 +222,15 @@ def main():
     print(f"[resumo] val:    {len(val_ds.usable)} sujeitos utilizaveis "
           f"({len(val_ds)} patches, {len(val_loader)} batches/epoca)", flush=True)
 
-    model = RRIN3D(base_ch=args.base_ch, max_disp=args.max_disp,
-                    use_quality_cond=args.use_quality_cond).to(device)
+    if args.num_layers < 1:
+        raise ValueError(f"--num-layers deve ser >= 1 (recebido {args.num_layers})")
+    model = build_rrin_model(num_layers=args.num_layers, base_ch=args.base_ch,
+                              max_disp=args.max_disp,
+                              use_quality_cond=args.use_quality_cond).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[resumo] RRIN3D: {n_params} parametros (base_ch={args.base_ch}, "
-          f"use_quality_cond={args.use_quality_cond})")
+    model_name = type(model).__name__
+    print(f"[resumo] {model_name}: {n_params} parametros (base_ch={args.base_ch}, "
+          f"num_layers={args.num_layers}, use_quality_cond={args.use_quality_cond})")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min",
                                                              factor=0.5, patience=5)
@@ -246,6 +275,8 @@ def main():
         run_tag += "_qc"
     if not only_valid:
         run_tag += "_inclinv"
+    if args.num_layers > 1:
+        run_tag += f"_k{args.num_layers}"
     out_dir = Path(args.out_dir) / run_tag
     out_dir.mkdir(parents=True, exist_ok=True)
     run_id = args.job_id.replace("/", "_") if args.job_id else "sem_job_id"
@@ -275,7 +306,8 @@ def main():
         print(f"[resume] carregando checkpoint existente: {resume_ckpt_path}", flush=True)
         ckpt = torch.load(resume_ckpt_path, map_location=device)
         old_args = ckpt.get("args", {})
-        for key in ("shell_b", "n_level", "patch_size", "base_ch", "max_disp", "use_quality_cond"):
+        for key in ("shell_b", "n_level", "patch_size", "base_ch", "max_disp", "use_quality_cond",
+                    "num_layers"):
             old_val, new_val = old_args.get(key), vars(args).get(key)
             if old_val is not None and old_val != new_val:
                 print(f"[resume][aviso] --{key.replace('_','-')} mudou entre o checkpoint "

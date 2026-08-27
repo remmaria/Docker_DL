@@ -1,9 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=dmri_rcae_recon
 #SBATCH --cluster=gpu
-#SBATCH --partition=preempt
+#SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=h200
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -56,6 +55,16 @@
 #   RECON_TAG=job3498743 CKPT_JOB_ID=3498743_0 sbatch slurm/04_reconstruct_rcae.sh <work_dir> 1000 10
 #   RECON_TAG=job3498743 sbatch slurm/05_evaluate_and_downstream.sh <work_dir> 1000 10
 # Sem RECON_TAG, comportamento identico a antes (rcae_recon fixo).
+#
+# ANGULAR_LOSS=1 (variavel de ambiente) -- so tem efeito no checkpoint
+# CANONICO (quando nem CKPT_PATH nem CKPT_JOB_ID sao passados): aponta pra
+# "$WORK_DIR/rcae_checkpoints/shell<B>_n<N>_sh/best.pt" em vez de
+# ".../shell<B>_n<N>/best.pt" -- ver scripts/04_train_rcae.py, que agora
+# grava a variante com --angular-loss-weight>0 num diretorio SEPARADO
+# (sufixo _sh) exatamente pra evitar a colisao de checkpoint entre as duas
+# variantes que ja aconteceu uma vez em producao (as duas escrevendo no
+# MESMO out_dir/best.pt quando treinadas para o mesmo shell_b/n_level).
+#   ANGULAR_LOSS=1 sbatch slurm/04_reconstruct_rcae.sh <work_dir> <shell_b> <n_level>
 
 set -euo pipefail
 mkdir -p logs
@@ -80,6 +89,10 @@ echo "Reconstruindo (RCAE) para shell_b=$SHELL_B, n_level=$N_LEVEL"
 source "./00_env_common.sh"
 
 CKPT_DIR="$WORK_DIR/rcae_checkpoints/shell${SHELL_B%.*}_n${N_LEVEL}"
+if [[ "${ANGULAR_LOSS:-0}" == "1" ]]; then
+    CKPT_DIR="${CKPT_DIR}_sh"
+    echo "ANGULAR_LOSS=1 -- lendo checkpoint da variante com loss angular/SH: $CKPT_DIR"
+fi
 if [[ -n "${CKPT_PATH:-}" ]]; then
     CKPT="$CKPT_PATH"
     echo "Usando checkpoint explicito (CKPT_PATH): $CKPT"

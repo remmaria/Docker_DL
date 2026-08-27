@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=rrin_recon
 #SBATCH --cluster=gpu
-#SBATCH --partition=l40s
+#SBATCH --partition=a100
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1

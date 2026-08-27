@@ -243,6 +243,176 @@ class RRIN3D(nn.Module):
         return blend + residual
 
 
+class FlowNet3DLayered(nn.Module):
+    """Generalizacao em K camadas da FlowNet3D (ver protocolo secao 13,
+    "Toward a layered-flow extension for crossing fibers"): em vez de um
+    unico par de campos de fluxo + 1 mapa de visibilidade, prediz K camadas
+    INDEPENDENTES, cada uma com seu proprio par de fluxo (flow_a, flow_b) e
+    seu proprio mapa de visibilidade, mais um logit de selecao de camada por
+    voxel (combinado por softmax entre as K camadas em RRIN3DLayered).
+
+    Motivacao: um unico mapa de visibilidade so decide "confia mais em a ou
+    em b" -- bom pra oclusao simples (o caso "VFI de video" padrao), mas nao
+    consegue representar um voxel que e uma MISTURA de duas populacoes de
+    fibra diferentes (crossing), onde nenhum warp unico explica o voxel
+    inteiro. Cada camada pode em tese se especializar numa populacao
+    diferente; qual camada "vence" em cada voxel e decidido pelo softmax de
+    selecao, aprendido end-to-end so com a loss de reconstrucao (ver
+    RRIN3DLayered.forward e a discussao no protocolo sobre nao usar nenhuma
+    supervisao externa tipo CSD/peak-count de inicio -- so acrescentar isso
+    se for observado colapso de modo).
+
+    NAO usar para K=1 -- para K=1 use FlowNet3D (arquitetura original com
+    exatamente os mesmos parametros/comportamento), que mantem
+    compatibilidade com os checkpoints ja treinados (rrin, rrin_qc, etc.)."""
+
+    def __init__(self, num_layers: int, base_ch: int = 16, max_disp: float = 0.5,
+                 use_quality_cond: bool = False):
+        super().__init__()
+        if num_layers < 2:
+            raise ValueError("FlowNet3DLayered e para num_layers>=2 -- use FlowNet3D para K=1")
+        self.num_layers = num_layers
+        self.max_disp = max_disp
+        self.use_quality_cond = use_quality_cond
+        in_ch = 1 + 1 + 3 + 3 + 3 + 1  # vol_a, vol_b, bvec_a, bvec_b, bvec_t, t
+        if use_quality_cond:
+            in_ch += 2
+        self.enc1 = _conv3d(in_ch, base_ch)
+        self.enc2 = _conv3d(base_ch, base_ch * 2, stride=2)
+        self.enc3 = _conv3d(base_ch * 2, base_ch * 4, stride=2)
+        self.dec2 = _conv3d(base_ch * 4, base_ch * 2)
+        self.dec1 = _conv3d(base_ch * 2 + base_ch * 2, base_ch)
+        self.head = _conv3d(base_ch + base_ch, base_ch)
+        # por camada: 3 (flow_a) + 3 (flow_b) + 1 (vis_logit) + 1 (layer_logit)
+        self.out = nn.Conv3d(base_ch, 8 * num_layers, kernel_size=3, padding=1)
+
+    def forward(self, vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, quality=None):
+        spatial = vol_a.shape[-3:]
+        bvec_a_map = _repeat_vec_3d(bvec_a, spatial)
+        bvec_b_map = _repeat_vec_3d(bvec_b, spatial)
+        bvec_t_map = _repeat_vec_3d(bvec_t, spatial)
+        t_map = _repeat_vec_3d(t.view(-1, 1), spatial)
+        parts = [vol_a, vol_b, bvec_a_map, bvec_b_map, bvec_t_map, t_map]
+        if self.use_quality_cond:
+            if quality is None:
+                raise ValueError("use_quality_cond=True mas `quality` nao foi passado ao forward")
+            parts.append(_repeat_vec_3d(quality, spatial))
+        x = torch.cat(parts, dim=1)
+
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+
+        d2 = self.dec2(e3)
+        d2 = F.interpolate(d2, size=e2.shape[-3:], mode="trilinear", align_corners=True)
+        d2 = torch.cat([d2, e2], dim=1)
+
+        d1 = self.dec1(d2)
+        d1 = F.interpolate(d1, size=e1.shape[-3:], mode="trilinear", align_corners=True)
+        d1 = torch.cat([d1, e1], dim=1)
+
+        feat = self.head(d1)
+        raw = self.out(feat)  # (B, 8*K, D, H, W)
+        b = raw.shape[0]
+        spatial_shape = raw.shape[2:]
+        K = self.num_layers
+        raw = raw.view(b, K, 8, *spatial_shape)
+        flow_a = torch.tanh(raw[:, :, 0:3]) * self.max_disp   # (B, K, 3, D, H, W)
+        flow_b = torch.tanh(raw[:, :, 3:6]) * self.max_disp   # (B, K, 3, D, H, W)
+        vis_logit = raw[:, :, 6]                              # (B, K, D, H, W)
+        layer_logit = raw[:, :, 7]                            # (B, K, D, H, W)
+        return flow_a, flow_b, vis_logit, layer_logit
+
+
+class RRIN3DLayered(nn.Module):
+    """Generalizacao em K camadas de RRIN3D -- ver FlowNet3DLayered acima e
+    protocolo secao 13 ("Toward a layered-flow extension for crossing
+    fibers"). Com K camadas, cada camada faz warp+blend exatamente como a
+    RRIN3D original (fluxo bidirecional + visibilidade); as K camadas sao
+    entao combinadas por um softmax POR VOXEL sobre um logit de selecao de
+    camada.
+
+    IMPORTANTE (pra nao confundir "K" com algo que varia por voxel): K e um
+    hiperparametro FIXO e GLOBAL da arquitetura, escolhido antes do treino e
+    igual pra todo voxel/sujeito/n_level -- a rede sempre calcula as K
+    camadas em todo lugar. O que varia por voxel e o USO dessas camadas: os
+    pesos do softmax (`pi`, ver forward) sao computados independentemente
+    em cada posicao espacial, entao um voxel de fibra unica pode aprender a
+    colapsar quase todo peso numa camada so (comportamento efetivo K=1
+    localmente), e um voxel de crossing pode aprender a dividir o peso entre
+    duas -- tudo aprendido end-to-end so com a loss de reconstrucao,
+    SEM nenhuma supervisao externa dizendo quantas fibras tem ali. A
+    recomendacao no protocolo e comecar assim (K=2/K=3 "crus") e so
+    considerar uma supervisao auxiliar tipo CSD/peak-count (calculada da
+    aquisicao COMPLETA, nunca do n_level subamostrado -- ver protocolo) se
+    for observado colapso de modo (as K camadas convergindo pra prever a
+    mesma coisa, sem se especializar espacialmente).
+
+    Para K=1, use RRIN3D (nao esta classe) -- mantem compatibilidade exata
+    (mesmos parametros, mesmo comportamento) com os checkpoints ja
+    treinados (rrin, rrin_qc, rrin_qc_inclinv etc.). Use `build_rrin_model`
+    abaixo para nao ter que decidir isso manualmente em cada script.
+    """
+
+    def __init__(self, num_layers: int, base_ch: int = 16, max_disp: float = 0.5,
+                 use_quality_cond: bool = False):
+        super().__init__()
+        if num_layers < 2:
+            raise ValueError("RRIN3DLayered e para num_layers>=2 -- use RRIN3D para K=1")
+        self.num_layers = num_layers
+        self.use_quality_cond = use_quality_cond
+        self.flow_net = FlowNet3DLayered(num_layers=num_layers, base_ch=base_ch,
+                                          max_disp=max_disp, use_quality_cond=use_quality_cond)
+        self.refine_net = RefineNet3D(base_ch=base_ch)
+
+    def forward(self, vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, quality=None,
+                return_layers=False):
+        flow_a, flow_b, vis_logit, layer_logit = self.flow_net(
+            vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, quality=quality)
+        K = self.num_layers
+        t_map = t.view(-1, 1, 1, 1, 1)  # (B,1,1,1,1) -- broadcast com (B,1,D,H,W)
+
+        pi = torch.softmax(layer_logit, dim=1)  # (B, K, D, H, W), soma 1 por voxel
+
+        blend = torch.zeros_like(vol_a)
+        for k in range(K):
+            warped_a_k = warp3d(vol_a, flow_a[:, k])      # (B,1,D,H,W)
+            warped_b_k = warp3d(vol_b, flow_b[:, k])
+            vis_k = torch.sigmoid(vis_logit[:, k:k + 1])  # (B,1,D,H,W)
+            # mesmo espirito da RRIN3D original: combina (1-t)/t com a
+            # visibilidade DESSA camada -- cada camada tem sua propria
+            # nocao de "quanto confiar em a vs b".
+            w_a = (1.0 - t_map) * vis_k
+            w_b = t_map * (1.0 - vis_k)
+            denom = (w_a + w_b).clamp(min=1e-6)
+            layer_blend_k = (w_a * warped_a_k + w_b * warped_b_k) / denom
+            pi_k = pi[:, k:k + 1]  # (B,1,D,H,W) -- peso desta camada, por voxel
+            blend = blend + pi_k * layer_blend_k
+
+        residual = self.refine_net(blend, vol_a, vol_b)
+        out = blend + residual
+        if return_layers:
+            # util pra inspecionar os mapas de pi/flow por camada (ver
+            # protocolo -- checar se aparece estrutura espacial parecida
+            # com regioes de crossing conhecidas, tipo centrum semiovale).
+            return out, {"pi": pi, "flow_a": flow_a, "flow_b": flow_b, "vis_logit": vis_logit}
+        return out
+
+
+def build_rrin_model(num_layers: int = 1, base_ch: int = 16, max_disp: float = 0.5,
+                      use_quality_cond: bool = False):
+    """Escolhe RRIN3D (K=1, arquitetura original) ou RRIN3DLayered (K>=2,
+    ver docstring de RRIN3DLayered) de acordo com `num_layers`. Usar esta
+    funcao em scripts/04b_train_rrin.py e scripts/05b_reconstruct_rrin.py
+    em vez de instanciar as classes diretamente, para as duas ficarem
+    sempre sincronizadas (o checkpoint grava `num_layers` em `args`, e a
+    reconstrucao le de la -- ver scripts/05b_reconstruct_rrin.py)."""
+    if num_layers <= 1:
+        return RRIN3D(base_ch=base_ch, max_disp=max_disp, use_quality_cond=use_quality_cond)
+    return RRIN3DLayered(num_layers=num_layers, base_ch=base_ch, max_disp=max_disp,
+                          use_quality_cond=use_quality_cond)
+
+
 def _smoke_test():
     """Forward pass com tensores pequenos aleatorios, so pra checar shapes
     -- mesmo padrao de model/rcae.py. Testa as duas variantes
@@ -279,6 +449,32 @@ def _smoke_test():
         raise AssertionError("deveria ter levantado ValueError sem `quality`")
     except ValueError:
         print("OK: chamar sem `quality` com use_quality_cond=True levanta ValueError, como esperado")
+
+    # --- variantes em camadas (K>=2, ver protocolo secao 13) ---
+    for K in (2, 3):
+        for use_qc in (False, True):
+            model_k = build_rrin_model(num_layers=K, base_ch=8, use_quality_cond=use_qc)
+            assert isinstance(model_k, RRIN3DLayered)
+            quality_k = torch.rand(b, 2) if use_qc else None
+            out_k, layers = model_k(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t,
+                                     quality=quality_k, return_layers=True)
+            assert out_k.shape == expected, \
+                f"shape mismatch (K={K}, use_qc={use_qc}): {out_k.shape} != {expected}"
+            assert layers["pi"].shape == (b, K, d, h, w)
+            # softmax por voxel deve somar 1 ao longo das K camadas
+            pi_sum = layers["pi"].sum(dim=1)
+            assert torch.allclose(pi_sum, torch.ones_like(pi_sum), atol=1e-5), \
+                "pesos de camada (pi) nao somam 1 por voxel"
+            n_params_k = sum(p.numel() for p in model_k.parameters())
+            print(f"smoke test OK (RRIN3DLayered, K={K}, use_quality_cond={use_qc}), "
+                  f"output shape: {tuple(out_k.shape)}, {n_params_k} parametros")
+
+    # build_rrin_model(num_layers=1) deve devolver a arquitetura ORIGINAL
+    # (RRIN3D), nao RRIN3DLayered -- garante compatibilidade de checkpoint.
+    model_default = build_rrin_model(num_layers=1, base_ch=8)
+    assert isinstance(model_default, RRIN3D) and not isinstance(model_default, RRIN3DLayered)
+    print("OK: build_rrin_model(num_layers=1) devolve RRIN3D (nao RRIN3DLayered), "
+          "compatibilidade de checkpoint preservada")
 
 
 if __name__ == "__main__":

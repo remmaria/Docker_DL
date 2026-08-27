@@ -38,7 +38,7 @@ from utils.manifest import load_manifest
 from utils.gradients import load_bval_bvec, load_dwi, split_shells
 from utils.masking import load_or_build_mask
 from utils.dataset import _resolve_shell_key
-from model.rrin3d import RRIN3D
+from model.rrin3d import build_rrin_model
 
 
 def sliding_window_origins(shape, patch_size, stride):
@@ -76,12 +76,15 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device)
     ckpt_args = ckpt["args"]
     use_quality_cond = ckpt_args.get("use_quality_cond", False)
-    model = RRIN3D(base_ch=ckpt_args.get("base_ch", 16),
-                   max_disp=ckpt_args.get("max_disp", 0.5),
-                   use_quality_cond=use_quality_cond).to(device)
+    num_layers = ckpt_args.get("num_layers", 1)  # checkpoints antigos (sem a chave) sao K=1
+    model = build_rrin_model(num_layers=num_layers,
+                              base_ch=ckpt_args.get("base_ch", 16),
+                              max_disp=ckpt_args.get("max_disp", 0.5),
+                              use_quality_cond=use_quality_cond).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
-    print(f"Checkpoint carregado (epoca {ckpt.get('epoch')}, val_loss {ckpt.get('val_loss')})")
+    print(f"Checkpoint carregado (epoca {ckpt.get('epoch')}, val_loss {ckpt.get('val_loss')}, "
+          f"num_layers={num_layers}, modelo={type(model).__name__})")
 
     entries = [e for e in load_manifest(args.manifest) if e.split == args.split]
 
