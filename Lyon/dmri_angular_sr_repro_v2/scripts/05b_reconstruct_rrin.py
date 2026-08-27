@@ -77,14 +77,16 @@ def main():
     ckpt_args = ckpt["args"]
     use_quality_cond = ckpt_args.get("use_quality_cond", False)
     num_layers = ckpt_args.get("num_layers", 1)  # checkpoints antigos (sem a chave) sao K=1
+    norm_type = ckpt_args.get("norm_type", "instance")  # idem -- checkpoints antigos sao "instance"
     model = build_rrin_model(num_layers=num_layers,
                               base_ch=ckpt_args.get("base_ch", 16),
                               max_disp=ckpt_args.get("max_disp", 0.5),
-                              use_quality_cond=use_quality_cond).to(device)
+                              use_quality_cond=use_quality_cond,
+                              norm_type=norm_type).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     print(f"Checkpoint carregado (epoca {ckpt.get('epoch')}, val_loss {ckpt.get('val_loss')}, "
-          f"num_layers={num_layers}, modelo={type(model).__name__})")
+          f"num_layers={num_layers}, norm_type={norm_type}, modelo={type(model).__name__})")
 
     entries = [e for e in load_manifest(args.manifest) if e.split == args.split]
 

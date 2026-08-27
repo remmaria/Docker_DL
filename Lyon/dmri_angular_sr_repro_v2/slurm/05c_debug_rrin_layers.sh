@@ -52,6 +52,18 @@
 # script python sobre nao circularizar a evidencia).
 # DEBUG_OUT_DIR=<caminho> -- onde salvar (default: $WORK_DIR/rrin_layer_debug).
 #
+# NORM_TYPE=batch (default instance) -- so ajuda a achar o CKPT_DIR certo
+# (sufixo _bn) quando o checkpoint foi treinado com --norm-type batch (ver
+# NORM_TYPE em slurm/04b_train_rrin.sh) -- a variante que resolve o
+# artefato de costura de patch de vez (BatchNorm3d usa estatisticas fixas
+# em eval(), independentes do patch), em vez de so atenuar via STRIDE menor.
+#
+# ANGULAR_LOSS=1 (default 0) -- so ajuda a achar o CKPT_DIR certo (sufixo
+# _sh, ver ANGULAR_LOSS_WEIGHT em slurm/04b_train_rrin.sh e
+# utils/sh_angular_loss.py) quando o checkpoint foi treinado com
+# --angular-loss-weight > 0 -- a loss angular so afeta o treino, nao muda
+# a arquitetura nem os mapas pi^(k) inspecionados aqui.
+#
 # STRIDE=<N> / PATCH_SIZE=<N> (default 8 / 10, mesma convencao de
 # slurm/05b_reconstruct_rrin.sh) -- se voce esta testando a hipotese de que
 # o padrao listrado nos mapas pi^(k) e um artefato de costura de patch
@@ -87,6 +99,15 @@ if [[ "${ONLY_VALID:-1}" == "0" ]]; then
     echo "ONLY_VALID=0 -- lendo checkpoint treinado tambem com trincas invalidas"
 fi
 CKPT_DIR="${CKPT_DIR}_k${NUM_LAYERS}"
+if [[ "${NORM_TYPE:-instance}" == "batch" ]]; then
+    CKPT_DIR="${CKPT_DIR}_bn"
+    echo "NORM_TYPE=batch -- lendo checkpoint da variante com BatchNorm3d (resolve de vez o "
+    echo "artefato de costura entre patches, ver model/rrin3d.py:_norm3d e protocolo)"
+fi
+if [[ "${ANGULAR_LOSS:-0}" == "1" ]]; then
+    CKPT_DIR="${CKPT_DIR}_sh"
+    echo "ANGULAR_LOSS=1 -- lendo checkpoint da variante treinada com a loss angular/SH"
+fi
 echo "Diretorio de checkpoint: $CKPT_DIR"
 
 if [[ -n "${CKPT_PATH:-}" ]]; then

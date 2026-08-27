@@ -36,7 +36,7 @@ class RRINTripletDataset(Dataset):
                  patch_size: int = 10, training: bool = False, only_valid: bool = True,
                  mask_suffix: str = "_mask3d.nii.gz", shell_tol: float = 100.0,
                  seed: int = 0, max_cached_subjects: int = 2,
-                 min_tile_coverage: float = 0.0):
+                 min_tile_coverage: float = 0.0, sh_q_out: int = 0):
         """
         only_valid: quando True (default), so usa trincas com `valid=True`
             (residuo de colinearidade dentro do teto usado em
@@ -45,6 +45,23 @@ class RRINTripletDataset(Dataset):
             "chutar" nesses casos, sem sinal real de fluxo pra aprender.
             Sujeitos sem NENHUMA trinca valida para este (shell,n_level)
             sao descartados do dataset inteiro (ver __init__).
+
+        sh_q_out: (default 0 = desligado, comportamento identico a antes)
+            quando > 0, cada item TAMBEM devolve um "feixe" de ate
+            `sh_q_out` trincas adicionais do MESMO sujeito, na MESMA
+            posicao espacial (ox,oy,oz) do item principal -- usado por
+            scripts/04b_train_rrin.py para montar o termo de loss
+            angular/SH (ver utils/sh_angular_loss.py e protocolo secao
+            14.5/15), que precisa de VARIAS direcoes-alvo simultaneas por
+            "exemplo" pra ajustar uma base SH (analogo ao q_out do RCAE,
+            mas aqui cada trinca do feixe ainda passa pelo RRIN uma de
+            cada vez -- o feixe so agrupa as previsoes DEPOIS, no script de
+            treino, pra rodar a mesma compute_sh_angular_loss do RCAE sem
+            modifica-la). Se o sujeito tiver menos de `sh_q_out` trincas
+            validas disponiveis, o feixe e preenchido ate onde der e o
+            restante marcado invalido em "sh_mask" (compute_sh_angular_loss
+            ja sabe ignorar posicoes invalidas, mesmo mecanismo do padding
+            de collate_variable_targets no RCAE).
         """
         self.entries = entries
         self.triplets_dir = Path(triplets_dir)
@@ -57,6 +74,7 @@ class RRINTripletDataset(Dataset):
         self.shell_tol = shell_tol
         self.min_tile_coverage = min_tile_coverage
         self.max_cached_subjects = max_cached_subjects
+        self.sh_q_out = sh_q_out
         self._cache: "OrderedDict[str, dict]" = OrderedDict()
         self.seed = seed
         self._rng = np.random.default_rng(seed)
@@ -177,6 +195,36 @@ class RRINTripletDataset(Dataset):
             sub = np.pad(sub, pad_width, mode="constant")
         return sub
 
+    def _triplet_tensors(self, d, k, ox, oy, oz, mask_patch, xmax):
+        """Extrai (vol_a, vol_b, target, bvec_a, bvec_b, bvec_t, t_frac,
+        quality) para UMA trinca `k` do sujeito `d`, na posicao espacial
+        (ox,oy,oz) -- fatorado de __getitem__ para ser reusado tanto pelo
+        item principal quanto pelo feixe `sh_q_out` (mesma logica, so muda
+        qual `k`/posicao e passado)."""
+        a_idx, b_idx, t_idx = int(d["pair_a"][k]), int(d["pair_b"][k]), int(d["target_idx"][k])
+        t_frac = float(d["t_frac"][k])
+        # normalizados por 90 (maximo possivel com simetria antipodal, ver
+        # utils/gradients.py) -- usados so quando RRIN3D(use_quality_cond=True)
+        # (ver model/rrin3d.py); sempre calculados aqui (custo desprezivel),
+        # quem nao usar so ignora o campo "quality" do item.
+        quality = np.array([d["residual_deg"][k] / 90.0, d["gap_deg"][k] / 90.0],
+                            dtype=np.float32)
+
+        vol_a = (self._extract(d["dwi"][..., [a_idx]], ox, oy, oz) / xmax) * mask_patch
+        vol_b = (self._extract(d["dwi"][..., [b_idx]], ox, oy, oz) / xmax) * mask_patch
+        target = (self._extract(d["dwi"][..., [t_idx]], ox, oy, oz) / xmax) * mask_patch
+
+        # (ps,ps,ps,1) -> (1,ps,ps,ps)
+        vol_a = np.moveaxis(vol_a, -1, 0).astype(np.float32)
+        vol_b = np.moveaxis(vol_b, -1, 0).astype(np.float32)
+        target = np.moveaxis(target, -1, 0).astype(np.float32)
+
+        return {
+            "vol_a": vol_a, "vol_b": vol_b, "target": target,
+            "bvec_a": d["bvecs"][a_idx], "bvec_b": d["bvecs"][b_idx],
+            "bvec_t": d["bvecs"][t_idx], "t_frac": t_frac, "quality": quality,
+        }
+
     def __getitem__(self, idx):
         si, (ox, oy, oz) = self.tile_index[idx]
         entry, tag = self.usable[si]
@@ -194,34 +242,69 @@ class RRINTripletDataset(Dataset):
             # disponiveis em vez de sempre pegar a primeira.
             k = idx % n_triplets
 
-        a_idx, b_idx, t_idx = int(d["pair_a"][k]), int(d["pair_b"][k]), int(d["target_idx"][k])
-        t_frac = float(d["t_frac"][k])
-        # normalizados por 90 (maximo possivel com simetria antipodal, ver
-        # utils/gradients.py) -- usados so quando RRIN3D(use_quality_cond=True)
-        # (ver model/rrin3d.py); sempre calculados aqui (custo desprezivel),
-        # quem nao usar so ignora o campo "quality" do item.
-        quality = np.array([d["residual_deg"][k] / 90.0, d["gap_deg"][k] / 90.0],
-                            dtype=np.float32)
-
         mask_patch = self._extract(d["mask"].astype(np.float32), ox, oy, oz)[..., None]
         xmax = d["xmax"]
-        vol_a = (self._extract(d["dwi"][..., [a_idx]], ox, oy, oz) / xmax) * mask_patch
-        vol_b = (self._extract(d["dwi"][..., [b_idx]], ox, oy, oz) / xmax) * mask_patch
-        target = (self._extract(d["dwi"][..., [t_idx]], ox, oy, oz) / xmax) * mask_patch
+        main = self._triplet_tensors(d, k, ox, oy, oz, mask_patch, xmax)
 
-        # (ps,ps,ps,1) -> (1,ps,ps,ps)
-        vol_a = np.moveaxis(vol_a, -1, 0).astype(np.float32)
-        vol_b = np.moveaxis(vol_b, -1, 0).astype(np.float32)
-        target = np.moveaxis(target, -1, 0).astype(np.float32)
-
-        return {
-            "vol_a": torch.from_numpy(vol_a),
-            "vol_b": torch.from_numpy(vol_b),
-            "target": torch.from_numpy(target),
-            "bvec_a": torch.from_numpy(d["bvecs"][a_idx]),
-            "bvec_b": torch.from_numpy(d["bvecs"][b_idx]),
-            "bvec_t": torch.from_numpy(d["bvecs"][t_idx]),
-            "t_frac": torch.tensor(t_frac, dtype=torch.float32),
-            "quality": torch.from_numpy(quality),
+        item = {
+            "vol_a": torch.from_numpy(main["vol_a"]),
+            "vol_b": torch.from_numpy(main["vol_b"]),
+            "target": torch.from_numpy(main["target"]),
+            "bvec_a": torch.from_numpy(main["bvec_a"]),
+            "bvec_b": torch.from_numpy(main["bvec_b"]),
+            "bvec_t": torch.from_numpy(main["bvec_t"]),
+            "t_frac": torch.tensor(main["t_frac"], dtype=torch.float32),
+            "quality": torch.from_numpy(main["quality"]),
             "subject_tag": tag,
         }
+
+        if self.sh_q_out > 0:
+            K = self.sh_q_out
+            n_valid_sh = min(K, n_triplets)
+            if self.training:
+                sh_idxs = self._rng.choice(n_triplets, size=n_valid_sh, replace=False)
+            else:
+                # deterministico e reprodutivel entre epocas (val_loss
+                # comparavel), mas espalha o ponto de partida por item para
+                # nao amostrar sempre as mesmas n_valid_sh primeiras trincas
+                # em todo tile do mesmo sujeito.
+                start = idx % n_triplets
+                sh_idxs = np.unique((np.arange(n_valid_sh) + start) % n_triplets)
+                if sh_idxs.size < n_valid_sh:  # colisao rara do modulo -- completa com arange
+                    sh_idxs = np.arange(n_valid_sh)
+
+            ps = self.patch_size
+            vol_a_sh = np.zeros((K, 1, ps, ps, ps), dtype=np.float32)
+            vol_b_sh = np.zeros((K, 1, ps, ps, ps), dtype=np.float32)
+            target_sh = np.zeros((K, 1, ps, ps, ps), dtype=np.float32)
+            bvec_a_sh = np.zeros((K, 3), dtype=np.float32)
+            bvec_b_sh = np.zeros((K, 3), dtype=np.float32)
+            bvec_t_sh = np.zeros((K, 3), dtype=np.float32)
+            t_frac_sh = np.zeros((K,), dtype=np.float32)
+            quality_sh = np.zeros((K, 2), dtype=np.float32)
+            sh_mask = np.zeros((K,), dtype=bool)
+            for slot, k2 in enumerate(sh_idxs):
+                t = self._triplet_tensors(d, int(k2), ox, oy, oz, mask_patch, xmax)
+                vol_a_sh[slot] = t["vol_a"]
+                vol_b_sh[slot] = t["vol_b"]
+                target_sh[slot] = t["target"]
+                bvec_a_sh[slot] = t["bvec_a"]
+                bvec_b_sh[slot] = t["bvec_b"]
+                bvec_t_sh[slot] = t["bvec_t"]
+                t_frac_sh[slot] = t["t_frac"]
+                quality_sh[slot] = t["quality"]
+                sh_mask[slot] = True
+
+            item.update({
+                "vol_a_sh": torch.from_numpy(vol_a_sh),
+                "vol_b_sh": torch.from_numpy(vol_b_sh),
+                "target_sh": torch.from_numpy(target_sh),
+                "bvec_a_sh": torch.from_numpy(bvec_a_sh),
+                "bvec_b_sh": torch.from_numpy(bvec_b_sh),
+                "bvec_t_sh": torch.from_numpy(bvec_t_sh),
+                "t_frac_sh": torch.from_numpy(t_frac_sh),
+                "quality_sh": torch.from_numpy(quality_sh),
+                "sh_mask": torch.from_numpy(sh_mask),
+            })
+
+        return item

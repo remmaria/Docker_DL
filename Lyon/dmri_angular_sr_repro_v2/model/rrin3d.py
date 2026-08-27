@@ -60,10 +60,51 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _conv3d(in_ch: int, out_ch: int, stride: int = 1) -> nn.Sequential:
+def _norm3d(norm_type: str, out_ch: int) -> nn.Module:
+    """Camada de normalizacao usada em `_conv3d`, escolhida por `norm_type`.
+    Ver protocolo ("artefato de costura de patch") para o motivo de existir
+    a opcao "batch" alem do "instance" original.
+
+    "instance" (default, comportamento ORIGINAL/compativel com todos os
+    checkpoints ja treinados): `InstanceNorm3d` calcula media/variancia por
+    amostra, sobre a extensao espacial (D,H,W) do que estiver dentro do
+    patch atual. Como a reconstrucao usa sliding-window com overlap parcial
+    (ver scripts/05b_reconstruct_rrin.py, --patch-size/--stride), o MESMO
+    voxel cai em patches vizinhos com conteudo ao redor ligeiramente
+    diferente -> estatisticas diferentes -> normalizacoes diferentes ->
+    "costura" visivel entre patches na reconstrucao (confirmado
+    empiricamente: o artefato listrado atenua bastante com stride menor,
+    mais overlap). Aumentar o overlap (stride menor) e um paliativo (dilui
+    a diferenca via media ponderada do overlap-add), nao remove a causa.
+
+    "batch": `BatchNorm3d` resolve a causa raiz, nao so o sintoma -- em
+    modo de avaliacao (model.eval()), BatchNorm usa `running_mean`/
+    `running_var` FIXOS (acumulados ao longo de TODO o treino), nao
+    estatisticas calculadas a partir do patch/batch atual. Ou seja, na
+    reconstrucao a normalizacao vira uma transformacao afim fixa por canal,
+    igual nao importa em qual patch/janela o voxel caiu -- elimina a
+    costura por construcao. Custo: precisa ser treinado do ZERO (as
+    estatisticas/parametros aprendidos nao sao intercambiaveis com um
+    checkpoint "instance" existente) e depende de lotes de treino
+    razoavelmente estaveis (--batch-size, ver scripts/04b_train_rrin.py --
+    o default 8, combinado com a extensao espacial de cada patch, da uma
+    amostra estatistica efetiva grande o suficiente na pratica).
+
+    NAO confundir com GroupNorm: GroupNorm tambem calcula estatisticas
+    sobre a extensao espacial da amostra ATUAL (so muda o agrupamento de
+    canais), entao sofre do MESMO problema de costura que InstanceNorm --
+    por isso nao foi oferecido aqui como alternativa."""
+    if norm_type == "instance":
+        return nn.InstanceNorm3d(out_ch, affine=True)
+    if norm_type == "batch":
+        return nn.BatchNorm3d(out_ch, affine=True)
+    raise ValueError(f"norm_type desconhecido: {norm_type!r} (use 'instance' ou 'batch')")
+
+
+def _conv3d(in_ch: int, out_ch: int, stride: int = 1, norm_type: str = "instance") -> nn.Sequential:
     return nn.Sequential(
         nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1),
-        nn.InstanceNorm3d(out_ch, affine=True),
+        _norm3d(norm_type, out_ch),
         nn.LeakyReLU(0.1, inplace=True),
     )
 
@@ -105,19 +146,21 @@ class FlowNet3D(nn.Module):
     (flow_a, flow_b, 3 canais cada) e um mapa de visibilidade V (1 canal,
     logit antes da sigmoid)."""
 
-    def __init__(self, base_ch: int = 16, max_disp: float = 0.5, use_quality_cond: bool = False):
+    def __init__(self, base_ch: int = 16, max_disp: float = 0.5, use_quality_cond: bool = False,
+                 norm_type: str = "instance"):
         super().__init__()
         self.max_disp = max_disp
         self.use_quality_cond = use_quality_cond
+        self.norm_type = norm_type
         in_ch = 1 + 1 + 3 + 3 + 3 + 1  # vol_a, vol_b, bvec_a, bvec_b, bvec_t, t
         if use_quality_cond:
             in_ch += 2  # residual_norm, gap_norm (ver docstring da classe e RRIN3D)
-        self.enc1 = _conv3d(in_ch, base_ch)
-        self.enc2 = _conv3d(base_ch, base_ch * 2, stride=2)
-        self.enc3 = _conv3d(base_ch * 2, base_ch * 4, stride=2)
-        self.dec2 = _conv3d(base_ch * 4, base_ch * 2)
-        self.dec1 = _conv3d(base_ch * 2 + base_ch * 2, base_ch)
-        self.head = _conv3d(base_ch + base_ch, base_ch)
+        self.enc1 = _conv3d(in_ch, base_ch, norm_type=norm_type)
+        self.enc2 = _conv3d(base_ch, base_ch * 2, stride=2, norm_type=norm_type)
+        self.enc3 = _conv3d(base_ch * 2, base_ch * 4, stride=2, norm_type=norm_type)
+        self.dec2 = _conv3d(base_ch * 4, base_ch * 2, norm_type=norm_type)
+        self.dec1 = _conv3d(base_ch * 2 + base_ch * 2, base_ch, norm_type=norm_type)
+        self.head = _conv3d(base_ch + base_ch, base_ch, norm_type=norm_type)
         self.out = nn.Conv3d(base_ch, 7, kernel_size=3, padding=1)  # 3(flow_a)+3(flow_b)+1(vis)
         # inicializacao "morna" (zero-init da ultima camada, pratica padrao em
         # redes de fluxo optico/STN -- ver protocolo, sugestao de melhoria do
@@ -173,12 +216,12 @@ class RefineNet3D(nn.Module):
     volumes de entrada crus (sem warp) e prediz um residuo somado ao
     blend -- mesma ideia do "residue refinement" da RRIN, adaptada em 3D."""
 
-    def __init__(self, base_ch: int = 16):
+    def __init__(self, base_ch: int = 16, norm_type: str = "instance"):
         super().__init__()
         in_ch = 1 + 1 + 1  # blend, vol_a, vol_b
         self.net = nn.Sequential(
-            _conv3d(in_ch, base_ch),
-            _conv3d(base_ch, base_ch),
+            _conv3d(in_ch, base_ch, norm_type=norm_type),
+            _conv3d(base_ch, base_ch, norm_type=norm_type),
             nn.Conv3d(base_ch, 1, kernel_size=3, padding=1),
         )
 
@@ -217,6 +260,14 @@ class RRIN3D(nn.Module):
     (corrigivel) vs. estrutural (nao tem fluxo pra aprender ali, seja qual
     for o contexto dado).
 
+    norm_type (default "instance" -- ver docstring de `_norm3d`): "instance"
+    e o comportamento ORIGINAL (compativel com todos os checkpoints ja
+    treinados). "batch" troca por BatchNorm3d, que resolve de vez o
+    artefato de "costura" entre patches na reconstrucao (ver protocolo,
+    "artefato de patch-tiling/InstanceNorm3d") -- mas exige treinar do
+    ZERO (nao carrega em cima de um checkpoint "instance"), ver
+    scripts/04b_train_rrin.py --norm-type.
+
     Uso:
         model = RRIN3D(use_quality_cond=True)
         pred = model(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, quality=quality)
@@ -230,12 +281,14 @@ class RRIN3D(nn.Module):
     retorna: (B, 1, D, H, W) -- direcao-alvo predita.
     """
 
-    def __init__(self, base_ch: int = 16, max_disp: float = 0.5, use_quality_cond: bool = False):
+    def __init__(self, base_ch: int = 16, max_disp: float = 0.5, use_quality_cond: bool = False,
+                 norm_type: str = "instance"):
         super().__init__()
         self.use_quality_cond = use_quality_cond
+        self.norm_type = norm_type
         self.flow_net = FlowNet3D(base_ch=base_ch, max_disp=max_disp,
-                                   use_quality_cond=use_quality_cond)
-        self.refine_net = RefineNet3D(base_ch=base_ch)
+                                   use_quality_cond=use_quality_cond, norm_type=norm_type)
+        self.refine_net = RefineNet3D(base_ch=base_ch, norm_type=norm_type)
 
     def forward(self, vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, quality=None):
         flow_a, flow_b, vis_logit = self.flow_net(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t,
@@ -282,22 +335,23 @@ class FlowNet3DLayered(nn.Module):
     compatibilidade com os checkpoints ja treinados (rrin, rrin_qc, etc.)."""
 
     def __init__(self, num_layers: int, base_ch: int = 16, max_disp: float = 0.5,
-                 use_quality_cond: bool = False):
+                 use_quality_cond: bool = False, norm_type: str = "instance"):
         super().__init__()
         if num_layers < 2:
             raise ValueError("FlowNet3DLayered e para num_layers>=2 -- use FlowNet3D para K=1")
         self.num_layers = num_layers
         self.max_disp = max_disp
         self.use_quality_cond = use_quality_cond
+        self.norm_type = norm_type
         in_ch = 1 + 1 + 3 + 3 + 3 + 1  # vol_a, vol_b, bvec_a, bvec_b, bvec_t, t
         if use_quality_cond:
             in_ch += 2
-        self.enc1 = _conv3d(in_ch, base_ch)
-        self.enc2 = _conv3d(base_ch, base_ch * 2, stride=2)
-        self.enc3 = _conv3d(base_ch * 2, base_ch * 4, stride=2)
-        self.dec2 = _conv3d(base_ch * 4, base_ch * 2)
-        self.dec1 = _conv3d(base_ch * 2 + base_ch * 2, base_ch)
-        self.head = _conv3d(base_ch + base_ch, base_ch)
+        self.enc1 = _conv3d(in_ch, base_ch, norm_type=norm_type)
+        self.enc2 = _conv3d(base_ch, base_ch * 2, stride=2, norm_type=norm_type)
+        self.enc3 = _conv3d(base_ch * 2, base_ch * 4, stride=2, norm_type=norm_type)
+        self.dec2 = _conv3d(base_ch * 4, base_ch * 2, norm_type=norm_type)
+        self.dec1 = _conv3d(base_ch * 2 + base_ch * 2, base_ch, norm_type=norm_type)
+        self.head = _conv3d(base_ch + base_ch, base_ch, norm_type=norm_type)
         # por camada: 3 (flow_a) + 3 (flow_b) + 1 (vis_logit) + 1 (layer_logit)
         self.out = nn.Conv3d(base_ch, 8 * num_layers, kernel_size=3, padding=1)
         # mesma inicializacao "morna" de FlowNet3D (ver comentario la): saida
@@ -377,15 +431,17 @@ class RRIN3DLayered(nn.Module):
     """
 
     def __init__(self, num_layers: int, base_ch: int = 16, max_disp: float = 0.5,
-                 use_quality_cond: bool = False):
+                 use_quality_cond: bool = False, norm_type: str = "instance"):
         super().__init__()
         if num_layers < 2:
             raise ValueError("RRIN3DLayered e para num_layers>=2 -- use RRIN3D para K=1")
         self.num_layers = num_layers
         self.use_quality_cond = use_quality_cond
+        self.norm_type = norm_type
         self.flow_net = FlowNet3DLayered(num_layers=num_layers, base_ch=base_ch,
-                                          max_disp=max_disp, use_quality_cond=use_quality_cond)
-        self.refine_net = RefineNet3D(base_ch=base_ch)
+                                          max_disp=max_disp, use_quality_cond=use_quality_cond,
+                                          norm_type=norm_type)
+        self.refine_net = RefineNet3D(base_ch=base_ch, norm_type=norm_type)
 
     def forward(self, vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, quality=None,
                 return_layers=False):
@@ -422,17 +478,23 @@ class RRIN3DLayered(nn.Module):
 
 
 def build_rrin_model(num_layers: int = 1, base_ch: int = 16, max_disp: float = 0.5,
-                      use_quality_cond: bool = False):
+                      use_quality_cond: bool = False, norm_type: str = "instance"):
     """Escolhe RRIN3D (K=1, arquitetura original) ou RRIN3DLayered (K>=2,
     ver docstring de RRIN3DLayered) de acordo com `num_layers`. Usar esta
     funcao em scripts/04b_train_rrin.py e scripts/05b_reconstruct_rrin.py
     em vez de instanciar as classes diretamente, para as duas ficarem
-    sempre sincronizadas (o checkpoint grava `num_layers` em `args`, e a
-    reconstrucao le de la -- ver scripts/05b_reconstruct_rrin.py)."""
+    sempre sincronizadas (o checkpoint grava `num_layers`/`norm_type` em
+    `args`, e a reconstrucao le de la -- ver scripts/05b_reconstruct_rrin.py).
+
+    norm_type: "instance" (default, compativel com todos os checkpoints ja
+    treinados) ou "batch" (resolve de vez o artefato de costura entre
+    patches na reconstrucao, ver docstring de `_norm3d` -- exige treinar do
+    zero)."""
     if num_layers <= 1:
-        return RRIN3D(base_ch=base_ch, max_disp=max_disp, use_quality_cond=use_quality_cond)
+        return RRIN3D(base_ch=base_ch, max_disp=max_disp, use_quality_cond=use_quality_cond,
+                       norm_type=norm_type)
     return RRIN3DLayered(num_layers=num_layers, base_ch=base_ch, max_disp=max_disp,
-                          use_quality_cond=use_quality_cond)
+                          use_quality_cond=use_quality_cond, norm_type=norm_type)
 
 
 def _smoke_test():
@@ -495,8 +557,33 @@ def _smoke_test():
     # (RRIN3D), nao RRIN3DLayered -- garante compatibilidade de checkpoint.
     model_default = build_rrin_model(num_layers=1, base_ch=8)
     assert isinstance(model_default, RRIN3D) and not isinstance(model_default, RRIN3DLayered)
+    assert isinstance(model_default.flow_net.enc1[1], nn.InstanceNorm3d)
     print("OK: build_rrin_model(num_layers=1) devolve RRIN3D (nao RRIN3DLayered), "
           "compatibilidade de checkpoint preservada")
+
+    # --- norm_type="batch" (ver protocolo, artefato de patch-tiling) ---
+    for K in (1, 2):
+        model_bn = build_rrin_model(num_layers=K, base_ch=8, norm_type="batch")
+        assert isinstance(model_bn.flow_net.enc1[1], nn.BatchNorm3d)
+        out_bn = model_bn(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t)
+        if K > 1:
+            out_bn = out_bn[0]
+        assert out_bn.shape == expected, f"shape mismatch (norm_type=batch, K={K}): {out_bn.shape}"
+        # BatchNorm3d em eval() usa running stats fixas, independentes do
+        # patch/batch atual -- exatamente a propriedade que remove a
+        # costura entre patches na reconstrucao.
+        model_bn.eval()
+        with torch.no_grad():
+            out_bn_eval = model_bn(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t)
+            if K > 1:
+                out_bn_eval = out_bn_eval[0]
+        assert out_bn_eval.shape == expected
+        print(f"smoke test OK (norm_type=batch, K={K}), output shape: {tuple(out_bn_eval.shape)}")
+    try:
+        _norm3d("groupnorm_nao_existe", 8)
+        raise AssertionError("norm_type invalido deveria levantar ValueError")
+    except ValueError:
+        print("OK: norm_type invalido levanta ValueError, como esperado")
 
 
 if __name__ == "__main__":

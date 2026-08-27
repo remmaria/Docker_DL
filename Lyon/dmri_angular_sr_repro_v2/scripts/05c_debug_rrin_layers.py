@@ -155,15 +155,17 @@ def main():
                   f"original) -- este script de diagnostico so faz sentido para checkpoints "
                   f"RRIN3DLayered (K>=2, treinados com --num-layers/NUM_LAYERS>=2). Nao ha "
                   f"pesos de camada pi^(k) pra inspecionar num modelo K=1.")
+    norm_type = ckpt_args.get("norm_type", "instance")
     model = build_rrin_model(num_layers=num_layers,
                               base_ch=ckpt_args.get("base_ch", 16),
                               max_disp=ckpt_args.get("max_disp", 0.5),
-                              use_quality_cond=use_quality_cond).to(device)
+                              use_quality_cond=use_quality_cond,
+                              norm_type=norm_type).to(device)
     assert isinstance(model, RRIN3DLayered)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     print(f"Checkpoint carregado (epoca {ckpt.get('epoch')}, val_loss {ckpt.get('val_loss')}, "
-          f"num_layers={num_layers})")
+          f"num_layers={num_layers}, norm_type={norm_type})")
 
     entries = load_manifest(args.manifest)
 
