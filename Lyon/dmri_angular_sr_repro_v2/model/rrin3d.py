@@ -119,6 +119,21 @@ class FlowNet3D(nn.Module):
         self.dec1 = _conv3d(base_ch * 2 + base_ch * 2, base_ch)
         self.head = _conv3d(base_ch + base_ch, base_ch)
         self.out = nn.Conv3d(base_ch, 7, kernel_size=3, padding=1)  # 3(flow_a)+3(flow_b)+1(vis)
+        # inicializacao "morna" (zero-init da ultima camada, pratica padrao em
+        # redes de fluxo optico/STN -- ver protocolo, sugestao de melhoria do
+        # RRIN): com peso/bias zerados, a saida bruta comeca em 0 -> flow_a=
+        # flow_b=tanh(0)*max_disp=0 (nenhum deslocamento) e vis=sigmoid(0)=0.5
+        # (neutro entre a e b), em vez de valores aleatorios pequenos vindos
+        # da inicializacao padrao do Conv3d. Isso NAO trava o gradiente (so a
+        # ULTIMA camada e zerada, as anteriores continuam com init normal,
+        # entao ha sinal suficiente pra rede se afastar de zero conforme
+        # precisar) -- so evita que o treino comece propondo deslocamentos
+        # grandes e arbitrarios antes de aprender que "nao fazer nada" ja e
+        # uma predicao razoavel de partida. So afeta treinos NOVOS (do zero,
+        # sem --resume-checkpoint/last.pt existente) -- carregar um
+        # checkpoint via load_state_dict sobrescreve isso normalmente.
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
 
     def forward(self, vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, quality=None):
         spatial = vol_a.shape[-3:]
@@ -285,6 +300,13 @@ class FlowNet3DLayered(nn.Module):
         self.head = _conv3d(base_ch + base_ch, base_ch)
         # por camada: 3 (flow_a) + 3 (flow_b) + 1 (vis_logit) + 1 (layer_logit)
         self.out = nn.Conv3d(base_ch, 8 * num_layers, kernel_size=3, padding=1)
+        # mesma inicializacao "morna" de FlowNet3D (ver comentario la): saida
+        # bruta comeca em 0 -> flow=0, vis=0.5 em toda camada, e o
+        # layer_logit tambem comeca em 0 -> softmax uniforme entre as K
+        # camadas (1/K cada) -- ponto de partida neutro, sem nenhuma camada
+        # favorecida a priori. So afeta treinos NOVOS (sem resume).
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
 
     def forward(self, vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, quality=None):
         spatial = vol_a.shape[-3:]

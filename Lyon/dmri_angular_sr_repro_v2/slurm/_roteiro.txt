@@ -109,11 +109,12 @@ sbatch 02c_diagnose_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_di
 
 #------------03_train_rcae.sh
 
-sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/training 1000 10
+NO_RESUME=1 sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 
-ANGULAR_LOSS_WEIGHT=0.5 \
-    SH_LOSS_HIGH_ORDER_MIN=2 \
-    sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/training 1000 10
+NO_RESUME=1 \
+  ANGULAR_LOSS_WEIGHT=0.5 \
+  SH_LOSS_HIGH_ORDER_MIN=2 \
+  sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 
 
 

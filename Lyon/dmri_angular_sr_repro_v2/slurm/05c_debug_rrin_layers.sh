@@ -1,17 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=rrin_debug
-#SBATCH --cluster=gpu
-#SBATCH --partition=h200
-#SBATCH --gres=gpu:1
-# SBATCH --constraint=h200
+#SBATCH --job-name=rrin_debug_layers
+#SBATCH --cluster=htc
+#SBATCH --partition=preempt
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --time=2-23:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=0-04:00:00
 #SBATCH --account=tibrahim
-#SBATCH --error=logs/rrin_debug.%A_%a.err
-#SBATCH --output=logs/rrin_debug.%A_%a.out
+#SBATCH --error=logs/debug_rrin_layers.%A_%a.err
+#SBATCH --output=logs/debug_rrin_layers.%A_%a.out
 #
 # Diagnostico dos pesos de camada (pi^(k)) de um checkpoint RRIN3DLayered
 # (K>=2, ver model/rrin3d.py, scripts/05c_debug_rrin_layers.py e protocolo
@@ -53,6 +51,14 @@
 # de GFA calculado da aquisicao COMPLETA do sujeito, ver docstring do
 # script python sobre nao circularizar a evidencia).
 # DEBUG_OUT_DIR=<caminho> -- onde salvar (default: $WORK_DIR/rrin_layer_debug).
+#
+# STRIDE=<N> / PATCH_SIZE=<N> (default 8 / 10, mesma convencao de
+# slurm/05b_reconstruct_rrin.sh) -- se voce esta testando a hipotese de que
+# o padrao listrado nos mapas pi^(k) e um artefato de costura de patch
+# (pouca sobreposicao + InstanceNorm3d por patch, ver protocolo), baixar o
+# STRIDE aqui e comparar o mapa de efflayers antes/depois e a forma mais
+# direta de checar isso -- ex.:
+#   STRIDE=4 NUM_LAYERS=2 sbatch slurm/05c_debug_rrin_layers.sh <work_dir> <shell_b> <n_level> <subject>
 
 set -euo pipefail
 mkdir -p logs
@@ -119,6 +125,12 @@ fi
 DEBUG_OUT_DIR="${DEBUG_OUT_DIR:-$WORK_DIR/rrin_layer_debug}"
 echo "Gravando diagnostico em: $DEBUG_OUT_DIR"
 
+STRIDE="${STRIDE:-8}"
+PATCH_SIZE="${PATCH_SIZE:-10}"
+if [[ "$STRIDE" != "8" || "$PATCH_SIZE" != "10" ]]; then
+    echo "STRIDE=$STRIDE PATCH_SIZE=$PATCH_SIZE (default seria patch-size=10 stride=8)"
+fi
+
 python scripts/05c_debug_rrin_layers.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --triplets-dir "$WORK_DIR/subsampling" \
@@ -126,4 +138,5 @@ python scripts/05c_debug_rrin_layers.py \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --subject "$SUBJECT" \
     --out-dir "$DEBUG_OUT_DIR" \
+    --patch-size "$PATCH_SIZE" --stride "$STRIDE" \
     "${TARGETS_FLAG[@]}" "${ALL_TARGETS_FLAG[@]}" "${GFA_FLAG[@]}"

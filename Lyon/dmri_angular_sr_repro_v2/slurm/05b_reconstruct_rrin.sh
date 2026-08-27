@@ -103,5 +103,5 @@ python scripts/05b_reconstruct_rrin.py \
     --checkpoint "$CKPT" \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --out-dir "$RECON_OUT_DIR" \
-    --split test --patch-size 10 --stride 8 \
+    --split test --patch-size 10 --stride 4 \
     "${SUBJECTS_FLAG[@]}" "${LIMIT_FLAG[@]}"
