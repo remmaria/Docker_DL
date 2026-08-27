@@ -1,36 +1,30 @@
 #!/usr/bin/env python3
 """
-Etapa 4b (linha original da tese, retomada como diagnostico quantitativo --
-ver protocolo, secao 10.1): treina a RRIN3D (model/rrin3d.py) para um
-(shell, nivel de subamostragem) especifico, usando as trincas ja
-construidas por scripts/02b_build_rrin_triplets.py.
+Etapa 4c (linha AMT3D, ver model/amt3d.py e protocolo secao 10.3/13): treina
+a AMT3D para um (shell, nivel de subamostragem) especifico, usando as
+MESMAS trincas ja construidas por scripts/02b_build_rrin_triplets.py e o
+MESMO dataset (utils/rrin_dataset.py:RRINTripletDataset, sem nenhuma
+modificacao) que scripts/04b_train_rrin.py ja usa para RRIN3D.
 
-Espelha bastante scripts/04_train_rcae.py (mesmo manifesto/split, mesma
-normalizacao por percentil, mesmo layout de checkpoint out_dir/<shell>_<n>/
-{best,last}.pt, mesmo resume automatico), mas SIMPLIFICADO de proposito
-(sem os PNGs de debug por patch fixo -- ver docstring de model/rrin3d.py
-para o porque desta rede ser mantida enxuta).
-
-**Termo de loss angular/SH (--angular-loss-weight, ver protocolo secao
-9/14.5/15):** portado de scripts/04_train_rcae.py (utils/sh_angular_loss.py,
-modulo compartilhado). Diferenca estrutural importante em relacao ao RCAE:
-cada item do RRIN preve UMA UNICA direcao-alvo por chamada do modelo (nao
-uma sequencia N_in->N_out como o RCAE), entao nao da pra montar a base SH
-com as direcoes de UM item so. A solucao (ver utils/rrin_dataset.py,
-`sh_q_out`): quando --angular-loss-weight > 0, cada item do dataset TAMBEM
-devolve um "feixe" de ate `--sh-loss-q-out` trincas adicionais do MESMO
-sujeito/patch; este script empilha essas trincas (rodando o RRIN uma vez
-por trinca do feixe, em um unico forward batched) e so ENTAO monta o
-tensor (B, sh_q_out, ...) que compute_sh_angular_loss espera -- a mesma
-funcao usada pelo RCAE, sem nenhuma modificacao.
+Este script e um PORT quase 1:1 de scripts/04b_train_rrin.py (mesmo
+manifesto/split, mesma normalizacao por percentil ja embutida no dataset,
+mesmo layout de checkpoint out_dir/<run_tag>/{best,last}.pt, mesmo resume
+automatico, mesmo _sanity_step, mesmo termo de loss angular/SH opcional) --
+a UNICA coisa que muda de verdade e o modelo (model.amt3d.build_amt_model
+em vez de model.rrin3d.build_rrin_model) e os hiperparametros de
+arquitetura especificos do AMT3D (--num-fields, --corr-radius). NAO
+modifica nenhum arquivo do RRIN -- e um metodo totalmente separado, com seu
+proprio namespace de checkpoint (ver --out-dir, tipicamente
+$WORK_DIR/amt_checkpoints, apontado pelo wrapper slurm/04c_train_amt.sh --
+o argumento --out-dir em si e generico, nao tem "amt" hardcoded aqui).
 
 Uso:
-    python scripts/04b_train_rrin.py \
+    python scripts/04c_train_amt.py \
         --manifest work_dir/manifest.csv \
         --triplets-dir work_dir/subsampling \
         --shell-b 1000 --n-level 10 \
-        --out-dir work_dir/rrin_checkpoints \
-        --epochs 100 --batch-size 8 --patch-size 10 --lr 1e-4
+        --out-dir work_dir/amt_checkpoints \
+        --epochs 100 --batch-size 8 --patch-size 10 --lr 1e-3
 
 Requer PyTorch + GPU. Nao executado neste ambiente de desenvolvimento.
 """
@@ -51,17 +45,17 @@ from utils.rrin_dataset import RRINTripletDataset
 from utils.dataset import SubjectGroupedSampler, worker_init_fn
 from utils.sh_basis import max_order_for_n_directions
 from utils.sh_angular_loss import n_coeffs_even, compute_sh_angular_loss
-from model.rrin3d import build_rrin_model
+from model.amt3d import build_amt_model
 
 
 def _sh_bundle_forward(model, batch, device, use_quality_cond: bool):
-    """Roda o modelo sobre o feixe `*_sh` do batch (ver utils/rrin_dataset.py,
-    `sh_q_out`) e devolve (pred_sh, target_sh, bvec_t_sh, sh_mask) no
-    formato (B, K, ...) que utils.sh_angular_loss.compute_sh_angular_loss
-    espera. As K trincas do feixe sao empilhadas no eixo de batch (B*K)
-    para UM UNICO forward do modelo (nao um loop Python de K chamadas) --
-    RRIN3D/RRIN3DLayered ja processam cada item do batch de forma
-    independente, entao isso e equivalente e bem mais rapido."""
+    """Identico em espirito a _sh_bundle_forward de scripts/04b_train_rrin.py
+    (mesmo feixe `*_sh` do batch, ver utils/rrin_dataset.py) -- so troca
+    qual modelo e chamado. Duplicado (nao importado do script do RRIN) de
+    proposito: os dois scripts devem poder evoluir/ser lidos
+    independentemente, sem um importar o outro (mesma decisao editorial que
+    manteve 04b_train_rrin.py fora de qualquer import cruzado com
+    04_train_rcae.py)."""
     vol_a_sh = batch["vol_a_sh"].to(device)      # (B, K, 1, ps, ps, ps)
     vol_b_sh = batch["vol_b_sh"].to(device)
     target_sh = batch["target_sh"].to(device)
@@ -115,13 +109,10 @@ def run_epoch(model, loader, optimizer, device, train: bool, epoch: int,
 
         with torch.set_grad_enabled(train):
             pred = model(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t_frac, quality=quality)
-            # MAE (mesma escolha do RCAE, ver run_epoch em 04_train_rcae.py) --
-            # sem mascara aqui porque todo item ja tem shape fixo (1 par + 1
-            # alvo, ver utils/rrin_dataset.py), nao ha padding de collate.
+            # MAE (mesma escolha do RRIN/RCAE) -- sem mascara aqui porque
+            # todo item ja tem shape fixo (1 par + 1 alvo, ver
+            # utils/rrin_dataset.py), nao ha padding de collate.
             loss_signal = (pred - target).abs().mean()
-            # termo angular/SH opcional (ver protocolo secao 9/14.5/15 e
-            # docstring do modulo acima) -- desativado por padrao
-            # (angular_loss_weight=0.0), loss identica a antes.
             if angular_loss_weight > 0:
                 pred_sh, target_sh, bvec_t_sh, sh_mask = _sh_bundle_forward(
                     model, batch, device, use_quality_cond)
@@ -149,9 +140,6 @@ def run_epoch(model, loader, optimizer, device, train: bool, epoch: int,
 
         if batch_log_f is not None:
             tags_str = ";".join(batch["subject_tag"])
-            # loss_signal/loss_angular no fim (nao mudam a posicao das colunas
-            # antigas) -- loss_angular fica vazia quando o termo esta
-            # desativado, mesma convencao de 04_train_rcae.py.
             loss_angular_str = f"{loss_angular.item():.6f}" if loss_angular is not None else ""
             batch_log_f.write(f"{epoch},{split},{n_batches},{loss.item():.6f},"
                                f"{wait_s:.3f},{compute_s:.3f},{tags_str},"
@@ -175,118 +163,73 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--triplets-dir", required=True,
-                     help="pasta com os <tag>_rrin_triplets.npz da etapa 2b")
-    ap.add_argument("--out-dir", required=True)
+                     help="pasta com os <tag>_rrin_triplets.npz da etapa 2b (mesma pasta "
+                          "usada por scripts/04b_train_rrin.py -- o esquema de trincas nao "
+                          "depende do metodo que vai consumi-lo)")
+    ap.add_argument("--out-dir", required=True,
+                     help="raiz dos checkpoints DESTE metodo -- use um diretorio SEPARADO do "
+                          "usado por scripts/04b_train_rrin.py (ex.: $WORK_DIR/amt_checkpoints "
+                          "vs $WORK_DIR/rrin_checkpoints), ja que AMT3D e um metodo totalmente "
+                          "diferente, nao uma variante do RRIN -- ver slurm/04c_train_amt.sh")
     ap.add_argument("--shell-b", type=float, required=True)
     ap.add_argument("--n-level", type=int, required=True)
     ap.add_argument("--patch-size", type=int, default=10,
-                     help="mesmo default do RCAE (10) -- ver utils/dataset.py")
+                     help="mesmo default do RRIN/RCAE (10) -- ver utils/dataset.py")
     ap.add_argument("--mask-suffix", default="_mask3d.nii.gz")
     ap.add_argument("--min-tile-coverage", type=float, default=0.1)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--base-ch", type=int, default=16,
-                     help="canais base da RRIN3D (ver model/rrin3d.py) -- rede "
-                          "deliberadamente enxuta, ver docstring do modulo")
+                     help="canais base da AMT3D (ver model/amt3d.py)")
     ap.add_argument("--max-disp", type=float, default=0.5,
-                     help="deslocamento maximo do campo de fluxo, em unidades "
-                          "normalizadas (-1..1 cobre o patch inteiro por eixo)")
+                     help="deslocamento maximo de cada campo de fluxo (grosso e cada delta "
+                          "fino), em unidades normalizadas (-1..1 cobre o patch inteiro por "
+                          "eixo) -- mesma convencao/default de --max-disp em "
+                          "scripts/04b_train_rrin.py")
+    ap.add_argument("--num-fields", type=int, default=3,
+                     help="K, numero de campos de fluxo bilateral CANDIDATOS preditos na "
+                          "escala fina (ver model/amt3d.py:AMT3D, secao 'multi-field' do AMT "
+                          "original, Li et al. CVPR 2023) -- MUDA o numero de canais de saida "
+                          "do decoder fino e da rede de fusao, portanto e um hiperparametro de "
+                          "ARQUITETURA: mudar --num-fields entre um treino e sua retomada e "
+                          "BLOQUEANTE (ValueError), igual --norm-type ja e para o RRIN. "
+                          "Default 3 -- o ablation do AMT original mostra ganho saturando por "
+                          "volta de K~7, entao K=3 e um default mais leve mas dentro da faixa "
+                          "de saturacao (nao uma limitacao arbitraria). Grava em run_tag com "
+                          "sufixo _k<K> quando != 3 (mesma convencao de sufixos condicionais "
+                          "do RRIN, ver run_tag mais abaixo).")
+    ap.add_argument("--corr-radius", type=int, default=3,
+                     help="raio da janela local de lookup de correlacao na escala FINA (ver "
+                          "model/amt3d.py:_corr_lookup_3d) -- afeta o numero de canais de "
+                          "entrada da PRIMEIRA camada das cabecas grossa/fina (win=(2r+1)^3), "
+                          "portanto tambem MUDA o shape dos pesos dessas camadas -- tratado "
+                          "como BLOQUEANTE em resume (mesma logica de --num-fields: nao e um "
+                          "peso aprendido em si, mas o shape de uma camada aprendida depende "
+                          "dele). Grava em run_tag com sufixo _r<radius> quando != 3.")
     ap.add_argument("--use-quality-cond", action="store_true",
-                     help="condiciona a RRIN3D em residual_deg/gap_deg da trinca (ver "
-                          "protocolo secao 10.1 e docstring de model.rrin3d.RRIN3D) -- em vez "
-                          "de so filtrar trincas ruins fora do treino, deixa a rede aprender a "
-                          "confiar menos no fluxo quando a geometria nao sustenta a suposicao "
-                          "de interpolacao. Default (desativado) mantem o teste 'cego' mais "
-                          "proximo de VFI de video de verdade -- ative pra rodar a variante "
-                          "'consciente da qualidade' e comparar as duas.")
-    ap.add_argument("--num-layers", type=int, default=1,
-                     help="numero K de camadas de fluxo independentes (ver "
-                          "model/rrin3d.py:RRIN3DLayered e protocolo secao 13, 'Toward a "
-                          "layered-flow extension for crossing fibers'). Default 1 usa a "
-                          "arquitetura ORIGINAL (model.rrin3d.RRIN3D -- um unico fluxo "
-                          "bidirecional + 1 mapa de visibilidade escalar), mantendo "
-                          "compatibilidade total com os checkpoints ja treinados. K>=2 usa "
-                          "RRIN3DLayered: cada camada tem seu proprio par de fluxo (a->t, "
-                          "b->t) e sua propria visibilidade, e as K camadas sao combinadas "
-                          "por um softmax POR VOXEL (nao e um K que 'muda' por voxel -- a "
-                          "arquitetura sempre calcula as K camadas em todo lugar; o que muda "
-                          "por voxel e o PESO de cada camada nesse softmax, aprendido sem "
-                          "nenhuma supervisao externa). Motivacao: um unico mapa de "
-                          "visibilidade so decide 'confia mais em a ou em b' (bom pra oclusao "
-                          "simples, tipo VFI de video), mas nao representa um voxel que e uma "
-                          "MISTURA de duas populacoes de fibra (crossing) -- cada camada pode "
-                          "se especializar numa populacao. Comece SEM nenhuma loss auxiliar "
-                          "(so a loss de reconstrucao já existente) e compare K=1 (baseline) "
-                          "vs K=2 vs K=3 via aggregate_valid/aggregate_invalid "
-                          "(scripts/06_evaluate_reconstruction.py); so vale a pena acrescentar "
-                          "supervisao tipo CSD/peak-count (sempre calculada da aquisicao "
-                          "COMPLETA do sujeito, nunca do n_level subamostrado -- ver protocolo, "
-                          "risco de indeterminacao/circularidade) se as camadas colapsarem "
-                          "(pi quase identico em toda a imagem, sem estrutura espacial "
-                          "reconhecivel quando comparado a regioes conhecidas de crossing).")
+                     help="condiciona a AMT3D em residual_deg/gap_deg da trinca (mesma ideia e "
+                          "mesma convencao de --use-quality-cond em scripts/04b_train_rrin.py e "
+                          "model.rrin3d.RRIN3D -- ver docstring la). Default (desativado) "
+                          "mantem o teste 'cego'.")
     ap.add_argument("--angular-loss-weight", type=float, default=0.0,
-                     help="lambda do termo de loss opcional no dominio angular/SH (ver "
-                          "protocolo secao 9/14.5/15, portado de scripts/04_train_rcae.py via "
-                          "utils/sh_angular_loss.py). Default 0.0 = desativado, loss identica a "
-                          "antes (so MAE de sinal). Com peso > 0, o dataset TAMBEM monta um "
-                          "feixe de --sh-loss-q-out trincas do mesmo sujeito/patch por item "
-                          "(ver utils/rrin_dataset.py, custo extra de compute proporcional a "
-                          "--sh-loss-q-out) para poder ajustar uma base SH e penalizar erro nos "
-                          "coeficientes de ordem alta (l>=--sh-loss-high-order-min) -- os "
-                          "mesmos que capturam crossing e que a MAE de sinal bruto dilui entre "
-                          "todos os voxels (maioria fibra unica). Grava em run_tag com sufixo "
-                          "_sh (nao colide com as variantes sem loss angular).")
-    ap.add_argument("--sh-loss-high-order-min", type=int, default=4,
-                     help="ordem SH minima (par) considerada 'alta' pelo termo angular -- "
-                          "so tem efeito se --angular-loss-weight > 0.")
-    ap.add_argument("--sh-loss-lmax-cap", type=int, default=8,
-                     help="teto de ordem SH usado no ajuste, mesmo com --sh-loss-q-out grande "
-                          "o suficiente para sustentar mais -- so tem efeito se "
-                          "--angular-loss-weight > 0.")
-    ap.add_argument("--sh-loss-q-out", type=int, default=16,
-                     help="tamanho do feixe de trincas extra por item usado SO para o termo de "
-                          "loss angular/SH (ver utils/rrin_dataset.py, RRINTripletDataset.sh_q_out) "
-                          "-- e o equivalente RRIN do --q-out do RCAE (numero de direcoes-alvo "
-                          "simultaneas usadas pra ajustar a base SH). Default 16 sustenta ate "
-                          "l_max=4 (precisa >=15 direcoes); l=6 precisa >=28, l=8 precisa >=45 "
-                          "(ver n_coeffs_even). Tambem limitado pelo numero de trincas VALIDAS "
-                          "que o sujeito realmente tem para este (shell,n_level) -- ver protocolo "
-                          "secao 10.3 sobre a fracao valid cair em n_level baixo; itens sem "
-                          "trincas suficientes pra sustentar --sh-loss-high-order-min sao "
-                          "pulados no termo angular (a loss de sinal continua normal pra eles). "
-                          "So tem efeito se --angular-loss-weight > 0.")
+                     help="lambda do termo de loss opcional no dominio angular/SH -- mesmo "
+                          "mecanismo/infra de --angular-loss-weight em scripts/04b_train_rrin.py "
+                          "(utils/sh_angular_loss.py, reaproveita RRINTripletDataset.sh_q_out "
+                          "sem nenhuma mudanca). Default 0.0 = desativado.")
+    ap.add_argument("--sh-loss-high-order-min", type=int, default=4)
+    ap.add_argument("--sh-loss-lmax-cap", type=int, default=8)
+    ap.add_argument("--sh-loss-q-out", type=int, default=16)
     ap.add_argument("--norm-type", choices=["instance", "batch"], default="instance",
                      help="tipo de normalizacao usada em todas as camadas conv de "
-                          "model/rrin3d.py (ver docstring de _norm3d la). 'instance' "
-                          "(default) e o comportamento ORIGINAL, compativel com todos os "
-                          "checkpoints ja treinados -- mas calcula estatisticas por PATCH, o "
-                          "que causa um artefato de 'costura' visivel entre patches na "
-                          "reconstrucao com sliding-window (ver protocolo e "
-                          "slurm/05b_reconstruct_rrin.sh, STRIDE/PATCH_SIZE -- confirmado "
-                          "empiricamente que STRIDE menor/mais overlap atenua bastante o "
-                          "artefato, mas isso e um paliativo). 'batch' troca por BatchNorm3d, "
-                          "que em eval() usa estatisticas FIXAS (running_mean/running_var "
-                          "acumuladas em todo o treino) em vez de recalcular por patch -- "
-                          "resolve a causa raiz, nao so o sintoma. Custo: precisa treinar do "
-                          "ZERO (nao da pra retomar um checkpoint 'instance' com "
-                          "--norm-type batch, os parametros/estatisticas nao sao "
-                          "compativeis) -- use --no-resume ou um --out-dir novo. Cria um run "
-                          "SEPARADO (sufixo _bn no run_tag), nao sobrescreve os checkpoints "
-                          "'instance' existentes.")
+                          "model/amt3d.py (importada de model.rrin3d._norm3d -- MESMA "
+                          "implementacao, mesmo motivo de existir 'batch' alem de 'instance', "
+                          "ver docstring de _norm3d em model/rrin3d.py). Default 'instance'. "
+                          "'batch' exige treinar do ZERO (nao retoma um checkpoint 'instance').")
     ap.add_argument("--no-only-valid", action="store_true",
-                     help="treina/valida tambem com trincas INVALIDAS (residuo alto ou alvo "
-                          "extrapolado, ver utils/rrin_dataset.py:RRINTripletDataset e "
-                          "protocolo secao 10.1/10.2). Default (so validas) e o motivo "
-                          "confirmado de rrin/rrin_qc produzirem valores fisicamente "
-                          "implausiveis (explosao numerica, NMSE ~1e9-1e11) nos alvos "
-                          "invalidos na reconstrucao -- a rede nunca viu geometria parecida no "
-                          "treino. Ativar esta flag NAO deve fazer a rede aprender fluxo onde "
-                          "ele nao existe geometricamente (isso e uma limitacao de informacao, "
-                          "nao de capacidade), mas deve evitar a explosao numerica trocando "
-                          "'falha catastrofica' por 'degrada mal, de forma controlada' -- teste "
-                          "e compare o campo aggregate_invalid de scripts/06_evaluate_reconstruction.py "
-                          "antes/depois pra confirmar.")
+                     help="treina/valida tambem com trincas INVALIDAS -- mesma semantica de "
+                          "--no-only-valid em scripts/04b_train_rrin.py (ver docstring la e "
+                          "utils/rrin_dataset.py:RRINTripletDataset).")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--max-cached-subjects", type=int, default=2)
     ap.add_argument("--val-num-workers", type=int, default=None)
@@ -317,11 +260,10 @@ def main():
         if max_l < args.sh_loss_high_order_min:
             print(f"[angular-loss][aviso] --sh-loss-q-out {sh_q_out} so sustenta ate l={max_l} "
                   f"(< --sh-loss-high-order-min {args.sh_loss_high_order_min}) -- este termo vai "
-                  f"ser pulado em praticamente todo item. Aumente --sh-loss-q-out para ter "
-                  f"efeito real, ou reduza --sh-loss-high-order-min.", flush=True)
+                  f"ser pulado em praticamente todo item.", flush=True)
     else:
-        print("[angular-loss] desativado (--angular-loss-weight 0.0, default) -- "
-              "loss identica a antes (so MAE de sinal).", flush=True)
+        print("[angular-loss] desativado (--angular-loss-weight 0.0, default).", flush=True)
+
     train_ds = RRINTripletDataset(train_entries, args.triplets_dir, args.shell_b, args.n_level,
                                    patch_size=args.patch_size, training=True,
                                    mask_suffix=args.mask_suffix, only_valid=only_valid,
@@ -354,22 +296,18 @@ def main():
     print(f"[resumo] val:    {len(val_ds.usable)} sujeitos utilizaveis "
           f"({len(val_ds)} patches, {len(val_loader)} batches/epoca)", flush=True)
 
-    if args.num_layers < 1:
-        raise ValueError(f"--num-layers deve ser >= 1 (recebido {args.num_layers})")
-    model = build_rrin_model(num_layers=args.num_layers, base_ch=args.base_ch,
-                              max_disp=args.max_disp,
-                              use_quality_cond=args.use_quality_cond,
-                              norm_type=args.norm_type).to(device)
+    model = build_amt_model(base_ch=args.base_ch, max_disp=args.max_disp,
+                             num_fields=args.num_fields, corr_radius=args.corr_radius,
+                             use_quality_cond=args.use_quality_cond,
+                             norm_type=args.norm_type).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    model_name = type(model).__name__
-    print(f"[resumo] {model_name}: {n_params} parametros (base_ch={args.base_ch}, "
-          f"num_layers={args.num_layers}, use_quality_cond={args.use_quality_cond}, "
-          f"norm_type={args.norm_type})")
+    print(f"[resumo] AMT3D: {n_params} parametros (base_ch={args.base_ch}, "
+          f"num_fields={args.num_fields}, corr_radius={args.corr_radius}, "
+          f"use_quality_cond={args.use_quality_cond}, norm_type={args.norm_type})")
     if args.norm_type == "batch" and args.batch_size < 4:
         print(f"[aviso] norm_type=batch com --batch-size={args.batch_size} e baixo -- "
-              f"BatchNorm3d calcula estatisticas sobre o batch inteiro (mesmo agregando "
-              f"tambem a extensao espacial de cada patch, um batch muito pequeno deixa "
-              f"essas estatisticas ruidosas). Considere --batch-size>=4 se possivel.",
+              f"BatchNorm3d calcula estatisticas sobre o batch inteiro, um batch muito "
+              f"pequeno deixa essas estatisticas ruidosas. Considere --batch-size>=4.",
               flush=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min",
@@ -416,32 +354,25 @@ def main():
     _sanity_step(val_loader, "validacao", do_backward=False)
     print("[sanity] ok -- comecando o loop de epocas de verdade", flush=True)
 
-    # ATENCAO: run_tag precisa refletir use_quality_cond E only_valid -- sem
-    # isso, treinar uma variante com o MESMO --out-dir de outra sobrescreveria
-    # o mesmo best.pt/last.pt (colisao silenciosa, sem nenhum aviso -- as duas
-    # rodadas competindo pelo mesmo checkpoint em vez de ficarem separadas
-    # para comparacao).
+    # run_tag: MESMO padrao de disciplina de sufixos de scripts/04b_train_rrin.py
+    # (cada opcao que se desvia do default ganha um sufixo, pra nao colidir
+    # silenciosamente com outro checkpoint) -- comeca com o MESMO prefixo
+    # base do RRIN (shell<B>_n<N>), sem prefixo "amt" aqui dentro porque
+    # --out-dir (amt_checkpoints/ vs rrin_checkpoints/) ja desambigua o
+    # metodo por fora.
     run_tag = f"shell{int(args.shell_b)}_n{args.n_level}"
     if args.use_quality_cond:
         run_tag += "_qc"
     if not only_valid:
         run_tag += "_inclinv"
-    if args.num_layers > 1:
-        run_tag += f"_k{args.num_layers}"
+    if args.num_fields != 3:
+        run_tag += f"_k{args.num_fields}"
+    if args.corr_radius != 3:
+        run_tag += f"_r{args.corr_radius}"
     if args.norm_type == "batch":
         run_tag += "_bn"
     if args.angular_loss_weight > 0:
         run_tag += "_sh"
-    # sufixo de LR (2026-08-27): --lr nao tinha nenhum sufixo, entao rodar o
-    # MESMO (shell_b, n_level, variante) com um --lr diferente (ex.: testar
-    # se um LR maior acelera a convergencia do RRIN "cego" n16, ver protocolo
-    # secao 14.6/addendum 2026-08-27) colidiria com o checkpoint canonico
-    # (out_dir/best.pt) -- mesma classe de bug ja corrigida para
-    # use_quality_cond/norm_type/angular_loss_weight/num_layers acima.
-    # 1e-3 e o default "canonico" desde a correcao de LR da secao 12 (o
-    # default antigo do argparse, 1e-4, so sobrevive se alguem chamar o
-    # script python direto sem passar --lr -- slurm/04b_train_rrin.sh
-    # sempre passa "$LR" explicitamente, default 1e-3 la).
     if abs(args.lr - 1e-3) > 1e-12:
         run_tag += f"_lr{args.lr:g}"
     out_dir = Path(args.out_dir) / run_tag
@@ -450,13 +381,10 @@ def main():
     run_dir = out_dir / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[resumo] checkpoints em: {out_dir} (best.pt/last.pt -- caminho fixo, "
-          f"usado pela etapa 5b)")
+          f"usado pela etapa 5d)")
     print(f"[resumo] logs deste run em: {run_dir}")
 
-    # resume automatico -- mesmo mecanismo/semantica de 04_train_rcae.py
-    # (ver comentarios la e protocolo secao 9, prioridade 3): por padrao
-    # retoma de out_dir/last.pt se existir, salvo --no-resume ou
-    # --resume-checkpoint explicito.
+    # resume automatico -- MESMO mecanismo/semantica de scripts/04b_train_rrin.py.
     start_epoch = 1
     best_val = float("inf")
     epochs_no_improve = 0
@@ -473,26 +401,40 @@ def main():
         print(f"[resume] carregando checkpoint existente: {resume_ckpt_path}", flush=True)
         ckpt = torch.load(resume_ckpt_path, map_location=device)
         old_args = ckpt.get("args", {})
+        # WARN-only: mudam loss/velocidade de treino, NAO o shape dos
+        # parametros -- mesma classificacao de scripts/04b_train_rrin.py
+        # (angular_loss_weight/lr/etc. la).
         for key in ("shell_b", "n_level", "patch_size", "base_ch", "max_disp", "use_quality_cond",
-                    "num_layers", "norm_type", "angular_loss_weight", "sh_loss_high_order_min",
-                    "sh_loss_lmax_cap", "sh_loss_q_out", "lr"):
+                    "angular_loss_weight", "sh_loss_high_order_min", "sh_loss_lmax_cap",
+                    "sh_loss_q_out", "lr"):
             old_val, new_val = old_args.get(key), vars(args).get(key)
             if old_val is not None and old_val != new_val:
                 print(f"[resume][aviso] --{key.replace('_','-')} mudou entre o checkpoint "
                       f"({old_val}) e esta chamada ({new_val}) -- confira se e intencional.",
                       flush=True)
-        # norm_type nao pode ser retomado entre variantes -- BatchNorm3d e
-        # InstanceNorm3d tem parametros/buffers diferentes (running_mean/
-        # running_var so existem no primeiro), load_state_dict falharia (ou
-        # pior, "sucederia" parcialmente com strict=False se algum dia isso
-        # mudar) de forma confusa. Falhar alto e cedo aqui.
-        old_norm_type = old_args.get("norm_type", "instance")  # checkpoints antigos nao tinham este campo
+        # BLOQUEANTE: num_fields e corr_radius mudam o shape de camadas
+        # aprendidas (ver docstring de --num-fields/--corr-radius acima e
+        # model/amt3d.py:AMT3D) -- load_state_dict falharia (ou "sucederia"
+        # de forma confusa/silenciosa se algum dia strict=False for usado).
+        # Mesma disciplina de norm_type ja aplicada no RRIN.
+        old_num_fields = old_args.get("num_fields", 3)  # checkpoints antigos (se algum dia
+        old_corr_radius = old_args.get("corr_radius", 3)  # existir sem a chave) assumem o default
+        old_norm_type = old_args.get("norm_type", "instance")
+        if old_num_fields != args.num_fields:
+            raise ValueError(
+                f"--num-fields={args.num_fields} nao bate com o checkpoint ({old_num_fields}) -- "
+                f"num_fields muda o shape das camadas de saida (decoder fino + fusao), nao e "
+                f"retomavel entre variantes. Use --no-resume ou um --out-dir novo.")
+        if old_corr_radius != args.corr_radius:
+            raise ValueError(
+                f"--corr-radius={args.corr_radius} nao bate com o checkpoint ({old_corr_radius}) -- "
+                f"corr_radius muda o numero de canais de entrada das cabecas de fluxo (janela "
+                f"(2r+1)^3), nao e retomavel entre variantes. Use --no-resume ou um --out-dir novo.")
         if old_norm_type != args.norm_type:
             raise ValueError(
                 f"--norm-type={args.norm_type} nao bate com o checkpoint ({old_norm_type}) -- "
                 f"norm_type nao e retomavel entre variantes (parametros/buffers incompativeis). "
-                f"Use --no-resume ou um --out-dir/--norm-type novos para treinar a variante "
-                f"'{args.norm_type}' do zero.")
+                f"Use --no-resume ou um --out-dir/--norm-type novos.")
         model.load_state_dict(ckpt["model_state"])
         if "optimizer_state" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state"])

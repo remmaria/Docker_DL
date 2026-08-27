@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=rcae_sh
+#SBATCH --job-name=rcae_olat
 #SBATCH --cluster=gpu
 #SBATCH --partition=a100
 #SBATCH --gres=gpu:1
-# SBATCH --constraint=a100
+# SBATCH --constraint=l40s
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=96G
-#SBATCH --time=2-23:00:00
+#SBATCH --mem=64G
+#SBATCH --time=0-23:00:00
 #SBATCH --account=tibrahim
 #SBATCH --error=logs/train.%A_%a.err
 #SBATCH --output=logs/train.%A_%a.out
@@ -66,6 +66,25 @@
 # NO_RESUME=1 desativa o resume por completo e comeca do zero (equivalente
 # a --no-resume):
 #   NO_RESUME=1 sbatch slurm/03_train_rcae.sh <work_dir> <shell_b> <n_level>
+#
+# DECODER_TYPE=sh (variavel de ambiente, default direct) -- liga
+# --decoder-type sh (ver model/rcae.py:Decoder3DSH e protocolo secoes
+# 10/15): decoder preve coeficientes SH compartilhados entre as
+# direcoes-alvo do item (em vez de sinal por direcao independente),
+# convertidos pra sinal por uma multiplicacao pela matriz de base -- vies
+# estrutural que forca as predicoes do mesmo voxel a serem consistentes
+# como amostras de uma UNICA FOD continua, ideia inspirada na analogia
+# OLAT/iluminacao multi-fonte da secao 10. Grava em
+# out_dir/shell<B>_n<N>[_sh]_shdec/ (sufixo automatico, nao colide com a
+# variante "direct" existente -- pode coexistir com --angular-loss-weight,
+# que usa sufixo _sh separado, ver 04_train_rcae.py). Exige treinar do
+# ZERO (parametros incompativeis com "direct" -- o script bloqueia resume
+# entre as duas variantes com um erro).
+#   DECODER_TYPE=sh NO_RESUME=1 sbatch slurm/03_train_rcae.sh <work_dir> <shell_b> <n_level>
+# SH_DECODER_LMAX=<l> (default 4, so tem efeito com DECODER_TYPE=sh) --
+# ordem SH maxima dos coeficientes previstos (ver --sh-decoder-lmax). AO
+# CONTRARIO do ANGULAR_LOSS_WEIGHT, nao exige subir --q-out junto (nao ha
+# piso de direcoes-alvo simultaneas -- ver docstring de Decoder3DSH).
 
 set -euo pipefail
 mkdir -p logs
@@ -130,16 +149,24 @@ elif [[ "${NO_RESUME:-0}" == "1" ]]; then
     echo "NO_RESUME=1 -- ignorando qualquer last.pt existente, comecando do zero"
 fi
 
+DECODER_TYPE="${DECODER_TYPE:-direct}"
+SH_DECODER_LMAX="${SH_DECODER_LMAX:-4}"
+DECODER_TYPE_FLAG=()
+if [[ "$DECODER_TYPE" != "direct" ]]; then
+    DECODER_TYPE_FLAG=(--decoder-type "$DECODER_TYPE" --sh-decoder-lmax "$SH_DECODER_LMAX")
+    echo "DECODER_TYPE=$DECODER_TYPE SH_DECODER_LMAX=$SH_DECODER_LMAX -- treinando a variante com Decoder3DSH (checkpoint em .../_shdec/, exige treino do zero)"
+fi
+
 python scripts/04_train_rcae.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --scheme-dir "$WORK_DIR/subsampling" \
     --out-dir "$WORK_DIR/rcae_checkpoints" \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
-    --epochs 150 --batch-size 8 --patch-size 10 --q-out 10 \
-    --lr 1e-3 --num-workers 8 --max-cached-subjects 8 --patience 15 \
-    --debug-plot-every 1 --debug-plot-every-batches 6000 \
+    --epochs 150 --batch-size 4 --patch-size 10 --q-out 10 \
+    --lr 1e-3 --num-workers 8 --max-cached-subjects 6 --patience 15 \
+    --debug-plot-every 1 --debug-plot-every-batches 200 \
     --val-num-workers 4 --val-max-cached-subjects 1 \
     --angular-loss-weight "$ANGULAR_LOSS_WEIGHT" \
     --sh-loss-high-order-min "$SH_LOSS_HIGH_ORDER_MIN" \
-    "${RESUME_FLAG[@]}" \
+    "${RESUME_FLAG[@]}" "${DECODER_TYPE_FLAG[@]}" \
     --job-id "${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"

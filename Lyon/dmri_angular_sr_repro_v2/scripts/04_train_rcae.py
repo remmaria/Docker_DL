@@ -35,7 +35,7 @@ from utils.dataset import (
 from utils.viz import save_patch_debug_png
 from utils.sh_basis import max_order_for_n_directions
 from utils.sh_angular_loss import n_coeffs_even, compute_sh_angular_loss
-from model.rcae import RCAE
+from model.rcae import RCAE, sh_coeffs_to_signal
 
 # NOTA (2026-08-27): compute_sh_angular_loss (e os helpers n_coeffs_even/
 # sh_column_degrees) foram movidos para utils/sh_angular_loss.py, um modulo
@@ -130,7 +130,15 @@ def run_epoch(model, loader, optimizer, device, train: bool, b_ref: float,
             # plota state ao lado de pred pra ajudar a ver se a rede esta
             # variando a predicao por direcao ou so devolvendo o contexto.
             state = model.encoder(input_vols, input_bvecs)
-            pred = model.decoder(state, target_bvecs)
+            # dispatch por decoder_type (ver NOTA 2026-08-27 em
+            # plot_fixed_debug_patch, mesmo bug/fix -- Decoder3DSH.forward
+            # so aceita "state", sem target_bvecs reinjetado; a conversao
+            # coeficientes->sinal e feita depois, fora do decoder).
+            if model.decoder_type == "direct":
+                pred = model.decoder(state, target_bvecs)
+            else:
+                coeffs = model.decoder(state)
+                pred = sh_coeffs_to_signal(coeffs, target_bvecs, model.sh_lmax)
             # mask expandida pro shape completo (B, N_out, 1, ps, ps, ps) --
             # sem isso o denominador so conta pares (sujeito, direcao) e nao
             # os ps^3 voxels de cada um, o que deixaria a loss ~ps^3 vezes
@@ -251,12 +259,27 @@ def plot_fixed_debug_patch(model, fixed_batch, device, b_ref, plot_dir, epoch, v
 
     `b_ref` nao e mais usado aqui dentro (a arquitetura atual do RCAE nao
     condiciona mais em bval, so em bvec -- ver model/rcae.py); mantido no
-    parametro so pra nao mudar a assinatura/chamadas."""
+    parametro so pra nao mudar a assinatura/chamadas.
+
+    NOTA (2026-08-27, bug corrigido): antes chamava `model.decoder(state,
+    target_bvecs)` direto, o que so funciona para `decoder_type="direct"`
+    (`Decoder3D.forward(state, target_bvecs)`) -- com `decoder_type="sh"`,
+    `Decoder3DSH.forward(state)` aceita SO o state (nao tem bvec-alvo
+    reinjetado, ver model/rcae.py) e o forward extra quebrava com
+    "takes 2 positional arguments but 3 were given". Corrigido para
+    replicar a mesma logica de dispatch de `RCAE.forward` (nao chamar
+    `model(...)` completo aqui so porque esta funcao reaproveita o
+    `state` ja calculado para o plot de contexto/`save_patch_debug_png`)."""
     model.eval()
     with torch.no_grad():
         state = model.encoder(fixed_batch["input_vols"].to(device),
                                fixed_batch["input_bvecs"].to(device))
-        pred = model.decoder(state, fixed_batch["target_bvecs"].to(device))
+        target_bvecs = fixed_batch["target_bvecs"].to(device)
+        if model.decoder_type == "direct":
+            pred = model.decoder(state, target_bvecs)
+        else:
+            coeffs = model.decoder(state)
+            pred = sh_coeffs_to_signal(coeffs, target_bvecs, model.sh_lmax)
     loss_str = f" | val_loss {val_loss:.6f}" if val_loss is not None else " | baseline (sem treino)"
     png_path = plot_dir / f"epoch_{epoch:04d}.png"
     save_patch_debug_png(
@@ -396,6 +419,31 @@ def main():
                      help="teto de l_max tentado por item de batch no termo angular (mesmo "
                           "papel do teto em max_order_for_n_directions no baseline SH). Default 8. "
                           "So tem efeito se --angular-loss-weight > 0.")
+    ap.add_argument("--decoder-type", choices=["direct", "sh"], default="direct",
+                     help="'direct' (default): Decoder3D original, preve sinal por direcao-alvo "
+                          "de forma independente (fiel ao paper, ver model/rcae.py). 'sh': "
+                          "Decoder3DSH (ver protocolo secoes 10/15) -- preve coeficientes SH "
+                          "compartilhados entre TODAS as direcoes-alvo do item, convertidos pra "
+                          "sinal por uma multiplicacao pela matriz de base (mesma matematica de "
+                          "compute_sh_angular_loss, sem pseudo-inversa). Constroi FISICAMENTE a "
+                          "consistencia angular entre direcoes-alvo do mesmo voxel na propria "
+                          "arquitetura, em vez de so penalizar via --angular-loss-weight. "
+                          "IMPORTANTE: muda a arquitetura (nao so a loss) -- exige treinar do "
+                          "ZERO, nao da pra retomar um checkpoint 'direct' com --decoder-type sh "
+                          "(shapes de parametro incompativeis).")
+    ap.add_argument("--sh-decoder-lmax", type=int, default=4,
+                     help="l_max (par) dos coeficientes SH previstos pelo Decoder3DSH -- so tem "
+                          "efeito com --decoder-type sh. Default 4 (n_coeffs_even(4)=15, o "
+                          "primeiro l que carrega estrutura de fibra cruzando, ver "
+                          "--sh-loss-high-order-min acima). AO CONTRARIO de --angular-loss-weight "
+                          "(que exige --q-out alto para sustentar l_max via ajuste por pinv), "
+                          "aqui NAO ha piso de --q-out -- os coeficientes sao uma predicao direta "
+                          "da rede, nao um ajuste por inversao, entao mesmo --q-out 1 por passo "
+                          "funciona (ver docstring de Decoder3DSH em model/rcae.py). Pode ser "
+                          "combinado com --angular-loss-weight > 0: mesmo com decoder_type=sh, a "
+                          "loss angular ainda se aplica sobre o SINAL final (apos a conversao "
+                          "coeficientes->sinal), reforcando especificamente os coeficientes de "
+                          "ordem alta (l>=--sh-loss-high-order-min) durante o treino.")
     ap.add_argument("--no-resume", action="store_true",
                      help="por padrao, se out_dir/<shell>_<n>/last.pt ja existir (de um "
                           "treino anterior do MESMO combo shell/n_level que morreu no meio -- "
@@ -540,7 +588,12 @@ def main():
               f"de {len(val_ds)} tiles de validacao)", flush=True)
         debug_fixed_batch = collate_variable_targets([val_ds[best_idx]])
 
-    model = RCAE(lstm_size=args.lstm_size).to(device)
+    model = RCAE(lstm_size=args.lstm_size, decoder_type=args.decoder_type,
+                 sh_lmax=args.sh_decoder_lmax).to(device)
+    if args.decoder_type == "sh":
+        print(f"[decoder] decoder_type=sh, sh_lmax={args.sh_decoder_lmax} "
+              f"(n_coeffs={model.decoder.n_coeffs}) -- coeficientes SH compartilhados entre "
+              f"direcoes-alvo, ver model/rcae.py:Decoder3DSH e protocolo secao 15/10.")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min",
                                                              factor=0.5, patience=5)
@@ -612,6 +665,12 @@ def main():
     run_tag = f"shell{int(args.shell_b)}_n{args.n_level}"
     if args.angular_loss_weight > 0:
         run_tag += "_sh"
+    if args.decoder_type == "sh":
+        # sufixo _shdec (nao _sh, ja usado pela loss angular acima) -- as
+        # duas coisas sao ORTOGONAIS e podem ser combinadas (decoder SH com
+        # loss angular tambem ativa, ver docstring de --sh-decoder-lmax),
+        # entao precisam de sufixos distintos e combinaveis, nao um so.
+        run_tag += "_shdec"
     out_dir = Path(args.out_dir) / run_tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -671,6 +730,28 @@ def main():
         # SH" nesse combo continuaria silenciosamente a partir do
         # checkpoint ERRADO (o mais recente, seja lá qual config gerou).
         old_args = ckpt.get("args", {})
+        # decoder_type/sh_decoder_lmax SAO bloqueantes (nao so aviso) --
+        # Decoder3D e Decoder3DSH tem parametros de shape/significado
+        # totalmente diferentes (ver model/rcae.py), diferente de
+        # angular_loss_weight etc. abaixo (que so mudam a LOSS, nao a
+        # arquitetura) -- mesma logica de bloqueio ja usada para norm_type
+        # em scripts/04b_train_rrin.py (RRIN, InstanceNorm3d vs BatchNorm3d).
+        old_decoder_type = old_args.get("decoder_type", "direct")
+        if old_decoder_type != args.decoder_type:
+            raise ValueError(
+                f"--decoder-type mudou entre o checkpoint ({old_decoder_type}) e esta chamada "
+                f"({args.decoder_type}) -- Decoder3D e Decoder3DSH tem parametros incompativeis "
+                f"(nao e so questao de loss, e arquitetura diferente, ver model/rcae.py). Use "
+                f"--no-resume para treinar a variante nova do zero (grava em run_tag "
+                f"diferente, _shdec, entao nao sobrescreve o checkpoint 'direct' existente).")
+        if args.decoder_type == "sh":
+            old_sh_lmax = old_args.get("sh_decoder_lmax", 4)
+            if old_sh_lmax != args.sh_decoder_lmax:
+                raise ValueError(
+                    f"--sh-decoder-lmax mudou entre o checkpoint ({old_sh_lmax}) e esta chamada "
+                    f"({args.sh_decoder_lmax}) -- muda o numero de canais de saida do "
+                    f"Decoder3DSH (n_coeffs_even(l_max)), incompativel para resume. Use "
+                    f"--no-resume para treinar com o l_max novo do zero.")
         for key in ("shell_b", "n_level", "patch_size", "q_out", "lstm_size",
                     "angular_loss_weight", "sh_loss_high_order_min", "sh_loss_lmax_cap"):
             old_val, new_val = old_args.get(key), vars(args).get(key)

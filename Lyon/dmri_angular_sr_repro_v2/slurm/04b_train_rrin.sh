@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=16k2_shrrin
+#SBATCH --job-name=rrin_lr
 #SBATCH --cluster=gpu
 #SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
@@ -33,6 +33,12 @@
 # optico e mais fraca" com "essa rede so aprendeu mais devagar". Corrigido
 # alinhando os dois defaults). Se quiser rodar com outro valor:
 #   LR=1e-4 sbatch slurm/04b_train_rrin.sh <work_dir> <shell_b> <n_level>
+# Qualquer LR != 1e-3 grava em out_dir/shell<B>_n<N>[_variante]_lr<valor>/
+# (sufixo automatico, ver scripts/04b_train_rrin.py) -- NAO colide com o
+# checkpoint da variante com LR=1e-3 (ex.: o run "cego" n16 em andamento),
+# pode rodar em paralelo (job sbatch independente) sem sobrescrever nada.
+# Ex.: pra comparar convergencia com LR maior no MESMO n16 cego:
+#   LR=2e-3 sbatch slurm/04b_train_rrin.sh <work_dir> 1000 16
 #
 # USE_QUALITY_COND=1 (variavel de ambiente) -- liga --use-quality-cond (ver
 # protocolo secao 10.1/model/rrin3d.py): condiciona a FlowNet3D em

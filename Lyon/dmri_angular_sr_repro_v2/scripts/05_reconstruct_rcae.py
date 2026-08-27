@@ -80,10 +80,15 @@ def main():
     # completamente diferentes agora (Encoder3D/Decoder3D multi-ramo, ver
     # model/rcae.py). load_state_dict abaixo vai falhar alto e claro nesse
     # caso; e preciso retreinar do zero com o pipeline novo.
-    model = RCAE(lstm_size=ckpt_args.get("lstm_size", 48)).to(device)
+    decoder_type = ckpt_args.get("decoder_type", "direct")
+    sh_lmax = ckpt_args.get("sh_decoder_lmax", 4)
+    model = RCAE(lstm_size=ckpt_args.get("lstm_size", 48),
+                 decoder_type=decoder_type, sh_lmax=sh_lmax).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
-    print(f"Checkpoint carregado (epoca {ckpt.get('epoch')}, val_loss {ckpt.get('val_loss')})")
+    print(f"Checkpoint carregado (epoca {ckpt.get('epoch')}, val_loss {ckpt.get('val_loss')}, "
+          f"decoder_type={decoder_type}"
+          + (f", sh_lmax={sh_lmax}" if decoder_type == "sh" else "") + ")")
 
     entries = [e for e in load_manifest(args.manifest) if e.split == args.split]
 

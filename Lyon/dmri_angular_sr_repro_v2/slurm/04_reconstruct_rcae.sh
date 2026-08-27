@@ -65,6 +65,13 @@
 # variantes que ja aconteceu uma vez em producao (as duas escrevendo no
 # MESMO out_dir/best.pt quando treinadas para o mesmo shell_b/n_level).
 #   ANGULAR_LOSS=1 sbatch slurm/04_reconstruct_rcae.sh <work_dir> <shell_b> <n_level>
+#
+# DECODER_TYPE=sh (variavel de ambiente) -- so tem efeito no checkpoint
+# CANONICO, mesma logica de ANGULAR_LOSS acima: aponta pro sufixo _shdec
+# (ver DECODER_TYPE em slurm/03_train_rcae.sh e model/rcae.py:Decoder3DSH).
+# O proprio scripts/05_reconstruct_rcae.py ja le decoder_type/sh_lmax de
+# dentro do checkpoint (nao precisa passar de novo na linha de comando).
+#   DECODER_TYPE=sh sbatch slurm/04_reconstruct_rcae.sh <work_dir> <shell_b> <n_level>
 
 set -euo pipefail
 mkdir -p logs
@@ -92,6 +99,10 @@ CKPT_DIR="$WORK_DIR/rcae_checkpoints/shell${SHELL_B%.*}_n${N_LEVEL}"
 if [[ "${ANGULAR_LOSS:-0}" == "1" ]]; then
     CKPT_DIR="${CKPT_DIR}_sh"
     echo "ANGULAR_LOSS=1 -- lendo checkpoint da variante com loss angular/SH: $CKPT_DIR"
+fi
+if [[ "${DECODER_TYPE:-direct}" == "sh" ]]; then
+    CKPT_DIR="${CKPT_DIR}_shdec"
+    echo "DECODER_TYPE=sh -- lendo checkpoint da variante com Decoder3DSH: $CKPT_DIR"
 fi
 if [[ -n "${CKPT_PATH:-}" ]]; then
     CKPT="$CKPT_PATH"

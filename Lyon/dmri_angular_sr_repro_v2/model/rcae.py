@@ -56,12 +56,71 @@ pediu).
 Requer PyTorch (nao disponivel neste ambiente de desenvolvimento -- revisado
 manualmente, testado apenas por compilacao de sintaxe; validar no cluster
 com `python -m model.rcae`, smoke test no fim do arquivo).
+
+--------------------------------------------------------------------------
+NOVIDADE (2026-08-27) -- decoder com representacao SH intermediaria
+--------------------------------------------------------------------------
+Ver protocolo, secao 10 (analogia OLAT/iluminacao multi-fonte) e secao 15
+(loss angular/SH). O `Decoder3D` acima (agora chamado de "direct") prediz o
+SINAL de cada direcao-alvo de forma INDEPENDENTE -- o bvec-alvo e reinjetado
+em toda camada do decoder (`RepeatBVector`), e cada direcao de saida passa
+pelo MESMO pipeline conv sem nenhuma informacao compartilhada com as outras
+direcoes-alvo do mesmo item (so compartilham o `state` vindo do encoder).
+Isso reproduz fielmente o paper original, mas nao tem nenhum vies estrutural
+que force as N_out predicoes do mesmo voxel a serem CONSISTENTES entre si
+como amostras da MESMA funcao angular continua (a FOD do voxel) -- exigencia
+fisica real que hoje so entra como penalidade suave via `--angular-loss-weight`
+(secao 9), nunca como restricao arquitetural.
+
+`Decoder3DSH` (`decoder_type="sh"`) muda isso: em vez de prever sinal por
+direcao, o decoder prediz um numero FIXO de coeficientes SH (compartilhados
+entre TODAS as direcoes-alvo daquele voxel/item -- por isso nao precisa mais
+reinjetar bvec-alvo dentro do trunk convolucional, e nao precisa mais de
+`DistributedConv3D`/dimensao de tempo, ja que a saida do trunk nao depende de
+qual/quantas direcoes-alvo serao avaliadas). A conversao de coeficientes ->
+sinal por direcao e uma etapa FINAL, determinista e diferenciavel (mesma
+matriz de base real de `utils/sh_basis.py`, calculada por item do batch a
+partir do `target_bvecs` daquele item) -- exatamente a mesma conta que
+`utils/sh_angular_loss.py:compute_sh_angular_loss` ja faz para AJUSTAR
+coeficientes a partir de sinal (via `pinv`); aqui e o caminho inverso e mais
+simples (coeficientes -> sinal e so multiplicacao pela matriz de base, sem
+pseudo-inversa nenhuma).
+
+Isso e uma versao ENXUTA da mesma ideia central do arXiv:2509.07020
+("Physics-Guided Diffusion Transformer with Spherical Harmonic Posterior
+Sampling..." -- ver protocolo secao 10.1/14.5/15): usar SH como
+representacao FISICA intermediaria da rede, em vez de sinal bruto por
+direcao. A diferenca e que aqui NAO ha nenhum aparato de difusao generativa
+(denoising diffusion probabilistic model) nem Transformer -- so um decoder
+convolucional direto, bem mais barato, adaptado da arquitetura do paper do
+RCAE. Note tambem a diferenca de "OLAT completo": isso implementa so a ideia
+2 da secao 10 (decoder SH-intermediario); a ideia 1 (encoder invariante a
+permutacao, trocar o ConvLSTM3D por agregacao comutativa das direcoes de
+ENTRADA) continua em aberto, como ablacao separada.
+
+Trade-off explicito a documentar/discutir: `decoder_type="direct"` pode
+representar qualquer funcao da direcao-alvo (ate o limite da capacidade da
+rede); `decoder_type="sh"` so pode representar o que for expressavel na base
+SH ate `sh_lmax` -- um vies estrutural forte (util se a FOD real do tecido
+for bem capturada por SH de ordem <= sh_lmax, o que e o caso na maioria dos
+voxels exceto talvez crossings muito complexos) mas uma restricao real, nao
+so uma preferencia. Ao contrario da loss angular (secao 9, limitada por
+`q_out` por causa do ajuste via `pinv`), aqui NAO ha exigencia de multiplas
+direcoes-alvo simultaneas por passo de treino -- os coeficientes sao uma
+predicao direta da rede (nao um ajuste por inversao), entao `q_out=1` por
+passo continua funcionando (o gradiente so informa sobre a projecao naquela
+direcao especifica a cada passo, igual ja acontece com `decoder_type="direct"`
+hoje -- nao e uma limitacao nova introduzida por este decoder).
 """
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from utils.sh_basis import real_sh_matrix, cart2sphere
+from utils.sh_angular_loss import n_coeffs_even
 
 
 def _same_pad_3d(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
@@ -276,12 +335,136 @@ class Decoder3D(nn.Module):
         return self.dc4(self.dcv3(conv2))  # (B, N_out, 1, D, H, W)
 
 
+class ConvBlock3D(nn.Module):
+    """Igual a `DistributedConv3D`, mas sem a dimensao de tempo/direcao --
+    para o `Decoder3DSH` abaixo, cujo trunk convolucional processa o `state`
+    UMA unica vez por item do batch (nao um passo por direcao-alvo, ja que
+    os coeficientes SH previstos sao compartilhados entre todas as
+    direcoes-alvo, ver docstring do modulo). Mesma ordem conv -> ativacao ->
+    norm de `DistributedConv3D`, por consistencia."""
+
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int,
+                 norm: str | None = None, activation: str | None = "swish"):
+        super().__init__()
+        assert norm in (None, "instance", "batch"), f"norm invalido: {norm}"
+        assert activation in (None, "swish", "relu"), f"activation invalida: {activation}"
+        self.conv = SamePadConv3D(in_ch, out_ch, kernel_size)
+        if activation == "swish":
+            self.act = nn.SiLU()
+        elif activation == "relu":
+            self.act = nn.ReLU()
+        else:
+            self.act = None
+        if norm == "instance":
+            self.norm = nn.InstanceNorm3d(out_ch, affine=True)
+        elif norm == "batch":
+            self.norm = nn.BatchNorm3d(out_ch)
+        else:
+            self.norm = None
+
+    def forward(self, x):
+        # x: (B, C_in, D, H, W) -- sem dimensao de tempo
+        x = self.conv(x)
+        if self.act is not None:
+            x = self.act(x)
+        if self.norm is not None:
+            x = self.norm(x)
+        return x
+
+
+class Decoder3DSH(nn.Module):
+    """Decoder com representacao SH intermediaria (ver docstring do modulo
+    e protocolo secoes 10/15). Prediz `n_coeffs_even(l_max)` mapas de
+    coeficiente por voxel a partir do `state` do encoder -- NAO recebe
+    `target_bvecs` (os coeficientes nao dependem de qual/quantas
+    direcoes-alvo serao avaliadas depois; a conversao coeficientes->sinal
+    e feita por `sh_coeffs_to_signal`, fora deste modulo, condicionada ao
+    `target_bvecs` de cada item do batch).
+
+    Estrutura multi-ramo (kernels 1/2/3 em paralelo, concatenados) inspirada
+    no `Decoder3D` original, mas SEM reinjecao de bvec (nao ha bvec-alvo
+    ainda nesta etapa) e SEM `DistributedConv3D` (nao ha dimensao de tempo --
+    o trunk roda uma vez so por item, nao uma vez por direcao-alvo). Canais
+    escolhidos por analogia de escala com o `Decoder3D` original, nao sao
+    uma tentativa de fidelidade a nenhum paper (esta e uma extensao nova,
+    nao uma reproducao)."""
+
+    def __init__(self, lstm_size: int = 48, l_max: int = 4):
+        super().__init__()
+        self.l_max = l_max
+        self.n_coeffs = n_coeffs_even(l_max)
+        self.cvl1 = ConvBlock3D(lstm_size, 176, 1, norm="batch")
+        self.cvl2 = ConvBlock3D(176, 224, 1, norm="batch")
+        self.cv11 = ConvBlock3D(224, 240, 1, norm="batch")
+        self.cv12 = ConvBlock3D(224, 256, 2, norm="batch")
+        self.cv13 = ConvBlock3D(224, 136, 3, norm="batch")
+        # conv1 = concat(cv11, cv12, cv13) -> 240+256+136 = 632
+        self.cv21 = ConvBlock3D(632, 176, 1, norm="batch")
+        self.cv22 = ConvBlock3D(632, 136, 2, norm="batch")
+        self.cv23 = ConvBlock3D(632, 88, 3, norm="batch")
+        # conv2 = concat(cv21, cv22, cv23) -> 176+136+88 = 400
+        self.cv3 = ConvBlock3D(400, 16, 1, norm=None)
+        # saida linear (sem ReLU/norm) -- coeficientes SH podem ser negativos
+        self.out = ConvBlock3D(16, self.n_coeffs, 1, norm=None, activation=None)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        # state: (B, lstm_size, D, H, W) -> coeffs: (B, n_coeffs, D, H, W)
+        latent = self.cvl2(self.cvl1(state))
+        d11, d12, d13 = self.cv11(latent), self.cv12(latent), self.cv13(latent)
+        conv1 = torch.cat([d11, d12, d13], dim=1)
+        d21, d22, d23 = self.cv21(conv1), self.cv22(conv1), self.cv23(conv1)
+        conv2 = torch.cat([d21, d22, d23], dim=1)
+        return self.out(self.cv3(conv2))
+
+
+def sh_coeffs_to_signal(coeffs: torch.Tensor, target_bvecs: torch.Tensor,
+                         l_max: int) -> torch.Tensor:
+    """Converte coeficientes SH por voxel (saida de `Decoder3DSH`) em sinal
+    por direcao-alvo -- multiplicacao pela matriz de base real (mesma
+    convencao de `utils/sh_basis.py`), calculada por item do batch a partir
+    do `target_bvecs` daquele item (bvecs diferentes por item sao normais --
+    cada passo de treino pode sortear direcoes-alvo diferentes). A matriz de
+    base em si NAO tem gradiente (e uma funcao determinista dos bvecs, que
+    nao sao parametros aprendidos) -- o matmul com `coeffs` continua
+    totalmente diferenciavel em relacao aos pesos da rede.
+
+    coeffs: (B, R, D, H, W), R = n_coeffs_even(l_max).
+    target_bvecs: (B, N_out, 3).
+    Retorna: (B, N_out, 1, D, H, W) -- mesmo formato de saida de `Decoder3D`.
+    """
+    device = coeffs.device
+    b_size, r = coeffs.shape[0], coeffs.shape[1]
+    spatial = coeffs.shape[2:]
+    outs = []
+    for b in range(b_size):
+        bvecs_np = target_bvecs[b].detach().cpu().numpy()
+        theta, phi = cart2sphere(bvecs_np)
+        bmat = real_sh_matrix(theta, phi, l_max)  # (n_out, R)
+        assert bmat.shape[1] == r, (
+            f"n_coeffs da base ({bmat.shape[1]}) != n_coeffs do decoder ({r}) -- "
+            f"l_max inconsistente entre Decoder3DSH e sh_coeffs_to_signal")
+        bmat_t = torch.as_tensor(bmat, dtype=coeffs.dtype, device=device)  # (n_out, R)
+        c_b = coeffs[b].reshape(r, -1)          # (R, voxels)
+        pred_b = bmat_t @ c_b                   # (n_out, voxels)
+        pred_b = pred_b.reshape(bmat_t.shape[0], 1, *spatial)  # (n_out, 1, D, H, W)
+        outs.append(pred_b)
+    return torch.stack(outs, dim=0)  # (B, n_out, 1, D, H, W)
+
+
 class RCAE(nn.Module):
-    """Autoencoder recorrente completo -- Encoder3D + Decoder3D acima,
-    replica estrutural do `get_3d_autoencoder` do paper.
+    """Autoencoder recorrente completo -- Encoder3D + Decoder3D/Decoder3DSH
+    acima. Com `decoder_type="direct"` (default), replica estrutural do
+    `get_3d_autoencoder` do paper original. Com `decoder_type="sh"` (ver
+    docstring do modulo, protocolo secoes 10/15), o decoder prediz
+    coeficientes SH compartilhados entre as direcoes-alvo, convertidos pra
+    sinal por `sh_coeffs_to_signal` -- arquiteturalmente diferente (nao e
+    so uma opcao de configuracao leve: `state_dict` NAO e compativel entre
+    as duas variantes, exige treinar do zero, mesma logica de
+    `norm_type` em `model/rrin3d.py`/RRIN, ver protocolo secao 14.4).
 
     Uso:
-        model = RCAE(lstm_size=48)
+        model = RCAE(lstm_size=48)  # decoder_type="direct", default
+        model = RCAE(lstm_size=48, decoder_type="sh", sh_lmax=4)
         out = model(input_vols, input_bvecs, input_bvals, target_bvecs, target_bvals, b_ref)
     input_vols: (B, N_in, 1, D, H, W); input_bvecs: (B, N_in, 3)
     target_bvecs: (B, N_out, 3)
@@ -292,14 +475,23 @@ class RCAE(nn.Module):
     em scripts/04_train_rcae.py.
     """
 
-    def __init__(self, lstm_size: int = 48):
+    def __init__(self, lstm_size: int = 48, decoder_type: str = "direct", sh_lmax: int = 4):
         super().__init__()
+        assert decoder_type in ("direct", "sh"), f"decoder_type invalido: {decoder_type}"
+        self.decoder_type = decoder_type
+        self.sh_lmax = sh_lmax
         self.encoder = Encoder3D(lstm_size=lstm_size)
-        self.decoder = Decoder3D(lstm_size=lstm_size)
+        if decoder_type == "direct":
+            self.decoder = Decoder3D(lstm_size=lstm_size)
+        else:
+            self.decoder = Decoder3DSH(lstm_size=lstm_size, l_max=sh_lmax)
 
     def forward(self, input_vols, input_bvecs, input_bvals, target_bvecs, target_bvals, b_ref=None):
         state = self.encoder(input_vols, input_bvecs)
-        return self.decoder(state, target_bvecs)
+        if self.decoder_type == "direct":
+            return self.decoder(state, target_bvecs)
+        coeffs = self.decoder(state)
+        return sh_coeffs_to_signal(coeffs, target_bvecs, self.sh_lmax)
 
 
 def _smoke_test():
@@ -322,7 +514,24 @@ def _smoke_test():
     out = model(input_vols, input_bvecs, input_bvals, target_bvecs, target_bvals, b_ref=1000.0)
     expected = (b, n_out, 1, d, h, w)
     assert out.shape == expected, f"shape mismatch: {out.shape} != {expected}"
-    print("smoke test OK, output shape:", tuple(out.shape))
+    print("smoke test OK (decoder_type=direct), output shape:", tuple(out.shape))
+
+    # decoder_type="sh": mesma entrada, l_max pequeno (n_coeffs_even(2)=6,
+    # sustentavel mesmo com n_out=4 pequeno do teste -- ver docstring do
+    # modulo: ao contrario da loss angular, aqui nao ha piso de q_out).
+    model_sh = RCAE(lstm_size=8, decoder_type="sh", sh_lmax=2)
+    out_sh = model_sh(input_vols, input_bvecs, input_bvals, target_bvecs, target_bvals, b_ref=1000.0)
+    assert out_sh.shape == expected, f"shape mismatch (sh): {out_sh.shape} != {expected}"
+    assert model_sh.decoder.n_coeffs == 6, "n_coeffs_even(2) deveria ser 6"
+    # coeficientes SH sao compartilhados entre direcoes-alvo -- verificar que
+    # o decoder roda so uma vez por item (nao uma vez por direcao-alvo) via
+    # contagem de canais de saida do decoder (n_coeffs, nao n_out*algo).
+    with torch.no_grad():
+        state = model_sh.encoder(input_vols, input_bvecs)
+        coeffs = model_sh.decoder(state)
+    assert coeffs.shape == (b, 6, d, h, w), f"shape de coeffs inesperada: {coeffs.shape}"
+    print("smoke test OK (decoder_type=sh), output shape:", tuple(out_sh.shape),
+          "coeffs shape:", tuple(coeffs.shape))
 
 
 if __name__ == "__main__":

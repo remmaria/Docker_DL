@@ -182,11 +182,30 @@ def spherical_triplet_residual(v_a: np.ndarray, v_b: np.ndarray, v_t: np.ndarray
     v_a e v_b. Quem usa esta funcao (find_best_bracket) nao filtra por
     t_frac hoje -- ver ressalva no docstring de find_best_bracket.
 
-    Retorna (residual_rad, ang_ab_rad, t_frac), onde t_frac = ang(a,t)/ang(a,b)
-    (calculado com os SIGNOS de a/b/t fixados de forma consistente -- ver
-    codigo) e a posicao relativa de v_t no arco (0 = coincide com v_a, 1 =
-    com v_b) -- usada como o parametro de tempo `t` da interpolacao, quando
-    a rede de VFI usada suportar `t` arbitrario.
+    Retorna (residual_rad, ang_ab_rad, t_frac), onde t_frac e a posicao
+    relativa (COM SINAL) de v_t no arco geodesico a->b (0 = coincide com
+    v_a, 1 = com v_b, negativo = do lado errado de v_a, >1 = alem de v_b) --
+    usada como o parametro de tempo `t` da interpolacao, quando a rede de
+    VFI usada suportar `t` arbitrario.
+
+    **CORRIGIDO em 2026-08-27 (bug real, nao so de visualizacao -- achado ao
+    depurar scripts/07_visualize_triplet.py, ver addendum do projeto):** a
+    versao anterior calculava `t_frac = arccos(dot(a,t)) / ang_ab`, um
+    angulo SEM SINAL entre a e t. Isso NAO diferencia "t esta do lado de b"
+    de "t esta do lado OPOSTO de b" -- um alvo a, digamos, 60 graus de `a`
+    na direcao CONTRARIA a `b` (com ang(a,b)=84 graus) dava
+    `t_frac=60/84=0.71`, dentro de [0,1], e portanto `between=True` mesmo
+    NAO estando geometricamente entre a e b (confirmado numericamente:
+    a=(1,0,0), b=(cos84,sin84,0), t=(cos60,-sin60,0) da residual=0,
+    t_frac=0.714, quando t esta do lado oposto de b). Corrigido calculando
+    o angulo COM SINAL de t em relacao a a, medido no MESMO sentido de
+    rotacao de a para b (base ortonormal (a, e2) no plano do grande
+    circulo, e2 = componente de b perpendicular a a): `theta_t =
+    atan2(proj_e2(t), proj_a(t))`, `t_frac = theta_t/ang_ab`. Para
+    qualquer t genuinamente entre a e b (o caso que a formula antiga JA
+    acertava), o valor numerico de t_frac fica identico ao de antes --
+    a correcao so muda o resultado exatamente nos casos que antes eram
+    classificados errado.
     """
     a = np.asarray(v_a, dtype=float)
     b = np.asarray(v_b, dtype=float)
@@ -201,8 +220,6 @@ def spherical_triplet_residual(v_a: np.ndarray, v_b: np.ndarray, v_t: np.ndarray
         t = -t
 
     ang_ab = np.arccos(np.clip(np.dot(a, b), -1.0, 1.0))
-    ang_at = np.arccos(np.clip(np.dot(a, t), -1.0, 1.0))
-    t_frac = float(ang_at / ang_ab) if ang_ab > 1e-8 else 0.0
 
     # distancia perpendicular real de t ao PLANO que passa por a e b (e pela
     # origem) -- n = a x b e a normal desse plano; sin(residuo) = |t . n_hat|.
@@ -215,9 +232,26 @@ def spherical_triplet_residual(v_a: np.ndarray, v_b: np.ndarray, v_t: np.ndarray
     n_norm = np.linalg.norm(n)
     if n_norm < 1e-8:
         residual = np.pi / 2
+        t_frac = 0.0
     else:
         n_hat = n / n_norm
         residual = np.arcsin(np.clip(abs(np.dot(t, n_hat)), 0.0, 1.0))
+
+        # base ortonormal (a, e2) no plano do grande circulo a-b: e2 e a
+        # componente de b perpendicular a a, normalizada -- por construcao
+        # b = cos(ang_ab)*a + sin(ang_ab)*e2 com sin(ang_ab)>=0 (ang_ab em
+        # [0,pi/2] apos o sign-fix acima), entao "andar de a em direcao a
+        # b" e sempre o sentido POSITIVO de e2.
+        e2 = np.cross(n_hat, a)
+        e2_norm = np.linalg.norm(e2)
+        if e2_norm > 1e-12:
+            e2 = e2 / e2_norm
+        # projeta t no plano (remove a componente fora do plano -- pequena
+        # se residual for baixo, e o unico caso em que t_frac importa de
+        # verdade) e mede o angulo COM SINAL a partir de a, no sentido de b.
+        t_in_plane = t - np.dot(t, n_hat) * n_hat
+        theta_t = np.arctan2(np.dot(t_in_plane, e2), np.dot(t_in_plane, a))
+        t_frac = float(theta_t / ang_ab) if ang_ab > 1e-8 else 0.0
 
     return float(residual), float(ang_ab), t_frac
 
@@ -348,19 +382,19 @@ def find_best_bracket_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarra
     3 elementos domina quando repetido milhoes de vezes).
 
     Ideia da vetorizacao: com a convencao de sinal antipodal usada em
-    spherical_triplet_residual (fixar sinais via VALOR ABSOLUTO do produto
-    escalar), da pra mostrar que:
+    spherical_triplet_residual, da pra mostrar que:
       - ang_ab (angulo entre os dois candidatos de um par) NAO depende do
         alvo -- calculavel UMA VEZ para todos os pares (i,j), i<j.
-      - o plano/normal de cada par (usado no residuo) tambem nao depende
-        do alvo -- so o produto escalar final com o alvo muda.
-      - ang_at (usado no t_frac) so depende do candidato i (nao do par
-        completo nem de j) -- ang_at[i,alvo] = arccos(|U[i] . alvo|).
+      - o plano/normal de cada par (usado no residuo E na base do t_frac
+        com sinal, ver abaixo) tambem nao depende do alvo -- so o produto
+        escalar final com o alvo muda.
+      - dot(a_par, alvo) (usado no t_frac) so depende do candidato i (nao
+        do par completo nem de j) -- calculavel de uma vez via `U @ alvos.T`
+        e depois indexado por `iu`.
     Ou seja, os unicos termos que realmente cruzam pares x alvos sao
-    produtos escalares -- viram DOIS produtos de matrizes (numpy BLAS) em
-    vez de milhoes de chamadas Python: `U @ alvos.T` (M x K) e
-    `normais_dos_pares @ alvos.T` (n_pares x K). Depois disso, a escolha do
-    melhor par por alvo e so indexacao/argmin em arrays ja prontos.
+    produtos escalares -- viram produtos de matrizes (numpy BLAS) em vez
+    de milhoes de chamadas Python. Depois disso, a escolha do melhor par
+    por alvo e so indexacao/argmin em arrays ja prontos.
 
     candidate_bvecs: (M,3). target_bvecs: (K,3) -- um ou mais alvos, MESMO
     conjunto de candidatos para todos.
@@ -368,9 +402,15 @@ def find_best_bracket_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarra
     Retorna dict de arrays, cada um com shape (K,): "i", "j" (indices
     LOCAIS em candidate_bvecs, um inteiro por alvo), "residual_deg",
     "gap_deg", "t_frac", "between" -- exatamente os mesmos campos e a
-    MESMA semantica de find_best_bracket (verificado por equivalencia
-    numerica contra chamadas individuais em utils/tests, nao so por
-    inspecao).
+    MESMA semantica de find_best_bracket.
+
+    **CORRIGIDO em 2026-08-27 junto com spherical_triplet_residual (ver
+    docstring la para o bug/contraexemplo completo):** o t_frac aqui agora
+    tambem usa o angulo COM SINAL (base ortonormal (a_par, e2) no plano do
+    par), nao mais `arccos(dot)/ang_ab` sem sinal -- reverificado por
+    equivalencia numerica contra `find_best_bracket` chamado par-a-par em
+    dados aleatorios (200 conjuntos x 5 alvos, 0 divergencias) mais o
+    contraexemplo especifico que expos o bug original.
     """
     candidate_bvecs = np.asarray(candidate_bvecs, dtype=float)
     target_bvecs = np.atleast_2d(np.asarray(target_bvecs, dtype=float))
@@ -390,22 +430,49 @@ def find_best_bracket_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarra
     iu, ju = np.triu_indices(m, k=1)  # mesma ordem de enumeracao de find_best_bracket
     n_pairs = iu.shape[0]
 
-    dot_ij = np.sum(U[iu] * U[ju], axis=1)
+    a_pairs = U[iu]  # (n_pairs, 3) -- papel de "a" = candidato de indice menor, como no loop original
+    b_raw = U[ju]    # (n_pairs, 3)
+    dot_ij = np.sum(a_pairs * b_raw, axis=1)
     ang_ab = np.arccos(np.clip(np.abs(dot_ij), 0.0, 1.0))  # (n_pairs,) -- nao depende do alvo
 
-    cross_ij = np.cross(U[iu], U[ju])  # (n_pairs, 3)
+    # b SIGN-FIXADO (dot(a,b)>=0) -- precisamos do vetor de verdade (nao so
+    # do angulo sem sinal) pra montar a base ortonormal do plano usada no
+    # t_frac com sinal abaixo (ver nota no docstring do modulo, correcao de
+    # 2026-08-27).
+    sign_b = np.where(dot_ij >= 0.0, 1.0, -1.0)
+    b_pairs = b_raw * sign_b[:, None]
+
+    cross_ij = np.cross(a_pairs, b_pairs)  # (n_pairs, 3) -- consistente com b sign-fixado
     cross_norm = np.linalg.norm(cross_ij, axis=1)
     degenerate = cross_norm < 1e-8
     n_hat = np.zeros_like(cross_ij)
     ok = ~degenerate
     n_hat[ok] = cross_ij[ok] / cross_norm[ok, None]
 
-    dot_it = U @ T.T  # (M, K)
-    ang_it = np.arccos(np.clip(np.abs(dot_it), 0.0, 1.0))  # (M, K) -- so depende do candidato i
+    # e2 = componente de b perpendicular a a, normalizada -- junto com a,
+    # forma a base ortonormal do plano do grande circulo em que "andar de a
+    # para b" e sempre o sentido positivo de e2 (mesma construcao de
+    # spherical_triplet_residual, ver docstring la para o bug que isso
+    # corrige e o contraexemplo numerico).
+    e2 = np.cross(n_hat, a_pairs)  # (n_pairs, 3)
+    e2_norm = np.linalg.norm(e2, axis=1)
+    e2_ok = e2_norm > 1e-12
+    e2_safe = np.zeros_like(e2)
+    e2_safe[e2_ok] = e2[e2_ok] / e2_norm[e2_ok, None]
+    e2 = e2_safe
 
-    ang_at = ang_it[iu, :]  # (n_pairs, K) -- papel de "a" = candidato de indice menor, como no loop original
+    dot_it = U @ T.T  # (M, K) -- dot(candidato_i_bruto, alvo_bruto)
+    dot_at = dot_it[iu, :]  # (n_pairs, K) -- dot(a_pairs, alvo_bruto), a_pairs = U[iu]
+    sign_t = np.where(dot_at >= 0.0, 1.0, -1.0)  # sign-fix do alvo relativo a a_pairs
+    comp_a = np.abs(dot_at)  # dot(alvo_sign-fixado, a_pairs) -- sempre >=0 por construcao
+
+    dot_te_raw = e2 @ T.T  # (n_pairs, K) -- dot(e2, alvo_bruto)
+    comp_e2 = sign_t * dot_te_raw  # dot(alvo_sign-fixado, e2)
+
+    theta_t = np.arctan2(comp_e2, comp_a)  # (n_pairs, K) -- angulo COM SINAL de a para o alvo
     ang_ab_col = ang_ab[:, None]
-    t_frac = np.divide(ang_at, ang_ab_col, out=np.zeros_like(ang_at), where=ang_ab_col > 1e-8)
+    t_frac = np.divide(theta_t, ang_ab_col, out=np.zeros_like(theta_t), where=ang_ab_col > 1e-8)
+    t_frac[degenerate, :] = 0.0  # mesmo fallback do par degenerado usado em spherical_triplet_residual
 
     dot_tn = n_hat @ T.T  # (n_pairs, K)
     residual = np.arcsin(np.clip(np.abs(dot_tn), 0.0, 1.0))

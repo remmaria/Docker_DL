@@ -116,7 +116,7 @@ NO_RESUME=1 \
   SH_LOSS_HIGH_ORDER_MIN=2 \
   sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 
-
+DECODER_TYPE=sh SH_DECODER_LMAX=4 NO_RESUME=1 sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 
 
 ANGULAR_LOSS_WEIGHT=0.5 \
@@ -136,8 +136,13 @@ RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/
 
 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 32
 
+LR=2e-3 ONLY_VALID=1 NUM_LAYERS=1 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
 ONLY_VALID=1 NUM_LAYERS=1 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 ONLY_VALID=1 NUM_LAYERS=2 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+NORM_TYPE=batch ONLY_VALID=1 NUM_LAYERS=2 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+ANGULAR_LOSS_WEIGHT=0.1 ONLY_VALID=1 NUM_LAYERS=2 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
 ONLY_VALID=1 NUM_LAYERS=1 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 32
 ONLY_VALID=1 NUM_LAYERS=3 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 32
@@ -146,6 +151,9 @@ LR=1e-3 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon
 
 USE_QUALITY_COND=1 LR=1e-3 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
 
+
+#------------04c_train_amt.sh
+NO_RESUME=1 sbatch 04c_train_amt.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
 #------------05b_reconstruct_rrin.sh
 
@@ -177,6 +185,14 @@ RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" NUM_LAYERS=3 \
   CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_checkpoints/shell1000_n32_k3/best.pt RECON_TAG=rrin_n32_k3 \
   sbatch 05b_reconstruct_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 32
 
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" NUM_LAYERS=2 ANGULAR_LOSS=1 \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_checkpoints/shell1000_n16_k2/best.pt RECON_TAG=rrin_n16_k2_sh \
+  sbatch 05b_reconstruct_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" NUM_LAYERS=2 NORM_TYPE=batch \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_checkpoints/shell1000_n16_k2_bn/best.pt RECON_TAG=rrin_n16_k2_bn \
+  sbatch 05b_reconstruct_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
 
 EXTRA_METHOD="rrin_n16_k1=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin_n16_k1,rrin_n16_k2=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin_n16_k2" \
 RECON_TAG=unused \
@@ -188,9 +204,14 @@ RECON_TAG=unused \
 RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
   sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 32
 
+EXTRA_METHOD="rrin_n16_k2_sh=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin_n16_k2_sh,rrin_n16_k2_bn=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin_n16_k2_bn" \
+RECON_TAG=unused \
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+  sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
 
-NUM_LAYERS=2 CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_checkpoints/shell1000_n32_k2/best.pt \
+
+STRIDE=2 NUM_LAYERS=2 CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_checkpoints/shell1000_n32_k2/best.pt \
   sbatch 05c_debug_rrin_layers.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 32 20170417094841_802780_20170417094841_802780
 
 
