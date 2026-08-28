@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=rrin_star
+#SBATCH --job-name=rrstar35
 #SBATCH --cluster=gpu
 #SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
@@ -98,9 +98,14 @@ if [[ "$NORM_TYPE" != "instance" ]]; then
     NORM_TYPE_FLAG=(--norm-type "$NORM_TYPE")
     echo "NORM_TYPE=$NORM_TYPE -- treinando a variante com BatchNorm3d (exige treino do zero)"
 fi
+TRIPLETS_DIR="${TRIPLETS_DIR:-$WORK_DIR/subsampling}"
+if [[ "$TRIPLETS_DIR" != "$WORK_DIR/subsampling" ]]; then
+    echo "TRIPLETS_DIR=$TRIPLETS_DIR -- lendo trincas de pasta SEPARADA da producao (subsampling/)"
+fi
+
 python scripts/04e_train_rrin_star.py \
     --manifest "$WORK_DIR/manifest.csv" \
-    --triplets-dir "$WORK_DIR/subsampling" \
+    --triplets-dir "$TRIPLETS_DIR" \
     --out-dir "$WORK_DIR/rrin_star_checkpoints" \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" --ensemble-m "$ENSEMBLE_M" \
     --epochs 150 --batch-size 8 --patch-size 10 \

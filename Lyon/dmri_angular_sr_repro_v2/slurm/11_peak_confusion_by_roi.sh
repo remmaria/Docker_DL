@@ -79,6 +79,29 @@ if [[ "${SUBSAMPLED_ONLY:-0}" == "1" ]]; then
     TRIPLETS_DIR="${TRIPLETS_DIR:-$WORK_DIR/subsampling}"
     SUBSAMPLED_ONLY_FLAG=(--subsampled-only --triplets-dir "$TRIPLETS_DIR")
     echo "SUBSAMPLED_ONLY=1 -- lendo target_idx de $TRIPLETS_DIR"
+
+    # SH_ORDER_SUBSAMPLED_ONLY=<ordem> (variavel de ambiente, opcional --
+    # ver --sh-order-subsampled-only em scripts/11_peak_confusion_by_roi.py
+    # e addendum, secao 16.1/18): por padrao (sem esta variavel) o
+    # subsampled_only usa a ordem SH "honesta" pras n_level direcoes reais
+    # (max_order_for_n_directions(n_level), equivalente ao
+    # 'bruto_n_ordem_max' do poc_csd_direction_count.py da usuaria --
+    # estruturalmente incapaz de representar cruzamento, nao por falta de
+    # dado). Forcar aqui a MESMA ordem dos metodos de volume completo
+    # (equivalente ao 'bruto_n' do PoC -- ordem alta forcada em poucas
+    # direcoes, mal-posto de proposito) serve como diagnostico extra: isola
+    # se a diferenca de recall/energia contra os metodos de reconstrucao
+    # vem so da ordem menor (artefato de escolha de parametro) ou de fato
+    # da falta de informacao angular real (nesse caso, esperado que o
+    # ajuste fique instavel/hallucine picos em vez de melhorar). Ex.: pra
+    # n16 (max_order_for_n_directions(16)=4), comparar com a mesma ordem 8
+    # usada pelo shell completo:
+    #   SH_ORDER_SUBSAMPLED_ONLY=8 SUBSAMPLED_ONLY=1 \
+    #     sbatch slurm/11_peak_confusion_by_roi.sh <work_dir> 1000 16
+    if [[ -n "${SH_ORDER_SUBSAMPLED_ONLY:-}" ]]; then
+        SUBSAMPLED_ONLY_FLAG+=(--sh-order-subsampled-only "$SH_ORDER_SUBSAMPLED_ONLY")
+        echo "SH_ORDER_SUBSAMPLED_ONLY=$SH_ORDER_SUBSAMPLED_ONLY -- forcando essa ordem no subsampled_only (em vez da ordem 'honesta' automatica)"
+    fi
 fi
 
 ROI_FLAG=()

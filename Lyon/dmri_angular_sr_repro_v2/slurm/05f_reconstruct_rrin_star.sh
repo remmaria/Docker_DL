@@ -116,9 +116,14 @@ if [[ "$STRIDE" != "8" || "$PATCH_SIZE" != "10" ]]; then
     echo "STRIDE=$STRIDE PATCH_SIZE=$PATCH_SIZE (default seria patch-size=10 stride=8)"
 fi
 
+TRIPLETS_DIR="${TRIPLETS_DIR:-$WORK_DIR/subsampling}"
+if [[ "$TRIPLETS_DIR" != "$WORK_DIR/subsampling" ]]; then
+    echo "TRIPLETS_DIR=$TRIPLETS_DIR -- lendo trincas de pasta SEPARADA da producao (subsampling/)"
+fi
+
 python scripts/05f_reconstruct_rrin_star.py \
     --manifest "$WORK_DIR/manifest.csv" \
-    --triplets-dir "$WORK_DIR/subsampling" \
+    --triplets-dir "$TRIPLETS_DIR" \
     --checkpoint "$CKPT" \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --out-dir "$RECON_OUT_DIR" \
