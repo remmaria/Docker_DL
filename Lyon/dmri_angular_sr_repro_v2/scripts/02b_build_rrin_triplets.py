@@ -62,6 +62,41 @@ Saida: <out-dir>/<subject>[_<session>]_rrin_triplets.npz
                                         nota acima; --no-require-between restaura o
                                         comportamento antigo de valid = so residuo)
 
+  Se --ensemble-m M > 0 (ADITIVO -- ver protocolo secao 14.5 item 1/addendum
+  2026-08-27, "ensemble em estrela"), grava TAMBEM, para cada alvo, ate M
+  pares de entrada DIVERSOS (nao so o melhor -- ver
+  utils/gradients.py:find_star_ensemble_batch), na MESMA ordem de target_idx:
+    "{shell}__{level}__ens_pair_a"       -- (n_alvos, M) indice GLOBAL da 1a direcao de
+                                            cada par do feixe (-1 = posicao de padding)
+    "{shell}__{level}__ens_pair_b"       -- idem, 2a direcao
+    "{shell}__{level}__ens_t_frac"       -- (n_alvos, M) t_frac de cada par do feixe
+    "{shell}__{level}__ens_residual_deg" -- (n_alvos, M) residuo de cada par do feixe
+    "{shell}__{level}__ens_gap_deg"      -- (n_alvos, M) gap_deg de cada par do feixe
+    "{shell}__{level}__ens_valid"        -- (n_alvos, M) bool, par real presente nesta
+                                            posicao do feixe (mascara de padding -- NAO
+                                            e o mesmo criterio de "valido geometricamente"
+                                            de "valid" acima, so marca "existe par aqui")
+  Estes campos sao INDEPENDENTES dos de par-unico acima (mesmos alvos,
+  mesma ordem, mas a selecao do 1o par do feixe pode nao ser IDENTICA a
+  "pair_a"/"pair_b" se --no-require-between ou --max-residual-deg
+  divergirem entre as duas chamadas -- por padrao usam os MESMOS
+  args.max_residual_deg/require_between do par unico desta mesma execucao
+  (ver --ensemble-max-residual-deg abaixo para usar um teto DIFERENTE so
+  para o feixe), entao na pratica SAO identicos ao par unico quando M>=1
+  e nenhum teto separado for passado, ver docstring de
+  find_star_ensemble_batch.
+
+  **Nota importante (addendum 2026-08-27, secao 13): com o teto default de
+  5.0 graus, em n_level baixo/medio o "pool aceitavel" de cada alvo
+  frequentemente tem so 1 membro (nenhum outro par candidato passa no
+  teto), entao o feixe efetivo colapsa para M=1 na pratica -- use
+  --ensemble-max-residual-deg (mais frouxo que --max-residual-deg) se
+  quiser dar ao ensemble um pool de verdade pra diversificar, SEM mexer no
+  teto usado pelo par unico (preserva comparacao com RRIN3D/AMT3D/HFD3D ja
+  rodados). scripts/02c_diagnose_rrin_triplets.py agora reporta a
+  distribuicao de tamanho desse pool por (shell,n_level) -- rode antes de
+  decidir o valor.
+
 Ao final, imprime um resumo agregado (todos os sujeitos) da fracao de
 alvos validos por (shell,n_level) -- confira antes de treinar a RRIN em
 cima disso: n_level onde essa fracao for muito baixa vao gerar poucos
@@ -77,7 +112,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.manifest import load_manifest
-from utils.gradients import load_bval_bvec, find_best_bracket_batch
+from utils.gradients import load_bval_bvec, find_best_bracket_batch, find_star_ensemble_batch
 
 
 def _enumerate_combos(scheme_npz):
@@ -119,6 +154,32 @@ def main():
     ap.add_argument("--limit", type=int, default=None,
                      help="processa so os primeiros N sujeitos do manifesto (apos --subjects, "
                           "se ambos forem passados) -- outra forma de fazer uma previa rapida.")
+    ap.add_argument("--ensemble-m", type=int, default=0,
+                     help="ADITIVO (default 0 = desligado, npz identico a antes): quando > 0, "
+                          "TAMBEM grava, para cada alvo, um 'feixe em estrela' de ate M pares de "
+                          "entrada DIVERSOS (nao so o melhor par -- ver protocolo secao 14.5 item "
+                          "1/addendum 2026-08-27, e utils/gradients.py:find_star_ensemble_batch), "
+                          "usado pelo treino/reconstrucao do ensemble em estrela "
+                          "(scripts/04e_train_rrin_star.py / model/rrin3d_star.py). Os campos "
+                          "'pair_a'/'pair_b'/... de sempre (par UNICO, ver acima) continuam sendo "
+                          "gravados exatamente como antes -- isso so ACRESCENTA campos novos "
+                          "'{base}__ens_pair_a' etc., nao muda nada do que ja existe, entao os "
+                          "scripts/checkpoints RRIN3D/AMT3D/HFD3D (single-pair) nao sao afetados "
+                          "nem precisam ser regenerados so por causa desta flag.")
+    ap.add_argument("--ensemble-max-residual-deg", type=float, default=None,
+                     help="ADITIVO (default None = usa o MESMO valor de --max-residual-deg, "
+                          "comportamento de sempre): teto de residuo SEPARADO, so para montar o "
+                          "pool do 'feixe em estrela' (--ensemble-m), sem afetar o teto do par "
+                          "UNICO (--max-residual-deg continua controlando pair_a/pair_b/valid "
+                          "normalmente). Motivacao (ver addendum 2026-08-27, secao 13): com o "
+                          "teto apertado de sempre (default 5.0), o pool aceitavel por alvo "
+                          "costuma ter so 1 membro em n_level baixo/medio, entao o ensemble "
+                          "colapsa pra M=1 na pratica -- passar um valor mais frouxo aqui (ex. "
+                          "15.0) da ao ensemble candidatos de verdade pra diversificar, deixando "
+                          "a cabeca de fusao aprendida (ver model/rrin3d_star.py) decidir quanto "
+                          "confiar em cada par, SEM contaminar a comparacao ja feita de "
+                          "RRIN3D/AMT3D no par unico (que usa --max-residual-deg, nao este). "
+                          "Sem efeito se --ensemble-m nao for passado (>0).")
     args = ap.parse_args()
     require_between = not args.no_require_between
 
@@ -195,6 +256,29 @@ def main():
             save_dict[f"{base}__between"] = between
             save_dict[f"{base}__valid"] = valid
 
+            if args.ensemble_m > 0:
+                # ADITIVO -- ver docstring do modulo e utils/gradients.py:
+                # find_star_ensemble_batch. Mesmos input_bvecs/target_bvecs,
+                # mesmo require_between desta mesma chamada -- so o teto de
+                # residuo pode divergir do par unico se --ensemble-max-residual-deg
+                # tiver sido passado (default None = usa o mesmo de sempre).
+                ens_max_residual = (args.ensemble_max_residual_deg
+                                     if args.ensemble_max_residual_deg is not None
+                                     else args.max_residual_deg)
+                ens = find_star_ensemble_batch(input_bvecs, target_bvecs, args.ensemble_m,
+                                                max_residual_deg=ens_max_residual,
+                                                require_between=require_between)
+                ens_i, ens_j = ens["i"], ens["j"]  # (n_alvos, M), -1 = padding
+                pad = ens_i < 0
+                ens_pair_a = np.where(pad, -1, input_idx[np.clip(ens_i, 0, None)])
+                ens_pair_b = np.where(pad, -1, input_idx[np.clip(ens_j, 0, None)])
+                save_dict[f"{base}__ens_pair_a"] = ens_pair_a
+                save_dict[f"{base}__ens_pair_b"] = ens_pair_b
+                save_dict[f"{base}__ens_t_frac"] = ens["t_frac"]
+                save_dict[f"{base}__ens_residual_deg"] = ens["residual_deg"]
+                save_dict[f"{base}__ens_gap_deg"] = ens["gap_deg"]
+                save_dict[f"{base}__ens_valid"] = ens["mask"]
+
             key = (shell_str, n_level)
             agg[key][0] += int(valid.sum())
             agg[key][1] += int(valid.shape[0])
@@ -206,8 +290,13 @@ def main():
 
         out_path = out_dir / f"{tag}_rrin_triplets.npz"
         np.savez(out_path, **save_dict)
-        n_combos = len(save_dict) // 8
-        print(f"{tag}: {n_combos} combinacoes (shell,nivel) salvas em {out_path}")
+        # 8 chaves por combo sem ensemble, 14 com --ensemble-m>0 (ver docstring
+        # do modulo) -- conta pelo numero de combos distintos de verdade
+        # (chave "__target"), nao por uma divisao fixa (que quebraria com o
+        # numero de campos diferente entre as duas variantes).
+        n_combos = sum(1 for k in save_dict if k.endswith("__target"))
+        print(f"{tag}: {n_combos} combinacoes (shell,nivel) salvas em {out_path}"
+              + (f" (com ensemble-m={args.ensemble_m})" if args.ensemble_m > 0 else ""))
 
     print(f"\n(require_between={require_between} -- ver --no-require-between "
           "e nota no topo do arquivo se quiser comparar)")

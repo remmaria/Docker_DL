@@ -214,6 +214,22 @@ if [[ -n "${ROI_TRACTS:-}" ]]; then
     echo "ROI_TRACTS=$ROI_TRACTS -- metricas da etapa 7 tambem restritas a esses tratos"
 fi
 
+# SUBSAMPLED_ONLY=1 (variavel de ambiente, ADITIVO): alem dos metodos de
+# reconstrucao de sempre, tambem calcula o metodo extra 'subsampled_only'
+# (ver --subsampled-only em scripts/07_downstream_dti_noddi.py) -- ajusta
+# DTI usando SO as direcoes de entrada reais (n_level), sem reconstruir
+# nada no lugar dos alvos held-out. Precisa de TRIPLETS_DIR (default
+# "$WORK_DIR/subsampling", mesmo default de slurm/02b_build_rrin_triplets.sh
+# -- passe um valor diferente se estiver testando um teto de ensemble numa
+# pasta separada, ver slurm/02b_build_rrin_triplets.sh/OUT_DIR).
+SUBSAMPLED_ONLY_FLAG=()
+if [[ "${SUBSAMPLED_ONLY:-0}" == "1" ]]; then
+    TRIPLETS_DIR="${TRIPLETS_DIR:-$WORK_DIR/subsampling}"
+    SUBSAMPLED_ONLY_FLAG=(--subsampled-only --triplets-dir "$TRIPLETS_DIR")
+    echo "SUBSAMPLED_ONLY=1 -- incluindo metodo extra 'subsampled_only' (sem reconstrucao, "
+    echo "so as direcoes de entrada reais), lendo target_idx de $TRIPLETS_DIR"
+fi
+
 python scripts/07_downstream_dti_noddi.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --baseline-dir "$WORK_DIR/baseline_recon" \
@@ -221,7 +237,8 @@ python scripts/07_downstream_dti_noddi.py \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT" \
     --out-dir "$DOWNSTREAM_DIR" \
-    $NODDI_FLAG "${ROI_FLAG[@]}" "${SUBJECTS_FLAG[@]}" "${EXTRA_METHOD_FLAGS[@]}"
+    $NODDI_FLAG "${ROI_FLAG[@]}" "${SUBJECTS_FLAG[@]}" "${EXTRA_METHOD_FLAGS[@]}" \
+    "${SUBSAMPLED_ONLY_FLAG[@]}"
 
 if [[ "${CLEANUP_AFTER:-0}" == "1" ]]; then
     if [[ -n "${RECON_TAG:-}" ]]; then

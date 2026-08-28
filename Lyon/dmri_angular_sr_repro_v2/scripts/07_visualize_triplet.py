@@ -22,6 +22,17 @@ refinamento/warping (a "hipotese nula" mais simples possivel) -- e o mapa
 de erro absoluto |alvo_real - blend_ingenuo|, para visualizar concretamente
 o quanto essa hipotese erra naquele voxel/trinca especifico.
 
+Se o `<tag>_rrin_triplets.npz` foi gerado com
+`scripts/02b_build_rrin_triplets.py --ensemble-m M` (ver protocolo secao
+14.5 item 1/addendum 2026-08-27, "ensemble em estrela", e
+utils/gradients.py:find_star_ensemble_batch/model/rrin3d_star.py), a figura
+da esfera TAMBEM desenha os ate M pares candidatos DIVERSOS do feixe
+daquela mesma trinca (arcos coloridos mais finos, alem do arco preto
+tracejado do par-unico canonico) -- util pra visualizar concretamente a
+diversidade angular que o ensemble usa pra fundir predicoes (ver
+--ensemble-m/--no-ensemble abaixo). Sem esses campos no npz (par-unico
+apenas, comportamento de sempre), a figura fica identica a antes.
+
 Selecao da trinca-exemplo (--example, default "typical"): dentre as trincas
 VALIDAS (valid=True) daquele (shell_b,n_level), escolhe a que tem
 `gap_deg` mais proximo da MEDIANA das validas ("typical" -- um caso comum,
@@ -139,7 +150,8 @@ def _write_sphere_html(out_html: Path, shell_bvecs: np.ndarray, shell_all_idx: n
                         is_input_of_shell: np.ndarray, bvec_a: np.ndarray, bvec_b: np.ndarray,
                         bvec_t: np.ndarray, idx_a: int, idx_b: int, idx_t: int, arc: np.ndarray,
                         tag: str, shell_key: float, n_level: int, ti: int, example_label: str,
-                        is_valid: bool, residual_deg: float, gap_deg: float, t_frac: float) -> None:
+                        is_valid: bool, residual_deg: float, gap_deg: float, t_frac: float,
+                        ensemble_arcs: list = None) -> None:
     """Gera uma versao HTML interativa (Plotly, rotacionavel com o mouse) da
     MESMA figura da esfera desenhada estaticamente em `main()` -- mesmos
     dados/cores/geometria, so o backend de renderizacao muda. Nao depende do
@@ -195,9 +207,16 @@ def _write_sphere_html(out_html: Path, shell_bvecs: np.ndarray, shell_all_idx: n
             "type": "scatter3d", "mode": "lines",
             "x": arc[:, 0].tolist(), "y": arc[:, 1].tolist(), "z": arc[:, 2].tolist(),
             "line": {"color": "black", "width": 5, "dash": "dash"},
-            "hoverinfo": "skip", "name": "geodésica a→b (hipótese de fluxo)",
+            "hoverinfo": "skip", "name": "geodésica a→b (par único canônico)",
         },
     ]
+    for ens_arc, ens_color, ens_a_idx, ens_b_idx in (ensemble_arcs or []):
+        traces.append({
+            "type": "scatter3d", "mode": "lines",
+            "x": ens_arc[:, 0].tolist(), "y": ens_arc[:, 1].tolist(), "z": ens_arc[:, 2].tolist(),
+            "line": {"color": ens_color, "width": 3},
+            "hoverinfo": "skip", "name": f"ensemble: par (#{ens_a_idx},#{ens_b_idx})",
+        })
     for v, vidx, color, label in [(bvec_a, idx_a, "limegreen", f"bvec_a (entrada, #{idx_a})"),
                                    (bvec_b, idx_b, "limegreen", f"bvec_b (entrada, #{idx_b})"),
                                    (bvec_t, idx_t, "crimson", f"bvec_alvo (real, #{idx_t})")]:
@@ -211,9 +230,10 @@ def _write_sphere_html(out_html: Path, shell_bvecs: np.ndarray, shell_all_idx: n
             "hoverinfo": "text", "name": label,
         })
 
+    ensemble_suffix = f" — ensemble: {len(ensemble_arcs) + 1} par(es)" if ensemble_arcs else ""
     title = (f"{tag} — shell {shell_key} — n_level={n_level}<br>"
              f"trinca #{ti} ({example_label}, valid={is_valid}) — residual={residual_deg:.1f}°, "
-             f"gap={gap_deg:.1f}°, t={t_frac:.2f}<br>"
+             f"gap={gap_deg:.1f}°, t={t_frac:.2f}{ensemble_suffix}<br>"
              f"pontos claros/translúcidos = espelho antipodal (-v, mesma direção física)")
     layout = {
         "title": {"text": title, "font": {"size": 14}},
@@ -243,6 +263,41 @@ Plotly.newPlot('plot', data, layout, {{responsive: true}});
 </html>
 """
     Path(out_html).write_text(html, encoding="utf-8")
+
+
+def _load_ensemble_pairs(trip, key: str, ti: int, max_m: int = None):
+    """Le o feixe "ensemble em estrela" (ver utils/gradients.py:
+    find_star_ensemble_batch e scripts/02b_build_rrin_triplets.py
+    --ensemble-m) da trinca `ti`, se os campos `{key}__ens_*` existirem no
+    npz -- devolve lista de (idx_a, idx_b) GLOBAIS dos pares REAIS do feixe
+    (posicoes de padding, `ens_valid=False` ou indice -1, sao descartadas),
+    ou None se o npz nao tem esses campos (par-unico apenas, sem
+    --ensemble-m -- comportamento de sempre, figura fica identica a antes).
+    `max_m` (opcional) limita quantas posicoes do feixe ler (default: todas
+    as gravadas)."""
+    ens_a_key = f"{key}__ens_pair_a"
+    if ens_a_key not in trip.files:
+        return None
+    ens_pair_a = trip[ens_a_key][ti]
+    ens_pair_b = trip[f"{key}__ens_pair_b"][ti]
+    ens_valid = trip[f"{key}__ens_valid"][ti]
+    if max_m is not None:
+        ens_pair_a = ens_pair_a[:max_m]
+        ens_pair_b = ens_pair_b[:max_m]
+        ens_valid = ens_valid[:max_m]
+    pairs = []
+    for a_idx, b_idx, ok in zip(ens_pair_a.tolist(), ens_pair_b.tolist(), ens_valid.tolist()):
+        if not ok or a_idx < 0 or b_idx < 0:
+            continue
+        pairs.append((int(a_idx), int(b_idx)))
+    return pairs
+
+
+# paleta pros arcos do feixe "ensemble em estrela" -- distinta do preto
+# tracejado do par-unico canonico e do verde-limao/carmesim dos marcadores
+# a/b/alvo, pra nao competir visualmente com eles.
+_ENSEMBLE_ARC_COLORS = ["darkorange", "mediumpurple", "teal", "goldenrod",
+                        "deeppink", "steelblue", "olive", "brown"]
 
 
 def _select_triplet(valid, gap_deg, residual_deg, example: str, triplet_index: int = None):
@@ -300,6 +355,15 @@ def main():
                           "o FOV inteiro, com mais fundo preto)")
     ap.add_argument("--elev", type=float, default=20.0, help="elevacao da vista 3D da esfera")
     ap.add_argument("--azim", type=float, default=45.0, help="azimute da vista 3D da esfera")
+    ap.add_argument("--ensemble-m", type=int, default=None,
+                     help="quantos pares do feixe 'ensemble em estrela' desenhar na esfera, se "
+                          "o npz tiver sido gerado com --ensemble-m (ver "
+                          "scripts/02b_build_rrin_triplets.py e protocolo secao 14.5 item 1). "
+                          "Default: desenha TODOS os pares gravados no feixe. Ignorado (sem "
+                          "efeito, sem erro) se o npz nao tiver esses campos.")
+    ap.add_argument("--no-ensemble", action="store_true",
+                     help="nao desenhar o feixe 'ensemble em estrela' mesmo que o npz tenha "
+                          "esses campos -- volta a mostrar so o par-unico canonico.")
     ap.add_argument("--no-html", action="store_true",
                      help="nao gerar a versao HTML interativa da esfera (rotacionavel com o "
                           "mouse, via Plotly carregado por CDN -- ver _write_sphere_html). Por "
@@ -345,6 +409,17 @@ def main():
           f"bvec_a=#{idx_a}, bvec_b=#{idx_b}, alvo=#{idx_t}, t_frac={t_frac:.3f}, "
           f"valid={is_valid}, residual_deg={residual_deg:.2f}, gap_deg={gap_deg:.2f}", flush=True)
 
+    ensemble_pairs = None
+    if not args.no_ensemble:
+        ensemble_pairs = _load_ensemble_pairs(trip, key, ti, max_m=args.ensemble_m)
+        if ensemble_pairs is None:
+            print("[info] npz sem campos '__ens_*' (rodado sem --ensemble-m em "
+                  "scripts/02b_build_rrin_triplets.py) -- mostrando so o par-unico canonico.",
+                  flush=True)
+        else:
+            print(f"[info] feixe 'ensemble em estrela': {len(ensemble_pairs)} par(es) real(is) "
+                  f"encontrados -- {ensemble_pairs}", flush=True)
+
     bvals, bvecs = load_bval_bvec(e.bval_path, e.bvec_path)
     shells = split_shells(bvals, tol=args.shell_tol)
     shell_key = _resolve_shell_key(shells, args.shell_b, args.shell_tol)
@@ -379,7 +454,67 @@ def main():
 
     arc = _slerp_arc(bvec_a, bvec_b)
     ax_sphere.plot(arc[:, 0], arc[:, 1], arc[:, 2], color="black", linewidth=2.0, linestyle="--",
-                   label="geodésica a→b (hipótese de fluxo)")
+                   label="geodésica a→b (hipótese de fluxo, par único canônico)")
+
+    # arcos extras do feixe "ensemble em estrela" (ver docstring do modulo/
+    # _load_ensemble_pairs) -- so desenhados se o npz tiver esses campos e
+    # --no-ensemble nao tiver sido passado. O 1o par do feixe e' SEMPRE
+    # identico ao par-unico canonico (ver find_star_ensemble_batch) -- pulado
+    # aqui pra nao desenhar o mesmo arco duas vezes por cima.
+    ensemble_arcs = []  # guardado pra reusar no HTML interativo, abaixo
+    if ensemble_pairs:
+        n_extra_drawn = 0
+        for ens_a_idx, ens_b_idx in ensemble_pairs:
+            if {ens_a_idx, ens_b_idx} == {idx_a, idx_b}:
+                continue  # e' o proprio par canonico -- ja desenhado acima
+            # Fixar o sinal de ens_bvec_a em relacao ao ALVO DESENHADO
+            # (bvec_t), NAO em relacao ao bvec_a do par canonico -- bug
+            # encontrado em 2026-08-27 (ver addendum secao 13). Cada par do
+            # feixe tem sua PROPRIA convencao interna de sinal em
+            # find_star_ensemble_batch (a_pairs = U[iu] cru, b e o alvo
+            # fixados em relacao a ESSE "a" especifico -- nao ao "a" do par
+            # canonico nem a nenhuma referencia global). Fixar contra
+            # bvec_a_canonico (ou deixar a cru, sem fixar nada) escolhe uma
+            # das duas representantes antipodais de ens_a_idx de forma
+            # ARBITRARIA em relacao ao alvo -- quando calha de ser a
+            # representante "errada", o par (a,b) inteiro fica flipado
+            # (b tambem flipa em cascata, ver _fix_sign abaixo), o que
+            # desloca o arco desenhado para o segmento DIAMETRALMENTE OPOSTO
+            # do MESMO circulo maximo (o plano nao muda, so o segmento
+            # visivel muda de lado) -- exatamente o padrao visual reportado
+            # ("arcos que nao passam pelo alvo"): o arco acaba perto do
+            # espelho antipodal do alvo (o ponto translucido), nao do alvo
+            # opaco desenhado.
+            #
+            # Fixar contra bvec_t (o alvo ja desenhado, computado 3 linhas
+            # acima) resolve isso: garante por construcao que a
+            # representante do alvo "local" a este par (recomputada com a
+            # mesma formula de sinal usada aqui) e EXATAMENTE bvec_t --
+            # entao, sempre que este par estiver marcado 'between=True' no
+            # npz (0<=t_frac<=1 na convencao interna de
+            # find_star_ensemble_batch), o arco desenhado passa
+            # geometricamente perto do bvec_t desenhado, a uma distancia
+            # ditada so por residual_deg (residuo perpendicular ao plano) --
+            # verificado numericamente em ~8000 casos sinteticos, distancia
+            # arco-alvo sempre dentro de 0.002 do limite teorico
+            # 2*sin(residual_deg/2), contra ate 1.8 (essencialmente
+            # arbitrario) fixando contra bvec_a_canonico. So afeta esta
+            # visualizacao -- a selecao real em find_star_ensemble_batch ja
+            # usa a convencao de sinal correta por par internamente, entao
+            # os .npz/treinos nao sao afetados por este bug.
+            ens_bvec_a = _fix_sign(bvec_t, bvecs[ens_a_idx])
+            ens_bvec_b = _fix_sign(ens_bvec_a, bvecs[ens_b_idx])
+            ens_arc = _slerp_arc(ens_bvec_a, ens_bvec_b)
+            color = _ENSEMBLE_ARC_COLORS[n_extra_drawn % len(_ENSEMBLE_ARC_COLORS)]
+            ax_sphere.plot(ens_arc[:, 0], ens_arc[:, 1], ens_arc[:, 2], color=color,
+                           linewidth=1.4, linestyle="-", alpha=0.85,
+                           label=f"ensemble: par (#{ens_a_idx},#{ens_b_idx})")
+            ensemble_arcs.append((ens_arc, color, ens_a_idx, ens_b_idx))
+            n_extra_drawn += 1
+        if n_extra_drawn == 0:
+            print("[info] feixe do ensemble nao tem nenhum par ALEM do canonico pra desenhar "
+                  "(so 1 par real disponivel para esta trinca).", flush=True)
+
     for v, color, label in [(bvec_a, "limegreen", "bvec_a (entrada)"),
                              (bvec_b, "limegreen", "bvec_b (entrada)"),
                              (bvec_t, "crimson", "bvec_alvo (real)")]:
@@ -392,10 +527,12 @@ def main():
 
     ax_sphere.set_box_aspect((1, 1, 1))
     ax_sphere.view_init(elev=args.elev, azim=args.azim)
+    ensemble_suffix = f" — ensemble: {len(ensemble_pairs)} par(es)" if ensemble_pairs else ""
     ax_sphere.set_title(
         f"{tag} — shell {shell_key} — n_level={args.n_level}\n"
         f"trinca #{ti} ({args.example if args.triplet_index is None else 'manual'}, "
-        f"valid={is_valid}) — residual={residual_deg:.1f}°, gap={gap_deg:.1f}°, t={t_frac:.2f}\n"
+        f"valid={is_valid}) — residual={residual_deg:.1f}°, gap={gap_deg:.1f}°, t={t_frac:.2f}"
+        f"{ensemble_suffix}\n"
         f"pontos claros/translúcidos = espelho antipodal (-v, mesma direção física)",
         fontsize=10)
     ax_sphere.legend(loc="upper left", fontsize=8, framealpha=0.9)
@@ -482,7 +619,8 @@ def main():
         _write_sphere_html(html_path, shell_bvecs, shell_all_idx, is_input_of_shell,
                             bvec_a, bvec_b, bvec_t, idx_a, idx_b, idx_t, arc,
                             tag, shell_key, args.n_level, ti, example_label,
-                            is_valid, residual_deg, gap_deg, t_frac)
+                            is_valid, residual_deg, gap_deg, t_frac,
+                            ensemble_arcs=ensemble_arcs)
         print(f"[ok] esfera interativa (HTML, abra no navegador) salva em: {html_path}")
 
 

@@ -36,7 +36,7 @@ class RRINTripletDataset(Dataset):
                  patch_size: int = 10, training: bool = False, only_valid: bool = True,
                  mask_suffix: str = "_mask3d.nii.gz", shell_tol: float = 100.0,
                  seed: int = 0, max_cached_subjects: int = 2,
-                 min_tile_coverage: float = 0.0, sh_q_out: int = 0):
+                 min_tile_coverage: float = 0.0, sh_q_out: int = 0, ensemble_m: int = 0):
         """
         only_valid: quando True (default), so usa trincas com `valid=True`
             (residuo de colinearidade dentro do teto usado em
@@ -62,6 +62,27 @@ class RRINTripletDataset(Dataset):
             restante marcado invalido em "sh_mask" (compute_sh_angular_loss
             ja sabe ignorar posicoes invalidas, mesmo mecanismo do padding
             de collate_variable_targets no RCAE).
+
+        ensemble_m: (default 0 = desligado, comportamento identico a antes)
+            quando > 0, cada item TAMBEM devolve um feixe de ate
+            `ensemble_m` pares de entrada DIVERSOS para a MESMA
+            direcao-alvo do item principal -- nao um feixe de trincas
+            diferentes, como sh_q_out (ver acima), mas MULTIPLOS PARES
+            candidatos pra UM SO alvo (ver protocolo secao 14.5 item 1/
+            addendum 2026-08-27, "ensemble em estrela", e
+            utils/gradients.py:find_star_ensemble_batch/
+            model/rrin3d_star.py:RRIN3DStar, que funde as M predicoes por
+            um softmax aprendido). Exige que o `<tag>_rrin_triplets.npz`
+            tenha sido gerado com `scripts/02b_build_rrin_triplets.py
+            --ensemble-m <M>` (M pode ser >= ensemble_m; usamos so os
+            primeiros `ensemble_m` slots do feixe gravado) -- levanta
+            RuntimeError cedo e com mensagem clara se os campos `ens_*`
+            nao existirem no npz, em vez de KeyError confuso mais tarde
+            dentro do DataLoader. Um sujeito pode ter menos de
+            `ensemble_m` pares REAIS disponiveis para um dado alvo (a
+            mascara `ens_valid` gravada por 02b ja marca isso) -- as
+            posicoes sem par real ficam zeradas e `ensemble_mask=False`,
+            mesmo mecanismo de padding de sh_mask/target_mask.
         """
         self.entries = entries
         self.triplets_dir = Path(triplets_dir)
@@ -75,6 +96,7 @@ class RRINTripletDataset(Dataset):
         self.min_tile_coverage = min_tile_coverage
         self.max_cached_subjects = max_cached_subjects
         self.sh_q_out = sh_q_out
+        self.ensemble_m = ensemble_m
         self._cache: "OrderedDict[str, dict]" = OrderedDict()
         self.seed = seed
         self._rng = np.random.default_rng(seed)
@@ -89,6 +111,13 @@ class RRINTripletDataset(Dataset):
             trip = np.load(trip_path)
             if f"{key}__target" not in trip.files:
                 continue
+            if ensemble_m > 0 and f"{key}__ens_pair_a" not in trip.files:
+                raise RuntimeError(
+                    f"ensemble_m={ensemble_m} pedido, mas {trip_path} nao tem os campos "
+                    f"'{key}__ens_pair_a' etc. -- rode scripts/02b_build_rrin_triplets.py de "
+                    f"novo com --ensemble-m >= {ensemble_m} (aditivo, nao precisa apagar nada "
+                    f"do que ja existe, so acrescenta os campos '__ens_*' novos)."
+                )
             valid = trip[f"{key}__valid"]
             if only_valid and not valid.any():
                 continue
@@ -156,6 +185,20 @@ class RRINTripletDataset(Dataset):
         residual_deg = trip[f"{key}__residual_deg"]
         gap_deg = trip[f"{key}__gap_deg"]
         valid = trip[f"{key}__valid"]
+
+        ens_pair_a = ens_pair_b = ens_t_frac = ens_residual_deg = ens_gap_deg = ens_valid = None
+        if self.ensemble_m > 0:
+            # ADITIVO -- so le/filtra estes campos se ensemble_m>0 (ver
+            # __init__, ja confirmou que existem). Slots alem de ensemble_m
+            # no npz (se M gravado por 02b > ensemble_m pedido aqui) sao
+            # simplesmente ignorados.
+            ens_pair_a = trip[f"{key}__ens_pair_a"][:, : self.ensemble_m]
+            ens_pair_b = trip[f"{key}__ens_pair_b"][:, : self.ensemble_m]
+            ens_t_frac = trip[f"{key}__ens_t_frac"][:, : self.ensemble_m]
+            ens_residual_deg = trip[f"{key}__ens_residual_deg"][:, : self.ensemble_m]
+            ens_gap_deg = trip[f"{key}__ens_gap_deg"][:, : self.ensemble_m]
+            ens_valid = trip[f"{key}__ens_valid"][:, : self.ensemble_m]
+
         if self.only_valid:
             keep = valid
             target_idx = target_idx[keep]
@@ -164,6 +207,13 @@ class RRINTripletDataset(Dataset):
             t_frac = t_frac[keep]
             residual_deg = residual_deg[keep]
             gap_deg = gap_deg[keep]
+            if self.ensemble_m > 0:
+                ens_pair_a = ens_pair_a[keep]
+                ens_pair_b = ens_pair_b[keep]
+                ens_t_frac = ens_t_frac[keep]
+                ens_residual_deg = ens_residual_deg[keep]
+                ens_gap_deg = ens_gap_deg[keep]
+                ens_valid = ens_valid[keep]
             valid = valid[keep]
 
         cached = {
@@ -178,6 +228,12 @@ class RRINTripletDataset(Dataset):
             "residual_deg": residual_deg,
             "gap_deg": gap_deg,
             "valid": valid,
+            "ens_pair_a": ens_pair_a,
+            "ens_pair_b": ens_pair_b,
+            "ens_t_frac": ens_t_frac,
+            "ens_residual_deg": ens_residual_deg,
+            "ens_gap_deg": ens_gap_deg,
+            "ens_valid": ens_valid,
         }
         self._cache[tag] = cached
         while len(self._cache) > self.max_cached_subjects:
@@ -225,6 +281,60 @@ class RRINTripletDataset(Dataset):
             "bvec_t": d["bvecs"][t_idx], "t_frac": t_frac, "quality": quality,
         }
 
+    def _ensemble_tensors(self, d, k, ox, oy, oz, mask_patch, xmax):
+        """Extrai o feixe "em estrela" de ate `self.ensemble_m` pares de
+        entrada DIVERSOS para a MESMA direcao-alvo da trinca `k` (ver
+        __init__/ensemble_m e protocolo secao 14.5 item 1/addendum
+        2026-08-27) -- ao contrario de _triplet_tensors (que extrai UM par),
+        aqui vol_a/vol_b/bvec_a/bvec_b variam entre as M posicoes do feixe,
+        mas o alvo (target/bvec_t) e o MESMO em todas (e' o mesmo alvo,
+        varios pares candidatos pra prever ELE). Posicoes de padding (sem
+        par real disponivel -- ver ens_valid) ficam com tensores zerados e
+        `ensemble_mask[slot]=False`, mesmo mecanismo do sh_mask/target_mask
+        ja usados no resto do modulo."""
+        M = self.ensemble_m
+        t_idx = int(d["target_idx"][k])
+        ps = self.patch_size
+        vol_a_ens = np.zeros((M, 1, ps, ps, ps), dtype=np.float32)
+        vol_b_ens = np.zeros((M, 1, ps, ps, ps), dtype=np.float32)
+        bvec_a_ens = np.zeros((M, 3), dtype=np.float32)
+        bvec_b_ens = np.zeros((M, 3), dtype=np.float32)
+        bvec_t_ens = np.zeros((M, 3), dtype=np.float32)
+        t_frac_ens = np.zeros((M,), dtype=np.float32)
+        quality_ens = np.zeros((M, 2), dtype=np.float32)
+        ensemble_mask = np.zeros((M,), dtype=bool)
+
+        bvec_t = d["bvecs"][t_idx]
+        # NAO reextraimos o volume-alvo aqui -- e' o MESMO alvo do item
+        # principal ("target", ja calculado por _triplet_tensors em
+        # __getitem__), reextrair so duplicaria IO/memoria a toa.
+
+        for slot in range(M):
+            if not bool(d["ens_valid"][k, slot]):
+                continue  # padding -- ja zerado/False acima
+            a_idx = int(d["ens_pair_a"][k, slot])
+            b_idx = int(d["ens_pair_b"][k, slot])
+            if a_idx < 0 or b_idx < 0:
+                continue  # defensivo -- ens_valid ja deveria cobrir isso
+            vol_a_patch = (self._extract(d["dwi"][..., [a_idx]], ox, oy, oz) / xmax) * mask_patch
+            vol_b_patch = (self._extract(d["dwi"][..., [b_idx]], ox, oy, oz) / xmax) * mask_patch
+            vol_a_ens[slot] = np.moveaxis(vol_a_patch, -1, 0).astype(np.float32)
+            vol_b_ens[slot] = np.moveaxis(vol_b_patch, -1, 0).astype(np.float32)
+            bvec_a_ens[slot] = d["bvecs"][a_idx]
+            bvec_b_ens[slot] = d["bvecs"][b_idx]
+            bvec_t_ens[slot] = bvec_t
+            t_frac_ens[slot] = float(d["ens_t_frac"][k, slot])
+            quality_ens[slot] = [d["ens_residual_deg"][k, slot] / 90.0,
+                                  d["ens_gap_deg"][k, slot] / 90.0]
+            ensemble_mask[slot] = True
+
+        return {
+            "vol_a_ens": vol_a_ens, "vol_b_ens": vol_b_ens,
+            "bvec_a_ens": bvec_a_ens, "bvec_b_ens": bvec_b_ens, "bvec_t_ens": bvec_t_ens,
+            "t_frac_ens": t_frac_ens, "quality_ens": quality_ens,
+            "ensemble_mask": ensemble_mask,
+        }
+
     def __getitem__(self, idx):
         si, (ox, oy, oz) = self.tile_index[idx]
         entry, tag = self.usable[si]
@@ -257,6 +367,22 @@ class RRINTripletDataset(Dataset):
             "quality": torch.from_numpy(main["quality"]),
             "subject_tag": tag,
         }
+
+        if self.ensemble_m > 0:
+            ens = self._ensemble_tensors(d, k, ox, oy, oz, mask_patch, xmax)
+            item.update({
+                "vol_a_ens": torch.from_numpy(ens["vol_a_ens"]),
+                "vol_b_ens": torch.from_numpy(ens["vol_b_ens"]),
+                "bvec_a_ens": torch.from_numpy(ens["bvec_a_ens"]),
+                "bvec_b_ens": torch.from_numpy(ens["bvec_b_ens"]),
+                "bvec_t_ens": torch.from_numpy(ens["bvec_t_ens"]),
+                "t_frac_ens": torch.from_numpy(ens["t_frac_ens"]),
+                "quality_ens": torch.from_numpy(ens["quality_ens"]),
+                "ensemble_mask": torch.from_numpy(ens["ensemble_mask"]),
+            })
+            # o alvo do feixe e' o MESMO "target"/"bvec_t" do item principal
+            # (main, acima) -- ver docstring de _ensemble_tensors -- entao
+            # nao ha um "target_ens" separado no item.
 
         if self.sh_q_out > 0:
             K = self.sh_q_out

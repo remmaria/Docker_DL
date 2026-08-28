@@ -25,6 +25,13 @@ triplets, ver protocolo secao 10.1/10.2) via --extra-method NOME=CAMINHO,
 repetivel -- mesma convencao de 06_evaluate_reconstruction.py, ex.:
     --extra-method rrin=work_dir/rrin_recon
 
+--subsampled-only (ADITIVO, requer --triplets-dir): alem dos metodos de
+reconstrucao acima, tambem ajusta um metodo extra 'subsampled_only' que
+NAO reconstroi nada -- so usa as direcoes de ENTRADA reais (exclui os
+alvos held-out do ajuste de DTI em vez de substitui-los por uma predicao).
+Serve de piso honesto: quanto RRIN/baseline_sh/etc. estao de fato
+adicionando sobre so ter menos direcoes cruas, sem reconstrucao nenhuma.
+
 DTI usa DIPY (obrigatorio). NODDI usa AMICO (opcional; se nao instalado, a
 etapa e pulada com aviso, o resto do script continua normalmente).
 """
@@ -35,11 +42,36 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# evita que o resumo impresso no log corte colunas com "..." (a tabela por
+# ROI x metodo pode ficar larga, especialmente com subsampled_only somado)
+# -- so afeta a IMPRESSAO, o CSV salvo nunca foi truncado.
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 200)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.manifest import load_manifest
 from utils.gradients import load_dwi, load_bval_bvec, split_shells
 from utils.masking import load_or_build_mask, load_roi_masks, JHU_TRACT_LABELS
+from utils.metrics import signal_bias, residual_std, r2_score_per_voxel
+
+
+def _roi_r2(pred_1d: np.ndarray, target_1d: np.ndarray) -> float:
+    """R^2 (fracao da variancia ESPACIAL explicada) de um mapa escalar
+    (FA/MD/AD/RD/NDI/ODI/ISOVF) dentro de uma ROI -- mesma ideia de
+    r2_score_per_voxel (utils/metrics.py), so que aqui a "populacao" e' o
+    conjunto de VOXELS da ROI (nao as direcoes held-out de um voxel:
+    aqui so existe 1 valor escalar por voxel, entao a variacao que
+    importa e' a variacao espacial DENTRO da ROI). R^2=1: o mapa
+    reconstruido acompanha exatamente a heterogeneidade real do tecido
+    naquela ROI; R^2=0: empata com so prever a MEDIA do FA/MD/etc. real da
+    ROI inteira (nenhuma heterogeneidade espacial recuperada, so um valor
+    "tipico" plausivel); R^2<0: pior que essa media. Reaproveita
+    r2_score_per_voxel tratando a ROI inteira como um "voxel" com N
+    "direcoes" (os N voxels da ROI ao longo do eixo -1)."""
+    if pred_1d.size < 2:
+        return float("nan")
+    return float(r2_score_per_voxel(pred_1d[np.newaxis, :], target_1d[np.newaxis, :])[0])
 
 
 def build_full_volume(gt_data, target_idx, recon_dir, tag, shell_b, n_level):
@@ -58,10 +90,19 @@ def build_full_volume(gt_data, target_idx, recon_dir, tag, shell_b, n_level):
     return out
 
 
-def fit_dti(data, bvals, bvecs, shell_b, mask, shell_tol=100.0):
+def fit_dti(data, bvals, bvecs, shell_b, mask, shell_tol=100.0, exclude_idx=None):
     """Ajusta DTI usando apenas b0s + a shell indicada (comportamento
     padrao de DTI classico, que nao deve misturar shells de b muito
     diferentes sem um modelo multi-shell dedicado).
+
+    `exclude_idx` (ADITIVO, default None = comportamento de sempre): se
+    passado, remove esses indices do conjunto de direcoes usadas no ajuste
+    -- usado pelo modo `--subsampled-only` (ver main()) pra simular "e se eu
+    so tivesse medido as direcoes de ENTRADA (n_level), sem reconstruir
+    nada": em vez de substituir os alvos held-out por uma predicao
+    (`build_full_volume`), simplesmente FICA SEM eles no ajuste de DTI --
+    um piso honesto de comparacao (dado real, so que com menos direcoes),
+    sem depender de nenhum metodo de reconstrucao.
     """
     import dipy.reconst.dti as dti
     from dipy.core.gradients import gradient_table
@@ -69,6 +110,8 @@ def fit_dti(data, bvals, bvecs, shell_b, mask, shell_tol=100.0):
     shells = split_shells(bvals, tol=shell_tol)
     idx = np.concatenate([shells[0], shells[shell_b]])
     idx.sort()
+    if exclude_idx is not None:
+        idx = np.setdiff1d(idx, np.asarray(exclude_idx), assume_unique=False)
     gtab = gradient_table(bvals[idx], bvecs[idx])
     model = dti.TensorModel(gtab)
     fit = model.fit(data[..., idx], mask=mask)
@@ -154,6 +197,21 @@ def main():
                           "e calculada (comportamento antigo, inalterado).")
     ap.add_argument("--mask-suffix", default="_mask3d.nii.gz")
     ap.add_argument("--shell-tol", type=float, default=100.0)
+    ap.add_argument("--subsampled-only", action="store_true",
+                     help="ADITIVO: alem dos metodos de reconstrucao passados (se houver), "
+                          "TAMBEM calcula um metodo extra 'subsampled_only' que NAO reconstroi "
+                          "nada -- ajusta DTI usando so as direcoes de ENTRADA reais (n_level), "
+                          "sem nenhuma predicao no lugar dos alvos held-out (ver `exclude_idx` "
+                          "em fit_dti()). Serve de piso honesto: mostra o quanto a "
+                          "reconstrucao (baseline_sh/RRIN/etc.) esta de fato ajudando em cima "
+                          "de so usar menos direcoes cruas, sem enfeite nenhum. Requer "
+                          "--triplets-dir (pra saber quais indices sao os alvos held-out). "
+                          "NAO calcula NODDI para esse metodo nesta primeira versao (TODO).")
+    ap.add_argument("--triplets-dir", default=None,
+                     help="pasta com os <tag>_rrin_triplets.npz da etapa 2b -- so precisa ser "
+                          "passado quando --subsampled-only estiver ligado (usado so pra achar "
+                          "o target_idx held-out; nao precisa bater com nenhum --baseline-dir/"
+                          "--extra-method, e' so metadado geometrico).")
     ap.add_argument("--shard-index", type=int, default=0,
                      help="ver mesmo flag em 06_evaluate_reconstruction.py -- paraleliza por "
                           "SUJEITO dentro do mesmo combo shell/n_level em vez de rodar todos "
@@ -182,8 +240,13 @@ def main():
             sys.exit(f"--extra-method invalido: {spec!r} (NOME e CAMINHO nao podem ser vazios)")
         extra_methods.append((name, path))
 
-    if args.baseline_dir is None and args.rcae_dir is None and not extra_methods:
-        sys.exit("Passe pelo menos --baseline-dir, --rcae-dir ou --extra-method")
+    if (args.baseline_dir is None and args.rcae_dir is None and not extra_methods
+            and not args.subsampled_only):
+        sys.exit("Passe pelo menos --baseline-dir, --rcae-dir, --extra-method ou "
+                  "--subsampled-only")
+    if args.subsampled_only and args.triplets_dir is None:
+        sys.exit("--subsampled-only precisa de --triplets-dir (pra achar o target_idx "
+                  "held-out sem depender de nenhuma reconstrucao).")
     if not (0 <= args.shard_index < max(args.shard_count, 1)):
         sys.exit(f"--shard-index ({args.shard_index}) fora do intervalo [0, {args.shard_count})")
     roi_tracts = [t.strip() for t in args.roi_tracts.split(",") if t.strip()] if args.roi_tracts else []
@@ -244,6 +307,26 @@ def main():
         for method, vol in variants.items():
             dti_maps[method] = fit_dti(vol, bvals, bvecs, args.shell_b, mask, shell_tol=args.shell_tol)
 
+        if args.subsampled_only:
+            trip_path = Path(args.triplets_dir) / f"{tag}_rrin_triplets.npz"
+            trip_key = f"{args.shell_b}__{args.n_level}__target"
+            if not trip_path.exists():
+                print(f"[aviso] {tag}: sem {trip_path.name}, pulando --subsampled-only "
+                      f"para este sujeito")
+            else:
+                trip = np.load(trip_path)
+                if trip_key not in trip.files:
+                    print(f"[aviso] {tag}: sem trincas para shell={args.shell_b} "
+                          f"n={args.n_level}, pulando --subsampled-only")
+                else:
+                    target_idx_sub = trip[trip_key]
+                    # NAO entra em `variants` (nao e' um volume completo reconstruido) --
+                    # so em dti_maps direto, ajustando com MENOS direcoes reais (as
+                    # held-out simplesmente ficam de fora do gtab/model.fit).
+                    dti_maps["subsampled_only"] = fit_dti(
+                        gt_data, bvals, bvecs, args.shell_b, mask,
+                        shell_tol=args.shell_tol, exclude_idx=target_idx_sub)
+
         noddi_maps = {}
         if args.run_noddi:
             if not e.is_multishell:
@@ -259,25 +342,41 @@ def main():
         for roi_name, roi_mask in rois.items():
             m = roi_mask
             n_vox = int(m.sum())
-            for method in variants:
+            for method in dti_maps:
                 if method == "ground_truth":
                     continue
                 row = {"subject": e.subject, "method": method, "shell": args.shell_b,
                        "n_level": args.n_level, "roi": roi_name, "n_voxels": n_vox,
                        "acquisition_context": "from_multishell" if e.is_multishell else "native_single_shell"}
                 for metric in ("FA", "MD", "AD", "RD"):
-                    diff = dti_maps[method][metric][m] - gt_dti[metric][m]
+                    pred_vals, gt_vals = dti_maps[method][metric][m], gt_dti[metric][m]
+                    diff = pred_vals - gt_vals
                     row[f"{metric}_mae"] = float(np.nanmean(np.abs(diff)))
                     # correlacao pixel-a-pixel exige pelo menos 2 voxels validos
                     # (ROIs pequenas de trato podem ter poucos voxels)
-                    row[f"{metric}_corr"] = float(np.corrcoef(
-                        dti_maps[method][metric][m], gt_dti[metric][m])[0, 1]) if n_vox >= 2 else np.nan
+                    row[f"{metric}_corr"] = float(np.corrcoef(pred_vals, gt_vals)[0, 1]) if n_vox >= 2 else np.nan
+                    # bias/resid_std/r2: mesma decomposicao vies-vs-variancia e
+                    # R^2 do dominio de sinal (06_evaluate_reconstruction.py),
+                    # aqui aplicada ao mapa escalar dentro da ROI -- ver
+                    # _r2_1d/utils.metrics.signal_bias/residual_std. Reponde
+                    # "o mapa reconstruido acompanha a heterogeneidade
+                    # espacial REAL do tecido nessa ROI, ou so fica perto de
+                    # um FA/MD/etc. 'tipico' (media), sem estrutura interna
+                    # genuina?" -- direto relevante pro achado de
+                    # subsampled_only vs. baseline_sh/reconstrucoes em FA_mae.
+                    row[f"{metric}_bias"] = signal_bias(pred_vals, gt_vals)
+                    row[f"{metric}_resid_std"] = residual_std(pred_vals, gt_vals)
+                    row[f"{metric}_r2"] = _roi_r2(pred_vals, gt_vals)
                 if args.run_noddi and noddi_maps.get(method) and noddi_maps.get("ground_truth"):
                     for metric in ("NDI", "ODI", "ISOVF"):
-                        diff = noddi_maps[method][metric][m] - noddi_maps["ground_truth"][metric][m]
+                        pred_vals = noddi_maps[method][metric][m]
+                        gt_vals = noddi_maps["ground_truth"][metric][m]
+                        diff = pred_vals - gt_vals
                         row[f"{metric}_mae"] = float(np.nanmean(np.abs(diff)))
-                        row[f"{metric}_corr"] = float(np.corrcoef(
-                            noddi_maps[method][metric][m], noddi_maps["ground_truth"][metric][m])[0, 1]) if n_vox >= 2 else np.nan
+                        row[f"{metric}_corr"] = float(np.corrcoef(pred_vals, gt_vals)[0, 1]) if n_vox >= 2 else np.nan
+                        row[f"{metric}_bias"] = signal_bias(pred_vals, gt_vals)
+                        row[f"{metric}_resid_std"] = residual_std(pred_vals, gt_vals)
+                        row[f"{metric}_r2"] = _roi_r2(pred_vals, gt_vals)
                 rows.append(row)
 
         # salva os mapas DTI do sujeito (todas as variantes) para inspecao visual
@@ -289,7 +388,7 @@ def main():
                 nib.save(nib.Nifti1Image(arr.astype(np.float32), affine),
                           maps_dir / f"{method}_{metric}.nii.gz")
 
-        print(f"{tag}: DTI ajustado para {list(variants.keys())}; ROIs avaliadas: "
+        print(f"{tag}: DTI ajustado para {list(dti_maps.keys())}; ROIs avaliadas: "
               f"{list(rois.keys())}")
 
     out_csv = out_dir / f"dti_noddi_metrics_shell{int(args.shell_b)}_n{args.n_level}.csv"
@@ -317,6 +416,18 @@ def main():
     df.to_csv(out_csv, index=False)
     print("Metricas downstream salvas em", out_csv)
     print(df.groupby(["roi", "method"])[[c for c in df.columns if c.endswith("_mae")]].mean())
+
+    r2_cols = [c for c in df.columns if c.endswith("_r2")]
+    if r2_cols:
+        print("\nR^2 espacial por ROI (o mapa reconstruido acompanha a heterogeneidade "
+              "real do tecido, ou so fica perto de um valor 'tipico'/medio da ROI?):")
+        print(df.groupby(["roi", "method"])[r2_cols].mean())
+        print("\nLeitura: R^2 proximo de 1 = mapa reconstruido recupera a variacao "
+              "espacial real de FA/MD/etc. dentro da ROI. R^2 proximo de 0 = empata com "
+              "so prever a media do ground truth naquela ROI (nenhuma heterogeneidade "
+              "recuperada). R^2 negativo = pior que essa media -- MAE baixo NAO garante "
+              "R^2 alto (um metodo pode ter MAE pequeno so por o FA real variar pouco "
+              "dentro da ROI, sem de fato acompanhar onde a variacao real acontece).")
 
 
 if __name__ == "__main__":

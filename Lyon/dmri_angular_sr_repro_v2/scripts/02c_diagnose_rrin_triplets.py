@@ -30,6 +30,16 @@ fracao "colinear mas extrapolando" (residuo <= teto porem between=False)
 -- util pra ver o quanto a exigencia de betweenness custou em relacao a
 so exigir colinearidade.
 
+Se o npz tiver sido gerado com `--ensemble-m` (ver
+scripts/02b_build_rrin_triplets.py e addendum 2026-08-27 secao 13,
+"ensemble em estrela"), este script TAMBEM reporta a distribuicao do
+TAMANHO DO POOL do feixe por alvo (quantas posicoes de
+`{base}__ens_valid` sao True) -- util pra decidir se
+`--ensemble-max-residual-deg` precisa ser mais frouxo que
+`--max-residual-deg`: se a maioria dos alvos tiver pool de tamanho 1,
+o "ensemble" colapsa pra M=1 na pratica (nao ha o que diversificar),
+mesmo que --ensemble-m tenha pedido mais.
+
 `gap_deg`/`t_frac` continuam reportados so para os alvos VALIDOS (ja
 existentes no calculo anterior) -- mede se o par escolhido, alem de
 colinear o suficiente, tambem esta perto o suficiente pra parecer
@@ -75,7 +85,9 @@ def main():
 
     agg = defaultdict(lambda: {"residual_all": [], "gap_valid": [], "t_frac_valid": [],
                                 "n_invalid": 0, "n_total": 0,
-                                "n_between": 0, "has_between_field": False})
+                                "n_between": 0, "has_between_field": False,
+                                "ens_pool_sizes": [], "ensemble_m": None,
+                                "has_ensemble_field": False})
 
     for e in entries:
         tag = e.subject if not e.session else f"{e.subject}_{e.session}"
@@ -100,6 +112,13 @@ def main():
             if between_key in trip.files:
                 d["has_between_field"] = True
                 d["n_between"] += int(trip[between_key].sum())
+
+            ens_valid_key = f"{base}__ens_valid"
+            if ens_valid_key in trip.files:
+                ens_valid = trip[ens_valid_key]  # (n_alvos, M)
+                d["has_ensemble_field"] = True
+                d["ensemble_m"] = ens_valid.shape[1]
+                d["ens_pool_sizes"].extend(ens_valid.sum(axis=1).tolist())
 
     if not agg:
         sys.exit("Nenhum <tag>_rrin_triplets.npz encontrado -- rode 02b primeiro")
@@ -156,6 +175,29 @@ def main():
               "'valid' (2a tabela acima) desde que 02b tenha rodado com "
               "require_between=True (default) -- 'valid' aqui ja exige as duas condicoes "
               "(colinear E between), nao so colinear.")
+
+    if any(d["has_ensemble_field"] for d in agg.values()):
+        print("\n=== tamanho do pool do 'ensemble em estrela' por alvo (--ensemble-m, ver "
+              "addendum 2026-08-27 secao 13) -- quantas posicoes de ens_valid sao True ===")
+        print(f"{'shell':>10s} {'n_level':>7s} {'M pedido':>9s} {'n_alvos':>8s} "
+              f"{'pool=1':>9s} {'pool=M':>9s} {'media':>7s}")
+        for (shell_str, n_level) in sorted(agg.keys()):
+            d = agg[(shell_str, n_level)]
+            if not d["has_ensemble_field"]:
+                continue
+            sizes = np.asarray(d["ens_pool_sizes"])
+            m = d["ensemble_m"]
+            n_pool1 = int((sizes == 1).sum())
+            n_poolM = int((sizes == m).sum())
+            print(f"{shell_str:>10s} {n_level:>7d} {m:>9d} {sizes.size:>8d} "
+                  f"{n_pool1:>5d} ({n_pool1/sizes.size:.0%}) "
+                  f"{n_poolM:>5d} ({n_poolM/sizes.size:.0%}) {sizes.mean():>7.2f}")
+        print("\n'pool=1' alto significa que o feixe colapsa pra M=1 na pratica pra a maioria "
+              "dos alvos (o pool aceitavel -- residual_deg<=teto E, se ligado, between -- so "
+              "tem 1 membro, nao ha o que diversificar via farthest_point_sampling). Se isso "
+              "estiver acontecendo e voce quiser um ensemble de verdade, regere o npz com "
+              "--ensemble-max-residual-deg mais frouxo que --max-residual-deg (afeta so o pool "
+              "do feixe, preserva o par unico -- ver scripts/02b_build_rrin_triplets.py).")
 
     print("\nLeitura: residual_deg (1a tabela) e a distancia angular PERPENDICULAR real "
           "do alvo ate o plano da circunferencia que passa pelo melhor par disponivel -- "

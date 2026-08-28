@@ -1,5 +1,15 @@
 
 
+sbatch 05g_reconstruct_naive_blend.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+ENSEMBLE_M=3 SUBJECT=20170417094841_802780_20170417094841_802780 sbatch 07b_visualize_triplet.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+ENSEMBLE_M=3 SUBJECT=20170417094841_802780_20170417094841_802780 EXAMPLE=worst sbatch 07b_visualize_triplet.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+SUBJECT=20170417094841_802780_20170417094841_802780 EXAMPLE=typical \
+  sbatch 07c_check_ensemble_between.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
 sbatch 01_prepare_data.sh /ix1/tibrahim/rmm270/DATA/DWIs/studies/all_bias /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir -> manidest.csv
 sbatch 02_baseline_sh.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir -> subsampling 857 (all) (scheme.npz)
 sbatch --array=1-37 02b_baseline_reconstruct.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir -> baseline_recon 129 (test)
@@ -104,7 +114,13 @@ MAX_RESIDUAL_DEG=5 sbatch 02b_build_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker
 
 
 #------------02c_diagnose_rrin_triplets.sh
-sbatch 02c_diagnose_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh
+sbatch 02c_diagnose_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
+
+OUT_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_test ENSEMBLE_M=3 ENSEMBLE_MAX_RESIDUAL_DEG=10 \
+  sbatch 02b_build_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
+
+TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_test sbatch 02c_diagnose_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
+
 
 
 #------------03_train_rcae.sh
@@ -152,13 +168,62 @@ LR=1e-3 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon
 USE_QUALITY_COND=1 LR=1e-3 NO_RESUME=1 sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir_sh 1000 10
 
 
+ENSEMBLE_M=3 sbatch 02b_build_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
+
+ENSEMBLE_M=3 ONLY_VALID=1 NO_RESUME=1 sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+ENSEMBLE_M=3 sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
 #------------04c_train_amt.sh
 NO_RESUME=1 sbatch 04c_train_amt.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+#------------05d_reconstruct_amt.sh
+
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/amt_checkpoints/shell1000_n16/runs/3579035_0/best.pt RECON_TAG=amt_n16 \
+  sbatch 05d_reconstruct_amt.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+EXTRA_METHOD="amt_n16=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/amt_recon_amt_n16" \
+RECON_TAG=unused \
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+  sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+#--------------04d_train_hfd.sh
+
+TEACHER_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/amt_checkpoints/shell1000_n16/runs/3561481_0/best.pt \
+  sbatch 04d_train_hfd.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/hfd_checkpoints/shell1000_n16/best.pt RECON_TAG=hfd_n16 \
+  sbatch 05e_reconstruct_hfd.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+EXTRA_METHOD="hfd_n16=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/hfd_recon_hfd_n16" \
+RECON_TAG=unused \
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+  sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
 
 #------------05b_reconstruct_rrin.sh
 
 
 #--------------AQUiiiiiiiiiiiiiiiiiii
+
+
+#rrin n16 star
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star3/runs/3578223_0/best.pt RECON_TAG=rrin_n16_star \
+  ENSEMBLE_M=3 \
+  sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+#rrin n16 - k2 - OK
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" NUM_LAYERS=2 \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_checkpoints/shell1000_n16_k2/runs/3578206_0/best.pt RECON_TAG=rrin_n16_k2ok \
+  sbatch 05b_reconstruct_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
 
 #rrin n16 - k1
 RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" NUM_LAYERS=1 \
@@ -193,11 +258,21 @@ RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" NUM_LAYERS=2 NORM_T
   CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_checkpoints/shell1000_n16_k2_bn/best.pt RECON_TAG=rrin_n16_k2_bn \
   sbatch 05b_reconstruct_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
-
-EXTRA_METHOD="rrin_n16_k1=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin_n16_k1,rrin_n16_k2=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin_n16_k2" \
-RECON_TAG=unused \
+#---
+EXTRA_METHOD="naive_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_blend_recon,rrin_n16_star=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star,rrin_n16_k2ok=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin_n16_k2ok" \
+SUBSAMPLED_ONLY=1 \
 RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
   sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+EXTRA_METHOD="naive_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_blend_recon,rrin_n16_star=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star,rrin_n16_k2ok=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin_n16_k2ok" \
+SUBSAMPLED_ONLY=1 \
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+ROI_TRACTS="FX,CGC,CGH,UF" \
+  sbatch --array=1-8 11_peak_confusion_by_roi.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+python scripts/merge_shard_csvs.py --dir /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/metrics
+#---
 
 EXTRA_METHOD="rrin_n32_k1=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin_n32_k1,rrin_n32_k2=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin_n32_k2,rrin_n32_k3=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_recon_rrin_n32_k3" \
 RECON_TAG=unused \
@@ -210,23 +285,27 @@ RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
   sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
 
-
 STRIDE=2 NUM_LAYERS=2 CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_checkpoints/shell1000_n32_k2/best.pt \
   sbatch 05c_debug_rrin_layers.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 32 20170417094841_802780_20170417094841_802780
 
 
 #rcae n10
 RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
-  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3541971_0/best.pt RECON_TAG=rcae_n10 \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3556154_0/best.pt RECON_TAG=rcae_n10 \
   sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 
 #rcae n10 SH
 RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
-  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3542004_0/best.pt RECON_TAG=rcae_n10_sh \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10_sh/best.pt RECON_TAG=rcae_n10_sh \
+  sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
+
+#rcae n10 SH OLAT
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10_shdec/best.pt RECON_TAG=rcae_n10_shdec \
   sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10
 
 
-EXTRA_METHOD="rcae_n10=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_recon_rcae_n10,rcae_n10_sh=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_recon_rcae_n10_sh" \
+EXTRA_METHOD="rcae_n10=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_recon_rcae_n10" \
 RECON_TAG=rcae \
 RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
   sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 10

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=rrin_lr
+#SBATCH --job-name=rrin_ok
 #SBATCH --cluster=gpu
 #SBATCH --partition=l40s
 #SBATCH --gres=gpu:1

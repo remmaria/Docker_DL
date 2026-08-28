@@ -33,11 +33,20 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# sem isso, o resumo impresso no log corta colunas com "..." quando a
+# tabela fica mais larga que a largura de terminal padrao do pandas (mais
+# facil de acontecer agora, com bias_mean/resid_std/r2_mean/r2_frac_negative
+# somados a nmse/rmse/acc_mean) -- afeta so a IMPRESSAO no stdout, o CSV
+# salvo em --out-csv sempre teve todas as colunas, nunca foi truncado.
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 200)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.manifest import load_manifest
 from utils.gradients import load_dwi
-from utils.metrics import psnr, ssim3d, nmse, rmse, angular_correlation_coefficient
+from utils.metrics import (psnr, ssim3d, nmse, rmse, angular_correlation_coefficient,
+                           signal_bias, residual_std, r2_score_per_voxel)
 
 
 def evaluate_subject_method(recon_dir: Path, tag: str, shell_b: float, n_level: int,
@@ -94,9 +103,19 @@ def evaluate_subject_method(recon_dir: Path, tag: str, shell_b: float, n_level: 
             return None
         recon_sel = recon[..., sel]
         gt_sel = gt_target[..., sel]
-        nmse_val = nmse(recon_sel[m], gt_sel[m])
-        rmse_val = rmse(recon_sel[m], gt_sel[m])
-        acc = angular_correlation_coefficient(recon_sel[m], gt_sel[m])
+        recon_m, gt_m = recon_sel[m], gt_sel[m]
+        nmse_val = nmse(recon_m, gt_m)
+        rmse_val = rmse(recon_m, gt_m)
+        acc = angular_correlation_coefficient(recon_m, gt_m)
+        # bias/resid_std: decompoe o rmse em erro sistematico (regressao a
+        # media/vies) vs. ruido aleatorio de verdade -- ver docstring de
+        # signal_bias/residual_std em utils/metrics.py. r2: fracao da
+        # VARIANCIA real (entre direcoes held-out) que o metodo capturou,
+        # complementar ao nmse (que so olha energia total, nao variacao) --
+        # ver docstring de r2_score_per_voxel.
+        bias_val = signal_bias(recon_m, gt_m)
+        resid_std_val = residual_std(recon_m, gt_m)
+        r2_per_voxel = r2_score_per_voxel(recon_m, gt_m) if recon_m.shape[-1] > 1 else None
         return {
             "subject": subject, "method": method, "shell": shell_b, "n_level": n_level,
             "acquisition_context": acquisition_context,
@@ -104,6 +123,12 @@ def evaluate_subject_method(recon_dir: Path, tag: str, shell_b: float, n_level: 
             "n_targets": int(sel.sum()),
             "nmse": nmse_val, "rmse": rmse_val, "acc_mean": float(np.nanmean(acc)),
             "acc_std": float(np.nanstd(acc)),
+            "bias_mean": bias_val, "resid_std": resid_std_val,
+            "r2_mean": float(np.nanmean(r2_per_voxel)) if r2_per_voxel is not None else float("nan"),
+            "r2_median": float(np.nanmedian(r2_per_voxel)) if r2_per_voxel is not None else float("nan"),
+            "r2_frac_negative": (float(np.mean(r2_per_voxel[~np.isnan(r2_per_voxel)] < 0))
+                                  if r2_per_voxel is not None and np.any(~np.isnan(r2_per_voxel))
+                                  else float("nan")),
         }
 
     # "aggregate": TODOS os alvos (comportamento antigo, mantido por
@@ -241,7 +266,10 @@ def main():
                   f"nao tem essa shell) -- gravando CSV vazio em {args.out_csv}", flush=True)
             df = pd.DataFrame(columns=["subject", "method", "shell", "n_level",
                                         "acquisition_context", "target_volume_idx",
-                                        "metric_scope", "triplet_valid", "n_targets"])
+                                        "metric_scope", "triplet_valid", "n_targets",
+                                        "nmse", "rmse", "acc_mean", "acc_std",
+                                        "bias_mean", "resid_std", "r2_mean", "r2_median",
+                                        "r2_frac_negative"])
             Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(args.out_csv, index=False)
             return
@@ -260,7 +288,17 @@ def main():
         # "aggregate_invalid" (se aparecer) mostra especificamente o tamanho
         # do problema nesses poucos alvos. Para baseline_sh/rcae (sem
         # conceito de trinca invalida), aggregate_valid == aggregate.
-        print(agg.groupby(["method", "metric_scope"])[["nmse", "rmse", "acc_mean"]].mean())
+        print(agg.groupby(["method", "metric_scope"])[
+            ["nmse", "rmse", "acc_mean", "bias_mean", "resid_std", "r2_mean", "r2_frac_negative"]
+        ].mean())
+        print("\nLeitura de bias_mean/resid_std/r2_mean/r2_frac_negative: 'bias_mean' proximo "
+              "de 0 com 'resid_std' alto = erro parece ruido aleatorio genuino; 'bias_mean' "
+              "grande em modulo = erro sistematico (a reconstrucao puxa pro mesmo lado sempre, "
+              "assinatura de regressao a media). 'r2_mean' baixo/negativo mesmo com nmse "
+              "'aceitavel' = o metodo nao esta capturando a VARIACAO angular real entre as "
+              "direcoes held-out, so ficando perto de um valor plausivel/medio -- "
+              "'r2_frac_negative' e a fracao de voxels onde o metodo e' literalmente PIOR que "
+              "so prever a media do proprio alvo real (o 'modelo nulo' mais simples possivel).")
 
 
 if __name__ == "__main__":

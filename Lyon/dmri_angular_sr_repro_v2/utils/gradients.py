@@ -524,6 +524,196 @@ def find_best_bracket_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarra
     }
 
 
+def find_star_ensemble_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarray,
+                              m: int, max_residual_deg: float | None = None,
+                              require_between: bool = True):
+    """"Ensemble em estrela" (ver protocolo secao 14.5, item 1 -- ideia
+    adiada em favor da loss angular/SH da secao 15, retomada em 2026-08-27
+    depois do bug critico de t_frac corrigido, ver addendum secao 12):
+    em vez de devolver so o MELHOR par (a,b) por alvo (find_best_bracket_batch),
+    devolve ate `m` pares DIVERSOS entre si, para depois serem combinados
+    (blend/fusao aprendida, ver model/rrin3d_star.py) numa unica predicao
+    por alvo -- a ideia sendo que pares com planos/normais bem diferentes
+    carregam informacao geometrica mais independente sobre o alvo do que um
+    unico par (ou vários pares quase-duplicados no mesmo grande circulo).
+
+    Selecao por alvo, em duas etapas:
+      1. Monta o mesmo "pool aceitavel" de find_best_bracket_batch (pares
+         com residual_deg<=max_residual_deg e, se require_between, tambem
+         0<=t_frac<=1 -- ou o pool so-por-residuo se nenhum pool "between"
+         existir, mesmo fallback de find_best_bracket_batch). Se NENHUM par
+         passar no teto de residuo, cai no MESMO fallback de
+         find_best_bracket_batch (menor residuo global) preenchendo so a
+         1a posicao do feixe (mask=[True, False, ..., False]) -- quem
+         consome trata isso como alvo "invalido" (mesmo criterio de
+         sempre, ver "mask"/"between" abaixo).
+      2. Dentro do pool aceitavel, ordena por gap_deg crescente (empate:
+         menor residual_deg) -- a MESMA ordem/criterio que
+         find_best_bracket_batch usaria para escolher um unico par -- e
+         usa o 1o (melhor gap_deg) como SEMENTE de uma
+         farthest_point_sampling (ver acima) aplicada as NORMAIS dos pares
+         do pool (n_i = a_i x b_i, ja calculadas aqui para o
+         residuo/t_frac -- nao aos bvecs brutos): os `m` pares escolhidos
+         sao o de melhor gap_deg mais os `m-1` com normais mais dispersas
+         entre as ja escolhidas. Se o pool tiver <= m pares aceitaveis,
+         devolve todos eles (sem FPS, nada a escolher) e marca o resto do
+         feixe como padding (mask=False).
+
+    Consequencia direta desta construcao: com m=1, o resultado e
+    IDENTICO (mesmo par, mesmos campos) ao de find_best_bracket_batch
+    chamada com os mesmos argumentos -- verificado numericamente (ver
+    utils/gradients.py, secao de testes do modulo/addendum do projeto).
+
+    candidate_bvecs: (M_cand,3). target_bvecs: (K,3).
+
+    Retorna dict de arrays, todos com shape (K, m):
+      "i", "j": indices LOCAIS em candidate_bvecs do par nessa posicao do
+          feixe (-1 nas posicoes de padding, quando `mask` e False la).
+      "residual_deg", "gap_deg", "t_frac", "between": mesmos campos e
+          semantica de find_best_bracket_batch, por posicao do feixe (0.0/
+          False nas posicoes de padding).
+      "mask": bool, True nas posicoes com par real. SEMPRE tem pelo menos
+          uma posicao True por linha (mask[:,0].all() == True) -- ou um
+          par aceitavel de verdade, ou o fallback de menor residuo global
+          (que quem consome deve tratar como alvo invalido do mesmo jeito
+          que ja trata hoje via "valid"/"between" de find_best_bracket_batch).
+
+    Levanta ValueError se candidate_bvecs tiver menos de 2 direcoes ou
+    m < 1.
+    """
+    candidate_bvecs = np.asarray(candidate_bvecs, dtype=float)
+    target_bvecs = np.atleast_2d(np.asarray(target_bvecs, dtype=float))
+    n_cand = candidate_bvecs.shape[0]
+    if n_cand < 2:
+        raise ValueError("find_star_ensemble_batch precisa de pelo menos 2 direcoes candidatas")
+    if m < 1:
+        raise ValueError("m deve ser >= 1")
+    k_targets = target_bvecs.shape[0]
+
+    # ---- geometria pairwise identica a find_best_bracket_batch (nao repetimos
+    # a explicacao aqui -- ver docstring/comentarios la, mesma formula exata). ----
+    u_norm = np.linalg.norm(candidate_bvecs, axis=1, keepdims=True)
+    u_norm[u_norm == 0] = 1.0
+    U = candidate_bvecs / u_norm
+    t_norm = np.linalg.norm(target_bvecs, axis=1, keepdims=True)
+    t_norm[t_norm == 0] = 1.0
+    T = target_bvecs / t_norm
+
+    iu, ju = np.triu_indices(n_cand, k=1)
+    n_pairs = iu.shape[0]
+    a_pairs = U[iu]
+    b_raw = U[ju]
+    dot_ij = np.sum(a_pairs * b_raw, axis=1)
+    ang_ab = np.arccos(np.clip(np.abs(dot_ij), 0.0, 1.0))
+    sign_b = np.where(dot_ij >= 0.0, 1.0, -1.0)
+    b_pairs = b_raw * sign_b[:, None]
+    cross_ij = np.cross(a_pairs, b_pairs)
+    cross_norm = np.linalg.norm(cross_ij, axis=1)
+    degenerate = cross_norm < 1e-8
+    n_hat = np.zeros_like(cross_ij)
+    ok = ~degenerate
+    n_hat[ok] = cross_ij[ok] / cross_norm[ok, None]
+    e2 = np.cross(n_hat, a_pairs)
+    e2_norm = np.linalg.norm(e2, axis=1)
+    e2_ok = e2_norm > 1e-12
+    e2_safe = np.zeros_like(e2)
+    e2_safe[e2_ok] = e2[e2_ok] / e2_norm[e2_ok, None]
+    e2 = e2_safe
+
+    dot_it = U @ T.T
+    dot_at = dot_it[iu, :]
+    sign_t = np.where(dot_at >= 0.0, 1.0, -1.0)
+    comp_a = np.abs(dot_at)
+    dot_te_raw = e2 @ T.T
+    comp_e2 = sign_t * dot_te_raw
+    theta_t = np.arctan2(comp_e2, comp_a)
+    ang_ab_col = ang_ab[:, None]
+    t_frac = np.divide(theta_t, ang_ab_col, out=np.zeros_like(theta_t), where=ang_ab_col > 1e-8)
+    t_frac[degenerate, :] = 0.0
+
+    dot_tn = n_hat @ T.T
+    residual = np.arcsin(np.clip(np.abs(dot_tn), 0.0, 1.0))
+    residual[degenerate, :] = np.pi / 2.0
+
+    between = (t_frac >= 0.0) & (t_frac <= 1.0)
+    gap_deg_pairs = np.degrees(ang_ab)      # (n_pairs,) -- nao depende do alvo
+    residual_deg = np.degrees(residual)     # (n_pairs, K)
+
+    acceptable = residual_deg <= max_residual_deg if max_residual_deg is not None else None
+
+    out_i = np.full((k_targets, m), -1, dtype=int)
+    out_j = np.full((k_targets, m), -1, dtype=int)
+    out_residual = np.zeros((k_targets, m))
+    out_gap = np.zeros((k_targets, m))
+    out_tfrac = np.zeros((k_targets, m))
+    out_between = np.zeros((k_targets, m), dtype=bool)
+    out_mask = np.zeros((k_targets, m), dtype=bool)
+
+    for k in range(k_targets):
+        if acceptable is not None:
+            acc_mask = acceptable[:, k]
+            if acc_mask.any():
+                pool_idx = np.nonzero(acc_mask)[0]
+                if require_between:
+                    bw_idx = pool_idx[between[pool_idx, k]]
+                    if bw_idx.size:
+                        pool_idx = bw_idx
+                # ordena o pool por gap_deg crescente (empate: menor residuo) --
+                # 1o elemento = par que find_best_bracket_batch teria escolhido
+                # sozinho (mesmo criterio, so que aqui como SEMENTE do feixe).
+                order = np.lexsort((residual_deg[pool_idx, k], gap_deg_pairs[pool_idx]))
+                pool_sorted = pool_idx[order]
+            else:
+                # nenhum par passa no teto -- mesmo fallback de
+                # find_best_bracket_batch: so a 1a posicao do feixe e
+                # preenchida (menor residuo global), resto fica padding
+                # (quem consome trata isso como alvo invalido, mesmo
+                # criterio de sempre).
+                best = int(np.argmin(residual_deg[:, k]))
+                out_i[k, 0] = iu[best]
+                out_j[k, 0] = ju[best]
+                out_residual[k, 0] = residual_deg[best, k]
+                out_gap[k, 0] = gap_deg_pairs[best]
+                out_tfrac[k, 0] = t_frac[best, k]
+                out_between[k, 0] = between[best, k]
+                out_mask[k, 0] = True
+                continue
+        else:
+            # sem teto (max_residual_deg=None) -- mesmo criterio de
+            # find_best_bracket_batch nesse caso: ordena TODOS os pares por
+            # residuo (gap so faz sentido como criterio SECUNDARIO dentro de
+            # um pool ja filtrado por teto -- sem teto, o "pool" e tudo, e o
+            # criterio primario vira minimizar o proprio residuo, igual ao
+            # `best = argmin(residual_deg)` do fallback de
+            # find_best_bracket_batch/find_best_bracket).
+            pool_idx = np.arange(n_pairs)
+            order = np.argsort(residual_deg[pool_idx, k])
+            pool_sorted = pool_idx[order]
+
+        if pool_sorted.size <= m:
+            chosen = pool_sorted
+        else:
+            normals_pool = n_hat[pool_sorted]  # (P,3)
+            fps_local = farthest_point_sampling(normals_pool, m, seed_idx=0, sort=False)
+            chosen = pool_sorted[fps_local]
+
+        n_chosen = chosen.size
+        out_i[k, :n_chosen] = iu[chosen]
+        out_j[k, :n_chosen] = ju[chosen]
+        out_residual[k, :n_chosen] = residual_deg[chosen, k]
+        out_gap[k, :n_chosen] = gap_deg_pairs[chosen]
+        out_tfrac[k, :n_chosen] = t_frac[chosen, k]
+        out_between[k, :n_chosen] = between[chosen, k]
+        out_mask[k, :n_chosen] = True
+
+    return {
+        "i": out_i, "j": out_j,
+        "residual_deg": out_residual, "gap_deg": out_gap,
+        "t_frac": out_tfrac, "between": out_between,
+        "mask": out_mask,
+    }
+
+
 # ---------------------------------------------------------------------------
 # I/O (depende de nibabel; import isolado para nao quebrar testes unitarios
 # que só exercitam a logica numpy acima)
