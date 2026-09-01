@@ -40,6 +40,23 @@
 # feixe (ENSEMBLE_M) -- o par unico continua sempre controlado só por
 # MAX_RESIDUAL_DEG, mesmo quando este estiver setado.
 #
+# ENSEMBLE_MAX_GAP_DEG=<graus> (variavel de ambiente, default vazio = sem
+# teto de gap, comportamento de sempre -- ver --ensemble-max-gap-deg em
+# scripts/02b_build_rrin_triplets.py e addendum 2026-08-27 secao 20.6):
+# teto de gap_deg (separacao angular a/b) para PREFERIR, quando ha
+# candidatos suficientes, pares com separacao pequena entre os m-1 pares
+# ALEM da semente do feixe (a semente ja e' sempre o de menor gap_deg do
+# pool, com ou sem este teto). Motivacao: a diversidade geometrica pura
+# (FPS por normais) pode escolher varios pares com gap_deg grande so por
+# serem dispersos entre si -- um diagnostico de pesos de fusao por voxel
+# (addendum secao 20.6) mostrou que, quando NENHUM candidato do feixe tem
+# gap pequeno, a fusao aprendida acaba borrando estrutura angular fina numa
+# media quase-uniforme entre candidatos mediocres, em vez de confiar num
+# par 'facil'. Nunca reduz o numero de pares reais do feixe -- so influencia
+# QUAIS sao escolhidos quando ha opcao de sobra; sem candidatos suficientes
+# dentro do teto, cai de volta no comportamento sem teto so naquele alvo.
+#   ENSEMBLE_MAX_GAP_DEG=25 sbatch slurm/02b_build_rrin_triplets.sh <work_dir>
+#
 # OUT_DIR=<pasta> (variavel de ambiente, default "$WORK_DIR/subsampling" --
 # ATENCAO: esse e' o default de SEMPRE, o mesmo usado por qualquer treino
 # ja rodando que le desse work_dir): escreve os <tag>_rrin_triplets.npz
@@ -81,10 +98,18 @@ if [[ -n "$ENSEMBLE_MAX_RESIDUAL_DEG" ]]; then
     echo "ENSEMBLE_MAX_RESIDUAL_DEG=$ENSEMBLE_MAX_RESIDUAL_DEG -- teto separado so pro pool do feixe"
 fi
 
+ENSEMBLE_MAX_GAP_DEG="${ENSEMBLE_MAX_GAP_DEG:-}"
+ENS_MAX_GAP_FLAG=()
+if [[ -n "$ENSEMBLE_MAX_GAP_DEG" ]]; then
+    ENS_MAX_GAP_FLAG=(--ensemble-max-gap-deg "$ENSEMBLE_MAX_GAP_DEG")
+    echo "ENSEMBLE_MAX_GAP_DEG=$ENSEMBLE_MAX_GAP_DEG -- preferindo pares de gap pequeno no feixe, quando possivel"
+fi
+
 python scripts/02b_build_rrin_triplets.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --scheme-dir "$WORK_DIR/subsampling" \
     --out-dir "$OUT_DIR" \
     --max-residual-deg "$MAX_RESIDUAL_DEG" \
     "${ENSEMBLE_FLAG[@]}" \
-    "${ENS_MAX_RESIDUAL_FLAG[@]}"
+    "${ENS_MAX_RESIDUAL_FLAG[@]}" \
+    "${ENS_MAX_GAP_FLAG[@]}"

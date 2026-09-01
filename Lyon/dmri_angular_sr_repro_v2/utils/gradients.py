@@ -526,7 +526,8 @@ def find_best_bracket_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarra
 
 def find_star_ensemble_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarray,
                               m: int, max_residual_deg: float | None = None,
-                              require_between: bool = True):
+                              require_between: bool = True,
+                              max_gap_deg: float | None = None):
     """"Ensemble em estrela" (ver protocolo secao 14.5, item 1 -- ideia
     adiada em favor da loss angular/SH da secao 15, retomada em 2026-08-27
     depois do bug critico de t_frac corrigido, ver addendum secao 12):
@@ -563,6 +564,35 @@ def find_star_ensemble_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarr
     IDENTICO (mesmo par, mesmos campos) ao de find_best_bracket_batch
     chamada com os mesmos argumentos -- verificado numericamente (ver
     utils/gradients.py, secao de testes do modulo/addendum do projeto).
+
+    max_gap_deg (opcional, default None = comportamento acima, inalterado):
+    a diversidade geometrica pura (FPS por normais, passo 2 acima) nao
+    prioriza pares com `gap_deg` pequeno -- ela pode escolher, entre os
+    `m-1` pares alem da semente, candidatos bem dispersos mas todos com
+    separacao angular grande entre `a`/`b`, regime onde a premissa de fluxo
+    optico (que RRIN3DStar usa para "esticar" um par ate o alvo, ver
+    model/rrin3d_star.py) e mais fragil (analogia OLAT, ver protocolo/
+    addendum secao 10/12). Achado que motivou este parametro: diagnostico
+    de pesos de fusao por voxel (addendum secao 20.6) mostrou que, quando
+    NENHUM dos `m` candidatos de um alvo tem `gap_deg` pequeno, a fusao
+    aprendida (PairWeightHead3D) nao tem um "vencedor" obvio pra confiar e
+    acaba fazendo uma media quase-uniforme entre varios candidatos
+    mediocres -- borrando estrutura angular fina (mesmo mecanismo do
+    `naive_ensemble_blend`, ver secao 20.4, so que dentro da fusao
+    aprendida). Quando `max_gap_deg` e dado, a escolha dos `m-1` pares
+    ALEM da semente (que continua sendo sempre o par de menor `gap_deg` do
+    pool, goste ou nao do teto) fica restrita, quando possivel, ao
+    subconjunto do pool com `gap_deg<=max_gap_deg` -- ainda maximizando
+    dispersao de normais DENTRO desse subconjunto (nao abre mao da
+    diversidade, so a busca dentro de um universo mais "amigavel" ao
+    warp). Se esse subconjunto nao tiver membros suficientes pra preencher
+    o feixe (menos de `m` no total, incluindo a semente), o teto e
+    ignorado PARA ESSE ALVO ESPECIFICO e cai no comportamento antigo (FPS
+    sobre o pool inteiro) -- o teto nunca reduz quantos pares reais o
+    feixe tem, so influencia QUAIS sao escolhidos quando ha opcao de
+    sobra. `None` (default) preserva o comportamento de sempre bit-a-bit,
+    incluindo para m=1 (a checagem de equivalencia com
+    find_best_bracket_batch nao usa este parametro).
 
     candidate_bvecs: (M_cand,3). target_bvecs: (K,3).
 
@@ -692,6 +722,33 @@ def find_star_ensemble_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarr
 
         if pool_sorted.size <= m:
             chosen = pool_sorted
+        elif max_gap_deg is not None:
+            # restringe os m-1 pares ALEM da semente (pool_sorted[0], que
+            # continua sendo sempre o de menor gap_deg do pool) a um
+            # subconjunto com gap_deg<=max_gap_deg, quando esse subconjunto
+            # tiver membros suficientes pra preencher o feixe -- ver
+            # docstring ("max_gap_deg") para a motivacao completa.
+            preferred_mask = gap_deg_pairs[pool_sorted] <= max_gap_deg
+            preferred_mask[0] = True  # semente sempre incluida, mesmo que o
+                                        # proprio gap dela exceda o teto (e' o
+                                        # melhor disponivel de qualquer jeito)
+            preferred_idx = np.nonzero(preferred_mask)[0]
+            if preferred_idx.size >= m:
+                # indice 0 e' sempre o menor valor possivel em preferred_idx
+                # (pool_sorted[0] sempre marcado True acima), entao fica na
+                # posicao 0 do array ordenado -- semente da FPS sem precisar
+                # localizar a posicao.
+                sub_pool = pool_sorted[preferred_idx]
+                normals_sub = n_hat[sub_pool]
+                fps_local = farthest_point_sampling(normals_sub, m, seed_idx=0, sort=False)
+                chosen = sub_pool[fps_local]
+            else:
+                # nao ha candidatos suficientes dentro do teto de gap pra
+                # preencher o feixe com diversidade -- cai no comportamento
+                # antigo (FPS sobre o pool inteiro) so PARA ESTE ALVO.
+                normals_pool = n_hat[pool_sorted]
+                fps_local = farthest_point_sampling(normals_pool, m, seed_idx=0, sort=False)
+                chosen = pool_sorted[fps_local]
         else:
             normals_pool = n_hat[pool_sorted]  # (P,3)
             fps_local = farthest_point_sampling(normals_pool, m, seed_idx=0, sort=False)

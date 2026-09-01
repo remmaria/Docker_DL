@@ -1,0 +1,7 @@
+TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 \
+    sbatch 13_inspect_star_pair_weights.sh \
+    /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir \
+    /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star6/runs/3582133_0/best.pt \
+    1000 16 \
+    20170417094841_802780_20170417094841_802780 \
+    "59,58,26"

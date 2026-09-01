@@ -166,7 +166,7 @@ RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpo
   ONLY_VALID=1 NUM_LAYERS=2 ENSEMBLE_M=3 \
   sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
-RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n10/runs/3556154_0/best.pt \
+RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n16/runs/3579826_0/last.pt \
   ONLY_VALID=1 \
   sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
@@ -191,15 +191,40 @@ ENSEMBLE_M=3 sbatch 02b_build_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Ly
 
 ENSEMBLE_M=3 ONLY_VALID=1 NO_RESUME=1 sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
+RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star3/runs/3579821_0/last.pt \
+  ENSEMBLE_M=3 ONLY_VALID=1 \
+  sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
 ENSEMBLE_M=3 sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
-# MODELOS RRIN ENSEMBLE M6 e R10
+#--------------- MODELOS RRIN ENSEMBLE M6 e R10
 OUT_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 ENSEMBLE_M=6 ENSEMBLE_MAX_RESIDUAL_DEG=10 \
   sbatch 02b_build_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
 
 TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 \
   ENSEMBLE_M=6 ONLY_VALID=1 NO_RESUME=1 \
   sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star6/runs/3581452_0/last.pt \
+  TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 \
+  ENSEMBLE_M=6 ONLY_VALID=1 \
+  sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_checkpoints/shell1000_n16_k2/runs/3579813_0/last.pt \
+  ONLY_VALID=1 NUM_LAYERS=2 \
+  sbatch 04b_train_rrin.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+#----------------- MODELOS RRIN ENSEMBLE M3 e R10
+OUT_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m3r10 ENSEMBLE_M=3 ENSEMBLE_MAX_RESIDUAL_DEG=10 \
+  sbatch 02b_build_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
+
+TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m3r10 \
+  ENSEMBLE_M=3 ONLY_VALID=1 NO_RESUME=1 \
+  sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
 
 # MODELOS RRIN ENSEMBLE M6 e R5
 OUT_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r5 ENSEMBLE_M=6 ENSEMBLE_MAX_RESIDUAL_DEG=5 \

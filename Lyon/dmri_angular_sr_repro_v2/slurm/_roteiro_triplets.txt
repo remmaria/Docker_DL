@@ -1,0 +1,14 @@
+# M = 6 RES = 5
+OUT_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m8r15 \
+  ENSEMBLE_M=8 \
+  ENSEMBLE_MAX_RESIDUAL_DEG=15 \
+  sbatch 02b_build_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
+
+
+OUT_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_gaptest \
+  ENSEMBLE_M=8 \
+  ENSEMBLE_MAX_RESIDUAL_DEG=15 \
+  sbatch 02b_build_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
+
+TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 sbatch 02c_diagnose_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
+TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_gaptest sbatch 02c_diagnose_rrin_triplets.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir

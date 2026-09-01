@@ -1,0 +1,50 @@
+
+# NAIVE ENSEMBLE
+
+TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 \
+  sbatch 05h_reconstruct_naive_ensemble_blend.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+
+# RRIN n16
+# M = 3 RES = 5
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star3/runs/3582144_0/best.pt \
+  RECON_TAG=rrin_n16_star35 \
+  ENSEMBLE_M=3 \
+  sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+# RRIN n16
+# M = 6 RES = 5
+TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r5 \
+    RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star6/runs/3582128_0/best.pt \
+    RECON_TAG=rrin_n16_star65 \
+    ENSEMBLE_M=6 \
+    sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+# RRIN n16
+# M = 6 RES = 10
+TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 \
+    RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star6/runs/3632758_0/best.pt \
+    RECON_TAG=rrin_n16_star610 \
+    ENSEMBLE_M=6 \
+    sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+# RRIN n16
+# M = 3 RES = 10
+TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m3r10 \
+    RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star3/runs/3631329_0/best.pt \
+    RECON_TAG=rrin_n16_star310 \
+    ENSEMBLE_M=6 \
+    sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+# RCAE n16
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+  CKPT_PATH="/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n16/runs/3632328_0/best.pt" \
+    RECON_TAG=rcae_n16 sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16

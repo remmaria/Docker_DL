@@ -87,7 +87,7 @@ def main():
                                 "n_invalid": 0, "n_total": 0,
                                 "n_between": 0, "has_between_field": False,
                                 "ens_pool_sizes": [], "ensemble_m": None,
-                                "has_ensemble_field": False})
+                                "has_ensemble_field": False, "ens_gap_valid": []})
 
     for e in entries:
         tag = e.subject if not e.session else f"{e.subject}_{e.session}"
@@ -119,6 +119,10 @@ def main():
                 d["has_ensemble_field"] = True
                 d["ensemble_m"] = ens_valid.shape[1]
                 d["ens_pool_sizes"].extend(ens_valid.sum(axis=1).tolist())
+                ens_gap_key = f"{base}__ens_gap_deg"
+                if ens_gap_key in trip.files:
+                    ens_gap = trip[ens_gap_key]  # (n_alvos, M)
+                    d["ens_gap_valid"].extend(ens_gap[ens_valid].tolist())
 
     if not agg:
         sys.exit("Nenhum <tag>_rrin_triplets.npz encontrado -- rode 02b primeiro")
@@ -198,6 +202,27 @@ def main():
               "estiver acontecendo e voce quiser um ensemble de verdade, regere o npz com "
               "--ensemble-max-residual-deg mais frouxo que --max-residual-deg (afeta so o pool "
               "do feixe, preserva o par unico -- ver scripts/02b_build_rrin_triplets.py).")
+
+        if any(d.get("ens_gap_valid") for d in agg.values()):
+            print("\n=== gap_deg dos pares REALMENTE escolhidos no feixe (--ensemble-m), so "
+                  "posicoes ens_valid=True -- ver addendum 2026-08-27 secao 20.6 ===")
+            print(f"{'shell':>10s} {'n_level':>7s} {'n pares':>9s} "
+                  f"{'p10':>7s} {'p50':>7s} {'p90':>7s} {'max':>7s}")
+            for (shell_str, n_level) in sorted(agg.keys()):
+                d = agg[(shell_str, n_level)]
+                ens_gap = np.asarray(d.get("ens_gap_valid", []))
+                if ens_gap.size == 0:
+                    continue
+                print(f"{shell_str:>10s} {n_level:>7d} {ens_gap.size:>9d} "
+                      f"{np.percentile(ens_gap,10):>7.1f} {np.percentile(ens_gap,50):>7.1f} "
+                      f"{np.percentile(ens_gap,90):>7.1f} {ens_gap.max():>7.1f}")
+            print("\nUse esta tabela pra comparar ANTES/DEPOIS de rodar 02b com "
+                  "--ensemble-max-gap-deg (ENSEMBLE_MAX_GAP_DEG no wrapper sbatch): um p50/p90 "
+                  "menor depois confirma que o teto esta de fato deslocando a selecao do feixe "
+                  "para pares de separacao angular menor (mais 'faceis' pro warp), nao so "
+                  "teoricamente -- sem essa tabela nao ha como distinguir isso de nenhum efeito "
+                  "real (ex.: se o pool nao tinha candidatos suficientes dentro do teto em quase "
+                  "nenhum alvo, ver docstring de --ensemble-max-gap-deg).")
 
     print("\nLeitura: residual_deg (1a tabela) e a distancia angular PERPENDICULAR real "
           "do alvo ate o plano da circunferencia que passa pelo melhor par disponivel -- "

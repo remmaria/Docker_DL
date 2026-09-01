@@ -180,6 +180,26 @@ def main():
                           "confiar em cada par, SEM contaminar a comparacao ja feita de "
                           "RRIN3D/AMT3D no par unico (que usa --max-residual-deg, nao este). "
                           "Sem efeito se --ensemble-m nao for passado (>0).")
+    ap.add_argument("--ensemble-max-gap-deg", type=float, default=None,
+                     help="ADITIVO (default None = sem teto de gap, comportamento de sempre): "
+                          "teto de gap_deg (separacao angular do par a/b) usado para preferir, "
+                          "quando ha candidatos suficientes, pares 'faceis' pro warp entre os "
+                          "m-1 pares ALEM da semente do feixe (a semente continua sendo sempre "
+                          "o de menor gap_deg do pool, com ou sem este teto -- ver "
+                          "utils/gradients.py:find_star_ensemble_batch). Motivacao (ver addendum "
+                          "2026-08-27, secao 20.6): a selecao de diversidade pura (FPS por "
+                          "normais) pode escolher varios pares com gap_deg grande so por serem "
+                          "geometricamente dispersos entre si -- regime onde a premissa de fluxo "
+                          "optico do RRIN3DStar e mais fragil (analogia OLAT). Um diagnostico de "
+                          "pesos de fusao por voxel mostrou que, quando NENHUM candidato do feixe "
+                          "tem gap pequeno, a fusao aprendida nao tem um par 'facil' pra confiar "
+                          "e acaba borrando estrutura angular fina numa media quase-uniforme "
+                          "entre candidatos mediocres. Este teto NUNCA reduz quantos pares reais "
+                          "o feixe tem (mask/n_valid identicos com ou sem ele) -- so influencia "
+                          "QUAIS pares sao escolhidos quando ha opcao de sobra; se o pool nao "
+                          "tiver candidatos suficientes dentro do teto pra preencher o feixe com "
+                          "diversidade, cai de volta no comportamento sem teto SO NAQUELE alvo. "
+                          "Sem efeito se --ensemble-m nao for passado (>0).")
     args = ap.parse_args()
     require_between = not args.no_require_between
 
@@ -267,7 +287,8 @@ def main():
                                      else args.max_residual_deg)
                 ens = find_star_ensemble_batch(input_bvecs, target_bvecs, args.ensemble_m,
                                                 max_residual_deg=ens_max_residual,
-                                                require_between=require_between)
+                                                require_between=require_between,
+                                                max_gap_deg=args.ensemble_max_gap_deg)
                 ens_i, ens_j = ens["i"], ens["j"]  # (n_alvos, M), -1 = padding
                 pad = ens_i < 0
                 ens_pair_a = np.where(pad, -1, input_idx[np.clip(ens_i, 0, None)])

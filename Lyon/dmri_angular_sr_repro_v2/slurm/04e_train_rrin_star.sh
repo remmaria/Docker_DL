@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=rrstar35
+#SBATCH --job-name=rrst815
 #SBATCH --cluster=gpu
-#SBATCH --partition=l40s
+#SBATCH --partition=a100
 #SBATCH --gres=gpu:1
 # SBATCH --constraint=h200
 #SBATCH --nodes=1

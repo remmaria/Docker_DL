@@ -1,0 +1,12 @@
+
+EXTRA_METHOD="naive_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_blend_recon,\
+naive_ensemble_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_ensemble_blend_recon,\
+rrin_n16_star310=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star310,\
+rrin_n16_star610=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star610,\
+rcae_n16=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_recon_rcae_n16" \
+    SUBSAMPLED_ONLY=1 \
+    ROI_TRACTS="FX,CGC,CGH,UF" \
+    RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+    sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
