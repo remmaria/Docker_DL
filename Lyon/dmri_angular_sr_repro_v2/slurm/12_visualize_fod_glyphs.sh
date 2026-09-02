@@ -46,7 +46,23 @@
 #   MIN_PEAKS_FOR_CROSSING (default: 2)
 #   MIN_MASK_FRAC         (default: 0.5)
 #   NORMALIZE            (default: global; ou per_voxel)
+#   CENTER_VOXEL         -- 'X,Y,Z' em coordenadas GLOBAIS (mesmo sistema impresso
+#                            em "Centroide da mascara"/sub-volume por uma rodada
+#                            anterior); se setado, IGNORA a busca automatica de
+#                            cruzamento e centra o patch nesse voxel especifico
+#                            (ex.: pra focar so no voxel de cruzamento mais nitido
+#                            achado numa figura anterior). Combine com PATCH_SIZE
+#                            menor (ex. 1 ou 2) pra isolar so aquele voxel.
 #   OUT_FILE             (default: $WORK_DIR/figures/fod_glyphs_shell<b>_n<n>.png)
+#
+#   SUBSAMPLED_ONLY=1 (2026-09-02, default 0) -- adiciona um painel extra
+#   "subsampled_only" (CSD ajustado SO nas direcoes de entrada reais, sem
+#   nenhuma reconstrucao/preenchimento -- mesma logica do --subsampled-only
+#   de 11_peak_confusion_by_roi.py). Requer TRIPLETS_DIR (default:
+#   $WORK_DIR/subsampling, mesma pasta de sempre).
+#   SH_ORDER_SUBSAMPLED_ONLY -- forca a ordem SH desse painel (default:
+#   auto via max_order_for_n_directions(n_level)).
+#   Ex.: SUBSAMPLED_ONLY=1 sbatch slurm/12_visualize_fod_glyphs.sh <work_dir> 1000 16 <baseline_dir>
 
 set -euo pipefail
 mkdir -p logs
@@ -78,11 +94,30 @@ if [[ -n "${EXTRA_METHOD:-}" ]]; then
     echo "EXTRA_METHOD=$EXTRA_METHOD"
 fi
 
+CENTER_VOXEL_FLAG=()
+if [[ -n "${CENTER_VOXEL:-}" ]]; then
+    CENTER_VOXEL_FLAG=(--center-voxel "$CENTER_VOXEL")
+    echo "CENTER_VOXEL=$CENTER_VOXEL -- ignorando busca automatica, focando nesse voxel"
+fi
+
+SUBSAMPLED_FLAG=()
+if [[ "${SUBSAMPLED_ONLY:-0}" == "1" ]]; then
+    TRIPLETS_DIR="${TRIPLETS_DIR:-$WORK_DIR/subsampling}"
+    SUBSAMPLED_FLAG=(--subsampled-only --triplets-dir "$TRIPLETS_DIR")
+    echo "SUBSAMPLED_ONLY=1 -- adicionando painel 'subsampled_only' (TRIPLETS_DIR=$TRIPLETS_DIR)"
+    if [[ -n "${SH_ORDER_SUBSAMPLED_ONLY:-}" ]]; then
+        SUBSAMPLED_FLAG+=(--sh-order-subsampled-only "$SH_ORDER_SUBSAMPLED_ONLY")
+        echo "SH_ORDER_SUBSAMPLED_ONLY=$SH_ORDER_SUBSAMPLED_ONLY -- forcando ordem SH desse painel"
+    fi
+fi
+
 python scripts/12_visualize_fod_glyphs.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --baseline-dir "$BASELINE_DIR" \
     "${RCAE_FLAG[@]}" \
     "${EXTRA_FLAGS[@]}" \
+    "${CENTER_VOXEL_FLAG[@]}" \
+    "${SUBSAMPLED_FLAG[@]}" \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --split "$SPLIT" \
     "${SUBJECTS_FLAG[@]}" \

@@ -58,7 +58,7 @@ from model.rrin3d_star import build_star_model
 
 
 def run_epoch(model, loader, optimizer, device, train: bool, epoch: int,
-              use_quality_cond: bool = False, batch_log_f=None) -> float:
+              need_quality: bool = False, batch_log_f=None) -> float:
     model.train(mode=train)
     total_loss = 0.0
     n_batches = 0
@@ -79,7 +79,10 @@ def run_epoch(model, loader, optimizer, device, train: bool, epoch: int,
         bvec_t = batch["bvec_t_ens"].to(device)
         t_frac = batch["t_frac_ens"].to(device)         # (B,M)
         ensemble_mask = batch["ensemble_mask"].to(device)  # (B,M) bool
-        quality = batch["quality_ens"].to(device) if use_quality_cond else None
+        # need_quality = use_quality_cond OU weight_quality_cond (ver model/rrin3d_star.py) --
+        # o MESMO tensor `quality_ens` alimenta as duas condicoes, independentemente de qual(is)
+        # esta(o) ligada(s); o modelo decide internamente qual sub-modulo de fato usa.
+        quality = batch["quality_ens"].to(device) if need_quality else None
 
         with torch.set_grad_enabled(train):
             pred = model(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t_frac, ensemble_mask,
@@ -148,7 +151,17 @@ def main():
     ap.add_argument("--max-disp", type=float, default=0.5)
     ap.add_argument("--use-quality-cond", action="store_true",
                      help="mesmo espirito de --use-quality-cond em 04b_train_rrin.py, aplicado "
-                          "a cada par do feixe (ver model/rrin3d_star.py).")
+                          "a cada par do feixe (ver model/rrin3d_star.py) -- condiciona o "
+                          "FlowNet3D (a estimativa de fluxo em si). DESACOPLADO de "
+                          "--weight-quality-cond (condiciona a fusao, nao o fluxo) -- as duas "
+                          "podem ser ligadas independentemente.")
+    ap.add_argument("--weight-quality-cond", action="store_true",
+                     help="NOVO (discussao pos-secao 20.9 do addendum): alimenta residual_deg/"
+                          "gap_deg de cada par diretamente na PairWeightHead3D (a cabeca que "
+                          "decide o peso de fusao entre os M pares), em vez de deixar a cabeca "
+                          "inferir confiabilidade so pelo conteudo de imagem -- ver docstring "
+                          "de model/rrin3d_star.py:PairWeightHead3D. Independente de "
+                          "--use-quality-cond (que condiciona o FlowNet3D, nao a fusao).")
     ap.add_argument("--norm-type", choices=["instance", "batch"], default="instance",
                      help="ver docstring de _norm3d em model/rrin3d.py -- mesmo comportamento/"
                           "restricoes de scripts/04b_train_rrin.py (batch exige treino do zero).")
@@ -214,13 +227,15 @@ def main():
     print(f"[resumo] val:    {len(val_ds.usable)} sujeitos utilizaveis "
           f"({len(val_ds)} patches, {len(val_loader)} batches/epoca)", flush=True)
 
+    need_quality = args.use_quality_cond or args.weight_quality_cond
     model = build_star_model(base_ch=args.base_ch, max_disp=args.max_disp,
                               use_quality_cond=args.use_quality_cond,
-                              norm_type=args.norm_type).to(device)
+                              norm_type=args.norm_type,
+                              weight_quality_cond=args.weight_quality_cond).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[resumo] RRIN3DStar: {n_params} parametros (base_ch={args.base_ch}, "
           f"ensemble_m={args.ensemble_m}, use_quality_cond={args.use_quality_cond}, "
-          f"norm_type={args.norm_type})")
+          f"weight_quality_cond={args.weight_quality_cond}, norm_type={args.norm_type})")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min",
                                                              factor=0.5, patience=5)
@@ -239,7 +254,7 @@ def main():
         bvec_t = batch["bvec_t_ens"].to(device)
         t_frac = batch["t_frac_ens"].to(device)
         ensemble_mask = batch["ensemble_mask"].to(device)
-        quality = batch["quality_ens"].to(device) if args.use_quality_cond else None
+        quality = batch["quality_ens"].to(device) if need_quality else None
         model.train(mode=do_backward)
         with torch.set_grad_enabled(do_backward):
             pred = model(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t_frac, ensemble_mask,
@@ -267,6 +282,8 @@ def main():
     run_tag = f"shell{int(args.shell_b)}_n{args.n_level}_star{args.ensemble_m}"
     if args.use_quality_cond:
         run_tag += "_qc"
+    if args.weight_quality_cond:
+        run_tag += "_wqc"
     if not only_valid:
         run_tag += "_inclinv"
     if args.norm_type == "batch":
@@ -299,7 +316,7 @@ def main():
         ckpt = torch.load(resume_ckpt_path, map_location=device)
         old_args = ckpt.get("args", {})
         for key in ("shell_b", "n_level", "patch_size", "base_ch", "max_disp", "use_quality_cond",
-                    "ensemble_m", "norm_type", "lr"):
+                    "weight_quality_cond", "ensemble_m", "norm_type", "lr"):
             old_val, new_val = old_args.get(key), vars(args).get(key)
             if old_val is not None and old_val != new_val:
                 print(f"[resume][aviso] --{key.replace('_','-')} mudou entre o checkpoint "
@@ -339,10 +356,10 @@ def main():
         for epoch in range(start_epoch, args.epochs + 1):
             train_sampler.set_epoch(epoch)
             train_loss = run_epoch(model, train_loader, optimizer, device, train=True,
-                                    epoch=epoch, use_quality_cond=args.use_quality_cond,
+                                    epoch=epoch, need_quality=need_quality,
                                     batch_log_f=batch_log_f)
             val_loss = run_epoch(model, val_loader, optimizer, device, train=False,
-                                  epoch=epoch, use_quality_cond=args.use_quality_cond,
+                                  epoch=epoch, need_quality=need_quality,
                                   batch_log_f=batch_log_f)
             scheduler.step(val_loss)
             current_lr = optimizer.param_groups[0]["lr"]

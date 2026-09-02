@@ -1,8 +1,14 @@
-CENTER_VOXEL="59,59,26" PATCH_SIZE=2 \
+CENTER_VOXEL="59,58,26" PATCH_SIZE=3 \
 EXTRA_METHOD="naive_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_blend_recon,\
 naive_ensemble_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_ensemble_blend_recon,\
+rrin_n16_star35=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star35,\
+rrin_n16_star65=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star65,\
+rrin_n16_star310=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star310,\
 rrin_n16_star610=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star610,\
-rrin_n16_star310=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star310" \
+rrin_n16_star610wq=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star610wq,\
+rrin_n16_star815=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star815,\
+implicit_n16=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/implicit_recon_implicit_n16,\
+rcae_n16=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_recon_rcae_n16" \
 SUBJECTS=20170417094841_802780_20170417094841_802780 \
   sbatch 12_visualize_fod_glyphs.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16 \
   /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/baseline_recon \

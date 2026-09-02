@@ -85,6 +85,8 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device)
     ckpt_args = ckpt["args"]
     use_quality_cond = ckpt_args.get("use_quality_cond", False)
+    weight_quality_cond = ckpt_args.get("weight_quality_cond", False)
+    need_quality = use_quality_cond or weight_quality_cond
     norm_type = ckpt_args.get("norm_type", "instance")
     ensemble_m = ckpt_args.get("ensemble_m")
     if ensemble_m is None:
@@ -95,11 +97,13 @@ def main():
     model = build_star_model(base_ch=ckpt_args.get("base_ch", 16),
                               max_disp=ckpt_args.get("max_disp", 0.5),
                               use_quality_cond=use_quality_cond,
-                              norm_type=norm_type).to(device)
+                              norm_type=norm_type,
+                              weight_quality_cond=weight_quality_cond).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     print(f"Checkpoint carregado (epoca {ckpt.get('epoch')}, val_loss {ckpt.get('val_loss')}, "
-          f"ensemble_m={ensemble_m}, norm_type={norm_type})")
+          f"ensemble_m={ensemble_m}, norm_type={norm_type}, use_quality_cond={use_quality_cond}, "
+          f"weight_quality_cond={weight_quality_cond})")
 
     entries = [e for e in load_manifest(args.manifest) if e.split == args.split]
 
@@ -187,7 +191,7 @@ def main():
         t_frac_all = torch.from_numpy(ens_t_frac.astype(np.float32)).to(device)  # (n_target, M)
         ensemble_mask_all = torch.from_numpy(ens_valid.astype(bool)).to(device)  # (n_target, M)
         quality_all = None
-        if use_quality_cond:
+        if need_quality:
             quality_np = np.stack([ens_residual_deg / 90.0, ens_gap_deg / 90.0],
                                    axis=-1).astype(np.float32)   # (n_target, M, 2)
             quality_all = torch.from_numpy(quality_np).to(device)

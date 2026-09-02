@@ -46,13 +46,29 @@ Requer PyTorch (nao disponivel neste ambiente de desenvolvimento -- revisado
 manualmente, testado apenas por compilacao de sintaxe; validar no cluster
 com `python -m model.rrin3d_star`, smoke test no fim do arquivo, mesmo
 padrao de model/rrin3d.py/model/amt3d.py).
+
+ATUALIZACAO (discussao pos-secao 20.9 do addendum -- diagnostico do glifo
+"torto" do star610 mostrou que, quando NENHUM par do feixe tem `gap_deg`
+baixo pra um alvo/voxel, a fusao aprendida acaba fazendo uma media
+razoavelmente equilibrada entre candidatos igualmente medianos, borrando
+estrutura angular fina; ver secao 20.6): `PairWeightHead3D`/`RRIN3DStar`
+ganharam um `use_quality_cond`/`weight_quality_cond` PROPRIO, ADITIVO e
+DESACOPLADO do `use_quality_cond` do FlowNet3D -- alimenta `residual_deg`/
+`gap_deg` de cada par DIRETO na cabeca de fusao, em vez de deixar a cabeca
+inferir confiabilidade so pelo conteudo de imagem. Paralelo com VFI de
+imagem natural: e o mesmo principio do "Z-metric"/importancia conhecida do
+Softmax Splatting (Niklaus & Liu, CVPR 2020) -- alimentar um sinal de
+qualidade JA CONHECIDO no mecanismo de peso, em vez de exigir que ele seja
+redescoberto do zero a partir de pixels. Nao resolve o problema de fundo
+(pool sem candidato bom, ver secao 20.6/20.9) -- so barateia o trabalho da
+cabeca de fusao pra usar o sinal geometrico de forma mais direta/estavel.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from .rrin3d import FlowNet3D, RefineNet3D, _conv3d, warp3d
+from .rrin3d import FlowNet3D, RefineNet3D, _conv3d, _repeat_vec_3d, warp3d
 
 
 class PairWeightHead3D(nn.Module):
@@ -64,11 +80,30 @@ class PairWeightHead3D(nn.Module):
     hipoteses de fluxo do MESMO par); aqui decide entre M PARES DIFERENTES.
     Saida SEM sigmoid/softmax (logit cru) -- a normalizacao entre os M pares
     (softmax mascarado) e feita em RRIN3DStar.forward, nao aqui, porque
-    precisa enxergar todos os M logits e a mascara de padding ao mesmo tempo."""
+    precisa enxergar todos os M logits e a mascara de padding ao mesmo tempo.
 
-    def __init__(self, base_ch: int = 16, norm_type: str = "instance"):
+    `use_quality_cond` (default False, ADITIVO -- discussao pos-secao 20.9 do
+    addendum, "alimentar gap_deg/residual_deg como feature explicita na
+    PairWeightHead3D"): quando True, concatena `quality` (residual_deg/90,
+    gap_deg/90 -- MESMA normalizacao/convencao ja usada por
+    RRIN3D/FlowNet3D.use_quality_cond, ver model/rrin3d.py) como 2 canais
+    constantes extras, via `_repeat_vec_3d` (mesmo mecanismo de broadcast
+    ja usado la). Motivacao: em vez de a cabeca inferir a confiabilidade de
+    cada par so pelo conteudo de imagem, ela recebe tambem o sinal
+    GEOMETRICO conhecido que a secao 20.6 do addendum ja mostrou
+    correlacionar com o peso aprendido (par de menor `residual_deg`/
+    `gap_deg` tende a ser mais confiavel) -- parametro INDEPENDENTE do
+    `use_quality_cond` do FlowNet3D (podem ligar/desligar em combinacoes
+    quaisquer; por isso o nome do parametro aqui e o mesmo, mas o dono e
+    outro modulo -- ver RRIN3DStar.weight_quality_cond, que os desacopla)."""
+
+    def __init__(self, base_ch: int = 16, norm_type: str = "instance",
+                 use_quality_cond: bool = False):
         super().__init__()
+        self.use_quality_cond = use_quality_cond
         in_ch = 1 + 1 + 1  # blend, vol_a, vol_b
+        if use_quality_cond:
+            in_ch += 2  # residual_norm, gap_norm (mesma convencao de RRIN3D/FlowNet3D)
         self.net = nn.Sequential(
             _conv3d(in_ch, base_ch, norm_type=norm_type),
             nn.Conv3d(base_ch, 1, kernel_size=3, padding=1),
@@ -80,8 +115,16 @@ class PairWeightHead3D(nn.Module):
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
-    def forward(self, blend, vol_a, vol_b):
-        x = torch.cat([blend, vol_a, vol_b], dim=1)
+    def forward(self, blend, vol_a, vol_b, quality=None):
+        parts = [blend, vol_a, vol_b]
+        if self.use_quality_cond:
+            if quality is None:
+                raise ValueError(
+                    "PairWeightHead3D.use_quality_cond=True mas `quality` nao foi passado ao "
+                    "forward -- ver RRIN3DStar.weight_quality_cond/docstring do modulo.")
+            spatial = blend.shape[-3:]
+            parts.append(_repeat_vec_3d(quality, spatial))  # quality: (B,2) -> (B,2,D,H,W)
+        x = torch.cat(parts, dim=1)
         return self.net(x)  # (B,1,D,H,W), logit cru
 
 
@@ -126,19 +169,35 @@ class RRIN3DStar(nn.Module):
     t: (B, M) -- t_frac de cada par (varia entre posicoes, MESMO alvo).
     ensemble_mask: (B, M) bool -- True = par real nesta posicao do feixe.
     quality: (B, M, 2) ou None -- residual_deg/gap_deg normalizados de cada
-        par (so usado se use_quality_cond=True, ver model/rrin3d.py).
+        par (usado se use_quality_cond=True e/ou weight_quality_cond=True --
+        MESMO tensor de entrada serve aos dois, ver docstring de
+        weight_quality_cond abaixo).
     retorna: (B, 1, D, H, W) -- direcao-alvo predita (fusao dos <=M pares).
+
+    weight_quality_cond (default False, ADITIVO -- ver PairWeightHead3D):
+        DESACOPLADO de `use_quality_cond` -- este ultimo condiciona o
+        FlowNet3D (a estimativa de fluxo em si, ja existente desde a
+        primeira versao desta classe); `weight_quality_cond` condiciona a
+        `PairWeightHead3D` (a escolha de QUANTO CONFIAR em cada par na
+        fusao). Sao ortogonais por design -- qualquer uma das 4 combinacoes
+        (False/False, True/False, False/True, True/True) e valida, dado
+        que o `quality` de entrada (mesmo tensor, ja calculado por
+        `utils/rrin_dataset.py:RRINTripletDataset._ensemble_tensors`
+        independente de qualquer uma das duas flags) e passado para o
+        forward sempre que QUALQUER uma das duas estiver ligada.
     """
 
     def __init__(self, base_ch: int = 16, max_disp: float = 0.5, use_quality_cond: bool = False,
-                 norm_type: str = "instance"):
+                 norm_type: str = "instance", weight_quality_cond: bool = False):
         super().__init__()
         self.use_quality_cond = use_quality_cond
+        self.weight_quality_cond = weight_quality_cond
         self.norm_type = norm_type
         self.flow_net = FlowNet3D(base_ch=base_ch, max_disp=max_disp,
                                    use_quality_cond=use_quality_cond, norm_type=norm_type)
         self.refine_net = RefineNet3D(base_ch=base_ch, norm_type=norm_type)
-        self.weight_head = PairWeightHead3D(base_ch=base_ch, norm_type=norm_type)
+        self.weight_head = PairWeightHead3D(base_ch=base_ch, norm_type=norm_type,
+                                             use_quality_cond=weight_quality_cond)
 
     def forward(self, vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, ensemble_mask, quality=None,
                 return_pairs=False):
@@ -171,7 +230,13 @@ class RRIN3DStar(nn.Module):
         blend_f = (w_a * warped_a + w_b * warped_b) / denom
         residual_f = self.refine_net(blend_f, vol_a_f, vol_b_f)
         pred_f = blend_f + residual_f                          # (B*M,1,D,H,W)
-        weight_logit_f = self.weight_head(blend_f, vol_a_f, vol_b_f)  # (B*M,1,D,H,W)
+        # quality_f e computado acima (a partir de `quality`, se veio) independente de
+        # use_quality_cond -- so passa pra weight_head se weight_quality_cond=True (a
+        # propria PairWeightHead3D valida/reclama se receber use_quality_cond=True e
+        # quality=None, ver classe acima).
+        weight_logit_f = self.weight_head(
+            blend_f, vol_a_f, vol_b_f,
+            quality=quality_f if self.weight_quality_cond else None)  # (B*M,1,D,H,W)
 
         def _unflat(x):
             return x.reshape(b, m, *x.shape[1:])
@@ -191,7 +256,7 @@ class RRIN3DStar(nn.Module):
 
 
 def build_star_model(base_ch: int = 16, max_disp: float = 0.5, use_quality_cond: bool = False,
-                      norm_type: str = "instance") -> RRIN3DStar:
+                      norm_type: str = "instance", weight_quality_cond: bool = False) -> RRIN3DStar:
     """Wrapper trivial (mesmo espirito de build_rrin_model em model/rrin3d.py)
     -- existe so para scripts/04e_train_rrin_star.py e
     scripts/05f_reconstruct_rrin_star.py nao precisarem instanciar a classe
@@ -199,7 +264,7 @@ def build_star_model(base_ch: int = 16, max_disp: float = 0.5, use_quality_cond:
     tambem dentro do ensemble em estrela) sem mudar a assinatura dos scripts
     que chamam esta funcao."""
     return RRIN3DStar(base_ch=base_ch, max_disp=max_disp, use_quality_cond=use_quality_cond,
-                       norm_type=norm_type)
+                       norm_type=norm_type, weight_quality_cond=weight_quality_cond)
 
 
 def _smoke_test():
@@ -247,6 +312,43 @@ def _smoke_test():
     out_q = model_q(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, ensemble_mask, quality=quality)
     assert out_q.shape == expected, f"shape mismatch (com quality): {out_q.shape} != {expected}"
     print(f"smoke test OK (use_quality_cond=True), output shape: {tuple(out_q.shape)}")
+
+    # weight_quality_cond (novo, DESACOPLADO de use_quality_cond -- ver docstring do
+    # modulo/RRIN3DStar): testa as 4 combinacoes de (use_quality_cond, weight_quality_cond),
+    # incluindo as 2 mistas (uma ligada, outra nao) pra confirmar que sao independentes.
+    for uqc in (False, True):
+        for wqc in (False, True):
+            model_mix = build_star_model(base_ch=8, use_quality_cond=uqc,
+                                          weight_quality_cond=wqc)
+            out_mix = model_mix(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, ensemble_mask,
+                                 quality=quality)
+            assert out_mix.shape == expected, \
+                f"shape mismatch (use_quality_cond={uqc}, weight_quality_cond={wqc}): " \
+                f"{out_mix.shape} != {expected}"
+    print("OK: as 4 combinacoes de (use_quality_cond, weight_quality_cond) rodam sem erro")
+
+    # weight_quality_cond=True mas esquecendo `quality` no forward deve levantar erro
+    # claro (mesmo padrao de FlowNet3D.use_quality_cond em model/rrin3d.py), nao um
+    # erro criptico de shape dentro da PairWeightHead3D.
+    model_wqc = build_star_model(base_ch=8, use_quality_cond=False, weight_quality_cond=True)
+    try:
+        model_wqc(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, ensemble_mask, quality=None)
+        raise AssertionError("deveria ter levantado ValueError sem `quality`")
+    except ValueError:
+        print("OK: weight_quality_cond=True sem `quality` levanta ValueError, como esperado")
+
+    # zero-init da PairWeightHead3D (mesmo espirito do FlowNet3D, ver docstring da classe):
+    # com weight_quality_cond=True mas pesos recem-inicializados, os 2 canais extras de
+    # quality nao deveriam ainda influenciar a saida (logit continua 0 em toda parte,
+    # pi uniforme) -- confere que a mudanca de quality nao muda pi num modelo NOVO.
+    model_wqc2 = build_star_model(base_ch=8, use_quality_cond=False, weight_quality_cond=True)
+    _, extra_a = model_wqc2(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, ensemble_mask,
+                             quality=torch.zeros(b, m, 2), return_pairs=True)
+    _, extra_b = model_wqc2(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t, ensemble_mask,
+                             quality=torch.ones(b, m, 2), return_pairs=True)
+    assert torch.allclose(extra_a["pi"], extra_b["pi"]), \
+        "com a ultima camada da PairWeightHead3D zero-init, pi nao deveria mudar com quality"
+    print("OK: zero-init da PairWeightHead3D preserva pi uniforme mesmo com quality diferente")
 
     # M=1 (ensemble degenerado a um unico par) deve funcionar normalmente --
     # nao ha nenhum caso especial pra M=1 no codigo (softmax de 1 elemento

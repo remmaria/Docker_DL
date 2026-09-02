@@ -33,9 +33,12 @@
 # so precisa que o npz de trincas tenha pelo menos esse M de pares
 # gravados, ver scripts/02b_build_rrin_triplets.py --ensemble-m).
 #
-# USE_QUALITY_COND=1 / NORM_TYPE=batch / ONLY_VALID=0 -- mesmo espirito de
-# slurm/05b_reconstruct_rrin.sh, so ajudam a achar o CKPT_DIR certo (sufixos
-# _qc/_bn/_inclinv).
+# USE_QUALITY_COND=1 / WEIGHT_QUALITY_COND=1 / NORM_TYPE=batch / ONLY_VALID=0 -- mesmo espirito
+# de slurm/05b_reconstruct_rrin.sh, so ajudam a achar o CKPT_DIR certo (sufixos
+# _qc/_wqc/_bn/_inclinv). WEIGHT_QUALITY_COND e novo (ver model/rrin3d_star.py:
+# PairWeightHead3D/RRIN3DStar.weight_quality_cond) -- DESACOPLADO de USE_QUALITY_COND, o
+# proprio script Python le os dois de dentro do checkpoint mesmo assim; estas variaveis aqui
+# so servem pra montar o caminho certo do CKPT_DIR (nao sao passadas como flag Python).
 #
 # STRIDE=<N> / PATCH_SIZE=<N> -- mesma semantica de slurm/05b_reconstruct_rrin.sh.
 
@@ -65,7 +68,11 @@ source "./00_env_common.sh"
 CKPT_DIR="$WORK_DIR/rrin_star_checkpoints/shell${SHELL_B%.*}_n${N_LEVEL}_star${ENSEMBLE_M}"
 if [[ "${USE_QUALITY_COND:-0}" == "1" ]]; then
     CKPT_DIR="${CKPT_DIR}_qc"
-    echo "USE_QUALITY_COND=1 -- lendo checkpoint da variante consciente da qualidade: $CKPT_DIR"
+    echo "USE_QUALITY_COND=1 -- lendo checkpoint da variante consciente da qualidade (FlowNet3D): $CKPT_DIR"
+fi
+if [[ "${WEIGHT_QUALITY_COND:-0}" == "1" ]]; then
+    CKPT_DIR="${CKPT_DIR}_wqc"
+    echo "WEIGHT_QUALITY_COND=1 -- lendo checkpoint da variante com gap_deg/residual_deg na fusao (PairWeightHead3D): $CKPT_DIR"
 fi
 if [[ "${ONLY_VALID:-1}" == "0" ]]; then
     CKPT_DIR="${CKPT_DIR}_inclinv"

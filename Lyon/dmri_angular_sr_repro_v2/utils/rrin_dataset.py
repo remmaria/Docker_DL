@@ -36,7 +36,8 @@ class RRINTripletDataset(Dataset):
                  patch_size: int = 10, training: bool = False, only_valid: bool = True,
                  mask_suffix: str = "_mask3d.nii.gz", shell_tol: float = 100.0,
                  seed: int = 0, max_cached_subjects: int = 2,
-                 min_tile_coverage: float = 0.0, sh_q_out: int = 0, ensemble_m: int = 0):
+                 min_tile_coverage: float = 0.0, sh_q_out: int = 0, ensemble_m: int = 0,
+                 log_worker_loads: bool = False):
         """
         only_valid: quando True (default), so usa trincas com `valid=True`
             (residuo de colinearidade dentro do teto usado em
@@ -83,6 +84,16 @@ class RRINTripletDataset(Dataset):
             mascara `ens_valid` gravada por 02b ja marca isso) -- as
             posicoes sem par real ficam zeradas e `ensemble_mask=False`,
             mesmo mecanismo de padding de sh_mask/target_mask.
+
+        log_worker_loads: (default False, ADITIVO -- ver mesmo parametro
+            em utils/pairflow_ssl_dataset.py:PairFlowSSLDataset, adicionado
+            junto no diagnostico de gargalo de dataloading de 2026-09-02)
+            quando True, imprime `worker_id`/`subject_tag` a cada carga
+            REAL de disco (cache MISS) em `_load_subject` -- usado pra
+            confirmar se o mesmo sujeito esta sendo recarregado por
+            multiplos workers na mesma epoca (ver
+            utils.dataset.SubjectGroupedSampler.__init__ para o mecanismo
+            suspeito).
         """
         self.entries = entries
         self.triplets_dir = Path(triplets_dir)
@@ -97,6 +108,7 @@ class RRINTripletDataset(Dataset):
         self.max_cached_subjects = max_cached_subjects
         self.sh_q_out = sh_q_out
         self.ensemble_m = ensemble_m
+        self.log_worker_loads = log_worker_loads
         self._cache: "OrderedDict[str, dict]" = OrderedDict()
         self.seed = seed
         self._rng = np.random.default_rng(seed)
@@ -118,6 +130,24 @@ class RRINTripletDataset(Dataset):
                     f"novo com --ensemble-m >= {ensemble_m} (aditivo, nao precisa apagar nada "
                     f"do que ja existe, so acrescenta os campos '__ens_*' novos)."
                 )
+            if ensemble_m > 0:
+                # BUG CORRIGIDO (2026-08-28): fatiar `[:, :ensemble_m]` num
+                # array com MENOS colunas que o M pedido nao levanta erro em
+                # numpy (so devolve as colunas que existem) -- isso deixava o
+                # mismatch passar batido aqui e so estourar bem mais tarde,
+                # num IndexError criptico dentro de um worker do DataLoader
+                # (`_ensemble_tensors`, ao tentar acessar um slot que nao
+                # existe). Checagem early e explicita: o `.npz` precisa ter
+                # sido gravado com --ensemble-m >= ensemble_m pedido aqui.
+                actual_m = trip[f"{key}__ens_pair_a"].shape[1]
+                if actual_m < ensemble_m:
+                    raise RuntimeError(
+                        f"ensemble_m={ensemble_m} pedido, mas {trip_path} foi gravado com "
+                        f"apenas M={actual_m} pares no feixe (campo '{key}__ens_pair_a' tem "
+                        f"shape (.,{actual_m})) -- rode scripts/02b_build_rrin_triplets.py de "
+                        f"novo com --ensemble-m >= {ensemble_m} apontando pro MESMO --out-dir "
+                        f"usado aqui (--triplets-dir), sobrescrevendo o .npz com o M maior."
+                    )
             valid = trip[f"{key}__valid"]
             if only_valid and not valid.any():
                 continue
@@ -159,6 +189,15 @@ class RRINTripletDataset(Dataset):
         if tag in self._cache:
             self._cache.move_to_end(tag)
             return self._cache[tag]
+
+        if self.log_worker_loads:
+            # Mesmo diagnostico de utils/pairflow_ssl_dataset.py:
+            # PairFlowSSLDataset._load_subject (2026-09-02) -- ver
+            # docstring la e de SubjectGroupedSampler.__init__ pra o
+            # mecanismo suspeito (redundancia de carga entre workers).
+            worker_info = torch.utils.data.get_worker_info()
+            wid = worker_info.id if worker_info is not None else -1
+            print(f"[rrin_dataset][worker-load] worker={wid} subject={tag}", flush=True)
 
         bvals, bvecs = load_bval_bvec(entry.bval_path, entry.bvec_path)
         data, affine, header = load_dwi(entry.dwi_path)

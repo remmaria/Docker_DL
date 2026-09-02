@@ -1,9 +1,11 @@
 # RRIN
 # M = 6 RES = 5
 NO_RESUME=1 \
-    TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m8r15 \
-    ENSEMBLE_M=8 ONLY_VALID=1  \
+    TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 \
+    ENSEMBLE_M=6 ONLY_VALID=1  \
+    WEIGHT_QUALITY_COND=1 \
     sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
 
 RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star6/runs/3582144_0/last.pt \
     ENSEMBLE_M=3 ONLY_VALID=1  \
@@ -19,5 +21,10 @@ RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpo
 RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n16/runs/3582143_0/last.pt \
     ONLY_VALID=1 \
     sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+    sbatch 04f_train_implicit.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+sbatch 04g_train_pairflow_ssl.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000
 
 

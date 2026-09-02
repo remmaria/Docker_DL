@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=rcae_n16
+#SBATCH --job-name=rc150016
 #SBATCH --cluster=gpu
 #SBATCH --partition=a100
 #SBATCH --gres=gpu:1

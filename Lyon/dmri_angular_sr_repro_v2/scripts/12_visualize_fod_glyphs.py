@@ -52,12 +52,25 @@ Reusa exatamente a MESMA montagem "full = data.copy(); full[...,
 target_idx] = recon" de 11_peak_confusion_by_roi.py:_process_subject pra
 avaliar cada metodo de reconstrucao.
 
+--SUBSAMPLED-ONLY (2026-09-02, a pedido da usuaria -- "no script de
+visualizar glifos a gente colocou tb o subamostrado?"): ADITIVO, requer
+--triplets-dir. Mesma ideia do --subsampled-only de
+11_peak_confusion_by_roi.py -- SEM reconstrucao nenhuma, ajusta CSD so nas
+direcoes de entrada REAIS (exclui as direcoes-alvo do esquema de
+subamostragem via `exclude_idx` em fit_shm_and_npeaks(), mesma semantica
+de `exclude_idx` em 11_peak_confusion_by_roi.py:fit_peaks), numa ordem SH
+tipicamente MENOR (`max_order_for_n_directions(n_level)`, auto por
+default, --sh-order-subsampled-only pra forcar outra). Mostra visualmente
+"e' isso que da pra ver sem interpolacao nenhuma" ao lado do ground_truth/
+baseline_sh/rcae/etc. na mesma figura.
+
 Uso (mesma convencao --baseline-dir/--rcae-dir/--extra-method de
 06_evaluate_reconstruction.py/11_peak_confusion_by_roi.py):
     python scripts/12_visualize_fod_glyphs.py \
         --manifest work_dir/manifest.csv \
         --baseline-dir work_dir/baseline_recon \
         --extra-method "naive_blend=work_dir/naive_blend_recon,rrin_n16_star610=work_dir/rrin_star_recon_rrin_n16_star610,rcae_n16=work_dir/rcae_recon_rcae_n16" \
+        --subsampled-only --triplets-dir work_dir/subsampling \
         --shell-b 1000 --n-level 16 \
         --subjects 20170417094841_802780_20170417094841_802780 \
         --out work_dir/figures/fod_glyphs_shell1000_n16.png
@@ -190,12 +203,16 @@ def centered_patch(local_center, patch_size, slice_axis, shape):
 
 
 def fit_shm_and_npeaks(data, bvals, bvecs, shell_b, mask, shell_tol, sh_order,
-                        relative_peak_threshold, min_separation_angle, npeaks):
+                        relative_peak_threshold, min_separation_angle, npeaks,
+                        exclude_idx=None):
     """CSD single-shell single-tissue (Tournier07), mesma convencao de
     scripts/11_peak_confusion_by_roi.py:fit_peaks -- devolve so
     (n_peaks_map, shm_coeff), sem peak_dirs/peak_values (nao usados aqui,
     os glifos sao desenhados a partir do shm_coeff diretamente, nao dos
-    picos discretos)."""
+    picos discretos). `exclude_idx` (ADITIVO, default None, 2026-09-02):
+    remove esses indices do conjunto de direcoes usadas no ajuste -- mesma
+    semantica de `exclude_idx` em 11_peak_confusion_by_roi.py:fit_peaks,
+    usado pelo modo --subsampled-only (ver main())."""
     from dipy.core.gradients import gradient_table
     from dipy.reconst.csdeconv import ConstrainedSphericalDeconvModel, auto_response_ssst
     from dipy.direction import peaks_from_model
@@ -205,6 +222,8 @@ def fit_shm_and_npeaks(data, bvals, bvecs, shell_b, mask, shell_tol, sh_order,
     shell_key = _resolve_shell_key(shells, shell_b, shell_tol)
     idx = np.concatenate([shells[0], shells[shell_key]])
     idx.sort()
+    if exclude_idx is not None:
+        idx = np.setdiff1d(idx, np.asarray(exclude_idx), assume_unique=False)
 
     gtab = gradient_table(bvals[idx], bvecs[idx])
     vol = data[..., idx]
@@ -338,6 +357,19 @@ def main():
                           "cruzamento quanto o plano de amostragem do glifo 2D")
     ap.add_argument("--min-peaks-for-crossing", type=int, default=2)
     ap.add_argument("--min-mask-frac", type=float, default=0.5)
+    ap.add_argument("--subsampled-only", action="store_true",
+                     help="(2026-09-02) tambem desenha um painel 'subsampled_only' -- CSD "
+                          "ajustado SO nas direcoes de entrada reais (sem nenhuma "
+                          "reconstrucao/preenchimento), mesma logica de --subsampled-only em "
+                          "11_peak_confusion_by_roi.py. Requer --triplets-dir.")
+    ap.add_argument("--triplets-dir", default=None,
+                     help="pasta com '<tag>_rrin_triplets.npz' (ex.: work_dir/subsampling) -- "
+                          "so' necessario com --subsampled-only, pra saber quais direcoes sao "
+                          "'alvo' (excluidas do ajuste) pra este shell/n_level")
+    ap.add_argument("--sh-order-subsampled-only", type=int, default=None,
+                     help="ordem SH do CSD so' para o painel --subsampled-only (default: auto "
+                          "via max_order_for_n_directions(n_level) -- tipicamente MENOR que "
+                          "--sh-order, ja que ha menos direcoes reais disponiveis)")
     ap.add_argument("--center-voxel", default=None,
                      help="'X,Y,Z' em coordenadas GLOBAIS (mesmo sistema impresso em "
                           "'Centroide da mascara'/sub-volume por uma rodada anterior) -- "
@@ -355,6 +387,9 @@ def main():
                           "diferenca de magnitude).")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+
+    if args.subsampled_only and args.triplets_dir is None:
+        sys.exit("--subsampled-only precisa de --triplets-dir")
 
     import nibabel as nib
     import matplotlib
@@ -489,10 +524,10 @@ def main():
             if name and path:
                 methods_to_try.append((name.strip(), path.strip()))
 
-    panels = []  # (label, shm_patch)
+    panels = []  # (label, shm_patch, sh_order_desse_painel)
     for method, recon_dir in methods_to_try:
         if method == "ground_truth":
-            panels.append((method, gt_shm_patch))
+            panels.append((method, gt_shm_patch, sh_order))
             continue
         if recon_dir is None:
             continue
@@ -515,20 +550,56 @@ def main():
                   f"({type(exc).__name__}: {exc}), pulando", flush=True)
             continue
         shm_patch = shm[patch_slices_sub].reshape(args.patch_size, args.patch_size, -1)
-        panels.append((method, shm_patch))
+        panels.append((method, shm_patch, sh_order))
+
+    # --subsampled-only (2026-09-02): SEM reconstrucao nenhuma -- ajusta CSD
+    # so' nas direcoes de entrada reais (exclui as direcoes-alvo do esquema
+    # de subamostragem via exclude_idx), mesma logica/mesma fonte de
+    # target_idx de 11_peak_confusion_by_roi.py. sh_order_sub tipicamente
+    # difere (e' MENOR) que `sh_order` (menos direcoes reais disponiveis),
+    # por isso cada painel carrega sua PROPRIA ordem (ver render_glyph_field
+    # abaixo -- sh_to_sf precisa da ordem que bate com o numero de
+    # coeficientes do shm_patch daquele painel especifico).
+    if args.subsampled_only:
+        trip_path = Path(args.triplets_dir) / f"{tag}_rrin_triplets.npz"
+        trip_key = f"{args.shell_b}__{args.n_level}__target"
+        if not trip_path.exists() or trip_key not in np.load(trip_path).files:
+            print(f"[aviso] {tag}: sem trincas para --subsampled-only "
+                  f"(esperado {trip_path}, chave {trip_key!r}) -- pulando esse painel",
+                  flush=True)
+        else:
+            target_idx = np.load(trip_path)[trip_key]
+            sh_order_sub = (args.sh_order_subsampled_only
+                             or max_order_for_n_directions(args.n_level))
+            try:
+                _n_peaks_sub, shm_sub = fit_shm_and_npeaks(
+                    sub_data, bvals, bvecs, args.shell_b, sub_mask, args.shell_tol, sh_order_sub,
+                    args.relative_peak_threshold, args.min_separation_angle, args.npeaks,
+                    exclude_idx=target_idx)
+                shm_patch_sub = shm_sub[patch_slices_sub].reshape(
+                    args.patch_size, args.patch_size, -1)
+                panels.append(("subsampled_only", shm_patch_sub, sh_order_sub))
+                print(f"subsampled_only: sh_order={sh_order_sub} "
+                      f"(auto via max_order_for_n_directions({args.n_level}))"
+                      if args.sh_order_subsampled_only is None
+                      else f"subsampled_only: sh_order={sh_order_sub} (forcado via "
+                           f"--sh-order-subsampled-only)", flush=True)
+            except Exception as exc:
+                print(f"[aviso] {tag}: CSD falhou pro painel subsampled_only "
+                      f"({type(exc).__name__}: {exc}), pulando", flush=True)
 
     if len(panels) < 2:
         sys.exit("Menos de 2 paineis disponiveis (GT + pelo menos 1 metodo) -- confira "
-                  "--baseline-dir/--rcae-dir/--extra-method.")
+                  "--baseline-dir/--rcae-dir/--extra-method/--subsampled-only.")
 
     fig, axes = plt.subplots(1, len(panels), figsize=(3.2 * len(panels), 3.6))
     if len(panels) == 1:
         axes = [axes]
 
     amplitude_ref = None
-    for ax, (label, shm_patch) in zip(axes, panels):
+    for ax, (label, shm_patch, panel_sh_order) in zip(axes, panels):
         ref = amplitude_ref if args.normalize == "global" else None
-        peak = render_glyph_field(ax, shm_patch, directions, sh_order, args.glyph_scale,
+        peak = render_glyph_field(ax, shm_patch, directions, panel_sh_order, args.glyph_scale,
                                    amplitude_ref=ref)
         if label == "ground_truth" and args.normalize == "global":
             amplitude_ref = peak

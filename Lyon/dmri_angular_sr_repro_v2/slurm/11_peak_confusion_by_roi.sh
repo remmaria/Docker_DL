@@ -32,6 +32,11 @@
 # PEAK_MATCH_THRESHOLD_DEG=25 (default) -- tolerancia angular pra
 # considerar dois picos "o mesmo".
 #
+# MIN_PEAKS_FOR_CROSSING=2 (default) -- limiar de numero de picos do GROUND
+# TRUTH para um voxel contar como estrato 'crossing' na estratificacao por
+# complexidade (addendum secao 20.14, colunas *_simple/*_crossing no CSV de
+# saida -- ver --min-peaks-for-crossing em scripts/11_peak_confusion_by_roi.py).
+#
 # SUBJECTS="tag1,tag2" (variavel de ambiente) roda so nesse(s) sujeito(s)
 # especifico(s) em vez do split inteiro -- mesma convencao de POC_SUBJECTS
 # em slurm/poc_csd_direction_count.sh. Util pra testar rapido num sujeito
@@ -118,6 +123,12 @@ fi
 
 PEAK_MATCH_THRESHOLD_DEG="${PEAK_MATCH_THRESHOLD_DEG:-25.0}"
 
+MIN_PEAKS_FOR_CROSSING_FLAG=()
+if [[ -n "${MIN_PEAKS_FOR_CROSSING:-}" ]]; then
+    MIN_PEAKS_FOR_CROSSING_FLAG=(--min-peaks-for-crossing "$MIN_PEAKS_FOR_CROSSING")
+    echo "MIN_PEAKS_FOR_CROSSING=$MIN_PEAKS_FOR_CROSSING (default seria 2)"
+fi
+
 python scripts/11_peak_confusion_by_roi.py \
     --manifest "$WORK_DIR/manifest.csv" \
     "${BASELINE_FLAG[@]}" \
@@ -125,4 +136,5 @@ python scripts/11_peak_confusion_by_roi.py \
     --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT" \
     --peak-match-threshold-deg "$PEAK_MATCH_THRESHOLD_DEG" \
     --out-csv "$WORK_DIR/metrics/peak_confusion_shell${SHELL_B%.*}_n${N_LEVEL}.csv" \
-    "${EXTRA_METHOD_FLAGS[@]}" "${SUBSAMPLED_ONLY_FLAG[@]}" "${ROI_FLAG[@]}" "${SUBJECTS_FLAG[@]}"
+    "${EXTRA_METHOD_FLAGS[@]}" "${SUBSAMPLED_ONLY_FLAG[@]}" "${ROI_FLAG[@]}" "${SUBJECTS_FLAG[@]}" \
+    "${MIN_PEAKS_FOR_CROSSING_FLAG[@]}"

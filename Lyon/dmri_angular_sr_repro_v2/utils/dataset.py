@@ -478,19 +478,53 @@ class SubjectGroupedSampler(torch.utils.data.Sampler):
     garantia) -- agrupa direto a partir de `dataset.tile_index`.
     """
 
-    def __init__(self, dataset: "DWIPatchDataset", seed: int = 0):
+    def __init__(self, dataset: "DWIPatchDataset", seed: int = 0, freeze_order: bool = False):
+        """
+        freeze_order (default False, ADITIVO -- comportamento de todo
+        chamador existente continua identico sem passar isso explicitamente,
+        ver addendum 2026-09-02): quando True, `set_epoch` ignora o numero
+        da epoca e a ORDEM dos sujeitos fica a MESMA em toda epoca (so a
+        ordem DOS SUJEITOS -- o embaralhamento dos tiles DENTRO de cada
+        sujeito, mais abaixo em `__iter__`, continua variando por epoca
+        normalmente, ja que usa o mesmo `rng` sequencialmente).
+
+        Motivacao (diagnostico de gargalo de dataloading no treino
+        `pairflow_ssl`, ver scripts/04g_train_pairflow_ssl.py): com
+        `num_workers>0`, o `DataLoader` do PyTorch despacha os batches pros
+        workers em ROUND-ROBIN (worker 0,1,...,N-1,0,1,...), nao em blocos
+        por sujeito -- entao um sujeito cujos tiles rendem mais batches que
+        `num_workers` acaba tendo pelo menos 1 batch atendido por CADA
+        worker, e cada worker tem seu PROPRIO cache LRU
+        (`max_cached_subjects`) isolado dos demais (processos separados).
+        Resultado: o MESMO sujeito e' recarregado do disco em ate
+        `num_workers` workers diferentes por epoca -- e, se a ordem dos
+        sujeitos muda a cada epoca (comportamento antigo, default), o
+        mapeamento sujeito->worker tambem muda, entao nem entre epocas um
+        worker consegue reaproveitar o que ja carregou. Congelar a ordem
+        (freeze_order=True) NAO elimina a redundancia entre workers dentro
+        de uma mesma epoca (isso exigiria particionar sujeitos por worker,
+        mudanca maior, nao feita aqui), mas garante que o mapeamento
+        sujeito->worker fique ESTAVEL de epoca pra epoca -- entao, depois
+        da primeira epoca "fria", cada worker tende a ja ter em cache os
+        MESMOS sujeitos que vai precisar de novo, reduzindo releituras de
+        disco nas epocas seguintes (contanto que `max_cached_subjects` seja
+        grande o suficiente pra cobrir os sujeitos que aquele worker
+        especificamente revisita)."""
         groups = defaultdict(list)
         for flat_idx, (si, _origin) in enumerate(dataset.tile_index):
             groups[si].append(flat_idx)
         self.groups = list(groups.values())
         self.seed = seed
+        self.freeze_order = freeze_order
         self._epoch = 0
 
     def set_epoch(self, epoch: int):
         # opcional: chame antes de cada epoca se quiser uma ordem diferente
         # (senao usa sempre a mesma seed, mesma ordem toda epoca -- ainda
         # assim ja resolve o problema de cache, so nao varia a ordem).
-        self._epoch = epoch
+        # Com freeze_order=True, ignora `epoch` de proposito (ver docstring
+        # do __init__) -- a ordem dos SUJEITOS fica sempre a mesma.
+        self._epoch = 0 if self.freeze_order else epoch
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self._epoch)

@@ -1,0 +1,2 @@
+protocol,roi,fit_type,shells_used,b_value,n_dirs,n_b0,sh_order,n_voxels,frac_0peaks,frac_1peak,frac_crossing,mean_n_peaks,energy_frac_high_order
+SeqA1,whole_mask,single_shell,1000,1000.0,64,1,8,421714,0.0,0.23164040084037998,0.76835959915962,2.2717955770972744,0.5264120484659177

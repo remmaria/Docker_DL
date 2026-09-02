@@ -20,6 +20,19 @@ mesma ordem de grandeza do --min-separation-angle usado pelo proprio CSD
 pra distinguir dois picos DENTRO do mesmo voxel). Sobra de picos preditos
 sem par vira FP; sobra de picos reais sem par vira FN.
 
+METRICA ADICIONAL "mean_tp_angle_deg" (2026-09-01, ver addendum secao
+20.15): TP/FP/FN e' uma contagem BINARIA -- casou dentro do limiar ou nao
+-- e na pratica varios metodos bem diferentes entre si (ate um blend
+"naive" sem nada aprendido) deram precision/recall bem parecidos num
+sujeito de teste, escondendo diferenca real de fidelidade. Por isso o
+script tambem acumula, entre os pares efetivamente casados como TP, a
+distancia angular media (colunas "sum_tp_angle_deg"/"mean_tp_angle_deg",
+tambem estratificadas por simple/crossing) -- um sinal continuo de "o
+quao bem" casou, nao so' "se" casou, mais sensivel que a contagem de picos
+pra diferenciar metodos com precision/recall parecidos (ver tambem
+"energy_frac_high_order"/"energy_frac_high_order_crossing" pro mesmo
+proposito, do lado da energia SH em vez do angulo do pico).
+
 Duas situacoes de comparacao (mutuamente compativeis, pode rodar as duas
 juntas numa mesma chamada):
 
@@ -39,6 +52,23 @@ juntas numa mesma chamada):
    forcar outra) porque ha' de fato menos direcoes medidas. Serve de piso:
    quanto a reconstrucao esta ajudando a achar os picos certos, comparado
    a so aceitar a resolucao angular mais baixa da aquisicao subamostrada.
+
+ESTRATIFICACAO POR COMPLEXIDADE (secao 20.14 do addendum, ADITIVA, sempre
+calculada -- nao precisa de flag pra ligar, so --min-peaks-for-crossing pra
+ajustar o limiar): alem das colunas agregadas pela ROI inteira, cada linha
+tambem ganha as mesmas metricas (TP/FP/FN/TN_voxels/energy_frac_high_order/
+ref_energy_frac_high_order) recalculadas separadamente em dois subconjuntos
+de voxels da ROI, definidos pelo NUMERO DE PICOS DO GROUND TRUTH
+(gt_n_peaks, ja calculado por fit_peaks): "simple" (exatamente 1 pico) e
+"crossing" (>= --min-peaks-for-crossing picos, default 2), sufixadas
+"_simple"/"_crossing" (mais "n_voxels_simple"/"n_voxels_crossing"). Motivo:
+o resumo agregado por ROI inteira ja mostrou (addendum 20.13) que RCAE tem
+o PIOR energy_frac_high_order em CGC/CGH/UF mas o MELHOR em FX -- essa
+estratificacao testa se o deficit de energia de ordem alta do RCAE se
+CONCENTRA especificamente em voxels de cruzamento genuino (consistente com
+"suaviza cruzamentos ambiguos apesar de acertar exemplos bem definidos",
+ver o glifo da secao 20.6) ou esta espalhado uniformemente entre voxels
+simples e de cruzamento dentro da mesma ROI (ver `complexity_masks`).
 
 Uso:
     python scripts/11_peak_confusion_by_roi.py \
@@ -190,13 +220,27 @@ def match_peaks_voxel(true_dirs, true_vals, pred_dirs, pred_vals, threshold_deg)
     antipodal (v == -v, convencao usual de picos de FOD), entao a
     distancia usada e' min(angulo, 180-angulo).
 
-    Retorna (n_tp, n_fp, n_fn) para esse voxel.
-    """
+    Retorna (n_tp, n_fp, n_fn, sum_ang_tp).
+
+    `sum_ang_tp` (adicionado 2026-09-01, ver addendum): soma, em graus, da
+    distancia angular de CADA par efetivamente casado como TP (`ang` ja
+    calculado abaixo pra ordenar os pares -- antes descartado apos decidir
+    TP/FP/FN). Motivacao: TP/FP/FN e' uma contagem BINARIA (dentro ou fora
+    de --peak-match-threshold-deg, default 25 graus) -- um metodo que erra
+    por 2 graus e um que erra por 24 graus contam como o MESMO TP, entao
+    dois metodos com precision/recall quase identicos (visto na pratica:
+    "tudo muito parecido, tirando o implicit") podem ainda ter erro angular
+    MEDIO bem diferente entre si nos picos que os dois acertam. Somar aqui
+    (em vez de so' guardar a media por voxel) permite agregar corretamente
+    entre voxels/sujeitos depois (`sum_tp_angle_deg` e' aditivo, uma media
+    de medias por voxel NAO seria -- mesmo racional de calcular
+    precision/recall no fim a partir da SOMA de TP/FP, nao da media de
+    precision por linha)."""
     true_list = [true_dirs[k] for k in range(true_dirs.shape[0]) if true_vals[k] > 0]
     pred_list = [pred_dirs[k] for k in range(pred_dirs.shape[0]) if pred_vals[k] > 0]
     n_true, n_pred = len(true_list), len(pred_list)
     if n_true == 0 and n_pred == 0:
-        return 0, 0, 0  # voxel "vazio" dos dois lados -- nao entra em TP/FP/FN (ver TN a parte)
+        return 0, 0, 0, 0.0  # voxel "vazio" dos dois lados -- nao entra em TP/FP/FN (ver TN a parte)
 
     pairs = []
     for i, tv in enumerate(true_list):
@@ -209,6 +253,7 @@ def match_peaks_voxel(true_dirs, true_vals, pred_dirs, pred_vals, threshold_deg)
 
     matched_true, matched_pred = set(), set()
     n_tp = 0
+    sum_ang_tp = 0.0
     for ang, i, j in pairs:
         if ang > threshold_deg:
             break  # ja ordenado por angulo -- nenhum par restante passa no limiar
@@ -217,10 +262,53 @@ def match_peaks_voxel(true_dirs, true_vals, pred_dirs, pred_vals, threshold_deg)
         matched_true.add(i)
         matched_pred.add(j)
         n_tp += 1
+        sum_ang_tp += float(ang)
 
     n_fn = n_true - len(matched_true)
     n_fp = n_pred - len(matched_pred)
-    return n_tp, n_fp, n_fn
+    return n_tp, n_fp, n_fn, sum_ang_tp
+
+
+def complexity_masks(roi_mask, gt_n_peaks, min_peaks_for_crossing):
+    """Estratifica uma ROI em dois subconjuntos de voxels, pela COMPLEXIDADE
+    angular do ground truth (numero de picos de FOD do proprio ground
+    truth, `gt_n_peaks` -- ja calculado uma vez por sujeito em
+    `_process_subject` via `fit_peaks`, sentinela -1 fora da mascara):
+
+    - "simple": voxels de fibra unica (gt_n_peaks == 1);
+    - "crossing": voxels de cruzamento genuino (gt_n_peaks >=
+      min_peaks_for_crossing, default 2 -- exposto via
+      --min-peaks-for-crossing).
+
+    Motivacao (addendum secao 20.13): RCAE e' o metodo com PIOR
+    `energy_frac_high_order` (fracao de energia SH em l>=4, a unica ordem
+    capaz de representar cruzamento) em CGC/CGH/UF, mas o MELHOR nesse
+    mesmo metrico em FX -- um resultado agregado por ROI inteira que pode
+    estar escondendo heterogeneidade DENTRO da ROI (a hipotese, levantada
+    a partir do exemplo de glifo da secao 20.6, e' que o RCAE acerta bem
+    cruzamentos especificos e bem definidos mas suaviza demais voxels mais
+    ambiguos dentro da mesma ROI, puxando a media pra baixo). Repetir a
+    mesma conta de energia/confusao de picos separadamente em voxels
+    "simple" vs. "crossing" testa diretamente se o deficit de energia de
+    ordem alta do RCAE se CONCENTRA em voxels de cruzamento genuino
+    (apoiaria essa hipotese) ou esta distribuido uniformemente entre
+    voxels simples e de cruzamento (sugeriria outro tipo de vies, nao
+    especifico de cruzamento).
+
+    Voxels fora da mascara em qualquer um dos lados (sentinela -1) ficam
+    de fora dos dois subconjuntos (mesma convencao de `confusion_for_roi`/
+    `fit_peaks`). Os dois subconjuntos sao disjuntos entre si mas nao
+    cobrem necessariamente a ROI inteira (voxels com gt_n_peaks==0, "sem
+    pico nenhum no ground truth", nao entram em nenhum dos dois -- nao sao
+    nem "simples" nem "cruzamento", sao "vazios").
+
+    Retorna dict {"simple": mask_bool, "crossing": mask_bool}, mesmo shape
+    espacial de roi_mask."""
+    roi_bool = np.asarray(roi_mask).astype(bool)
+    valid = gt_n_peaks >= 0
+    simple_mask = roi_bool & valid & (gt_n_peaks == 1)
+    crossing_mask = roi_bool & valid & (gt_n_peaks >= min_peaks_for_crossing)
+    return {"simple": simple_mask, "crossing": crossing_mask}
 
 
 def confusion_for_roi(gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs, pred_vals,
@@ -232,6 +320,7 @@ def confusion_for_roi(gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs, pre
     voxel)."""
     idxs = np.argwhere(roi_mask)
     tp = fp = fn = tn_voxels = 0
+    sum_tp_angle_deg = 0.0
     for (x, y, z) in idxs:
         gt_n = gt_n_peaks[x, y, z]
         pr_n = pred_n_peaks[x, y, z]
@@ -240,13 +329,65 @@ def confusion_for_roi(gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs, pre
         if gt_n == 0 and pr_n == 0:
             tn_voxels += 1
             continue
-        vtp, vfp, vfn = match_peaks_voxel(
+        vtp, vfp, vfn, vsum_ang = match_peaks_voxel(
             gt_dirs[x, y, z], gt_vals[x, y, z], pred_dirs[x, y, z], pred_vals[x, y, z],
             threshold_deg)
         tp += vtp
         fp += vfp
         fn += vfn
-    return {"TP": tp, "FP": fp, "FN": fn, "TN_voxels": tn_voxels}
+        sum_tp_angle_deg += vsum_ang
+    # "sum_tp_angle_deg" (adicionado 2026-09-01, ver docstring de
+    # match_peaks_voxel): soma bruta, NAO a media -- fica aditivo de
+    # proposito, pra dar pra somar entre ROIs/sujeitos e so' dividir por TP
+    # (tambem somado) no fim, exatamente como precision/recall ja fazem
+    # com TP/FP/FN (nunca a media das precisions por linha).
+    return {"TP": tp, "FP": fp, "FN": fn, "TN_voxels": tn_voxels,
+            "sum_tp_angle_deg": sum_tp_angle_deg}
+
+
+def _stratified_columns(gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs, pred_vals,
+                         pred_shm_coeff, roi_mask, sh_order, threshold_deg,
+                         min_peaks_for_crossing, gt_energy_by_stratum):
+    """Calcula, para os dois estratos de complexidade ("simple"/"crossing",
+    ver `complexity_masks`) dentro de uma ROI, as MESMAS metricas que a
+    ROI inteira ja recebe (TP/FP/FN/TN_voxels/energy_frac_high_order/
+    ref_energy_frac_high_order) mais a contagem de voxels de cada estrato
+    (n_voxels_<estrato> -- necessaria pra interpretar os demais numeros,
+    ja que um estrato com poucos voxels tem estimativa mais ruidosa).
+
+    `gt_energy_by_stratum` e' um dict {"simple": energy_by_l, "crossing":
+    energy_by_l} com a referencia do GROUND TRUTH ja calculada (uma vez
+    por sujeito/ROI/ordem SH, mesmo racional de gt_energy_by_roi_full/
+    gt_energy_by_roi_sub em _process_subject -- reaproveitada aqui, nao
+    recalculada por metodo).
+
+    Retorna dict de colunas ADITIVAS, sufixadas por estrato (ex.:
+    "TP_simple", "energy_frac_high_order_crossing", "n_voxels_crossing"),
+    prontas para fazer `row.update(...)` sem tocar nas colunas ja
+    existentes (nenhuma coluna antiga muda de nome/semantica -- 100%
+    compativel com CSVs gerados antes desta estratificacao)."""
+    strata = complexity_masks(roi_mask, gt_n_peaks, min_peaks_for_crossing)
+    cols = {}
+    for stratum_name, stratum_mask in strata.items():
+        conf = confusion_for_roi(gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs,
+                                  pred_vals, stratum_mask, threshold_deg)
+        energy_by_l = sh_energy_by_order(pred_shm_coeff, sh_order, stratum_mask)
+        cols[f"n_voxels_{stratum_name}"] = int(stratum_mask.sum())
+        cols[f"TP_{stratum_name}"] = conf["TP"]
+        cols[f"FP_{stratum_name}"] = conf["FP"]
+        cols[f"FN_{stratum_name}"] = conf["FN"]
+        cols[f"TN_voxels_{stratum_name}"] = conf["TN_voxels"]
+        cols[f"sum_tp_angle_deg_{stratum_name}"] = conf["sum_tp_angle_deg"]
+        cols[f"energy_frac_high_order_{stratum_name}"] = _energy_frac_high_order(energy_by_l)
+        cols[f"ref_energy_frac_high_order_{stratum_name}"] = _energy_frac_high_order(
+            gt_energy_by_stratum.get(stratum_name, {}))
+    return cols
+
+
+_STRATIFIED_COLS = [f"{base}_{stratum}"
+                     for base in ("n_voxels", "TP", "FP", "FN", "TN_voxels", "sum_tp_angle_deg",
+                                  "energy_frac_high_order", "ref_energy_frac_high_order")
+                     for stratum in ("simple", "crossing")]
 
 
 def _process_subject(e, tag, args, roi_tracts):
@@ -284,6 +425,16 @@ def _process_subject(e, tag, args, roi_tracts):
         roi_name: sh_energy_by_order(gt_shm_coeff, sh_order_full, roi_mask)
         for roi_name, roi_mask in rois.items()
     }
+    # referencia de energia do GT, ja por ESTRATO de complexidade (secao
+    # 20.14) -- mesmo racional de gt_energy_by_roi_full acima (calculada
+    # uma vez por sujeito/ROI, reaproveitada por todos os metodos "volume
+    # completo", que compartilham sh_order_full).
+    gt_energy_by_stratum_full = {
+        roi_name: {stratum_name: sh_energy_by_order(gt_shm_coeff, sh_order_full, stratum_mask)
+                   for stratum_name, stratum_mask in complexity_masks(
+                       roi_mask, gt_n_peaks, args.min_peaks_for_crossing).items()}
+        for roi_name, roi_mask in rois.items()
+    }
 
     rows = []
 
@@ -297,7 +448,9 @@ def _process_subject(e, tag, args, roi_tracts):
                  "shell": args.shell_b, "n_level": args.n_level, "roi": roi_name,
                  "sh_order": order, "fit_failed": True,
                  "TP": np.nan, "FP": np.nan, "FN": np.nan, "TN_voxels": np.nan,
-                 "energy_frac_high_order": np.nan, "ref_energy_frac_high_order": np.nan}
+                 "sum_tp_angle_deg": np.nan,
+                 "energy_frac_high_order": np.nan, "ref_energy_frac_high_order": np.nan,
+                 **{c: np.nan for c in _STRATIFIED_COLS}}
                 for roi_name in rois]
 
     methods_to_try = [("baseline_sh", args.baseline_dir), ("rcae", args.rcae_dir)] + args.extra_methods
@@ -338,6 +491,10 @@ def _process_subject(e, tag, args, roi_tracts):
                        gt_energy_by_roi_full.get(roi_name, {}))}
             for l, (_e, frac) in energy_by_l.items():
                 row[f"energy_l{l}_frac"] = frac
+            row.update(_stratified_columns(
+                gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs, pred_vals,
+                pred_shm_coeff, roi_mask, sh_order_full, args.peak_match_threshold_deg,
+                args.min_peaks_for_crossing, gt_energy_by_stratum_full.get(roi_name, {})))
             rows.append(row)
 
     if args.subsampled_only:
@@ -371,14 +528,36 @@ def _process_subject(e, tag, args, roi_tracts):
                 # pela energia total ERRADA (incluiria energia de l>sh_order_sub
                 # que um fit real nessa ordem nunca teria). Reajusta o GT do
                 # zero em sh_order_sub (mesmo custo de um metodo a mais).
+                # nota: a estratificacao "simple"/"crossing" usa gt_n_peaks
+                # (fit do GT em sh_order_full), NAO um re-fit em sh_order_sub
+                # -- mesma escolha ja feita pela linha "conf" logo abaixo
+                # (confusion_for_roi recebe gt_n_peaks/gt_dirs/gt_vals do fit
+                # original em sh_order_full mesmo aqui no branch
+                # --subsampled-only, nunca um re-fit do GT em ordem menor).
+                # So a REFERENCIA DE ENERGIA (sh_energy_by_order dos
+                # coeficientes) precisa vir na ordem certa (sh_order_sub),
+                # ja que energia por ordem l depende de em que ordem o CSD
+                # foi ajustado -- por isso gt_energy_by_roi_sub/
+                # gt_energy_by_stratum_sub reajustam o GT do zero quando as
+                # ordens diferem, mas usando os MESMOS voxels de
+                # "simple"/"crossing" (definidos por gt_n_peaks, full order)
+                # que o resto do arquivo ja usa.
                 if sh_order_sub == sh_order_full:
                     gt_energy_by_roi_sub = gt_energy_by_roi_full
+                    gt_energy_by_stratum_sub = gt_energy_by_stratum_full
                 else:
                     _gt_n_sub, _gt_dirs_sub, _gt_vals_sub, gt_shm_coeff_sub = fit_peaks(
                         data, bvals, bvecs, args.shell_b, mask, args.shell_tol, sh_order_sub,
                         args.relative_peak_threshold, args.min_separation_angle, args.npeaks)
                     gt_energy_by_roi_sub = {
                         roi_name: sh_energy_by_order(gt_shm_coeff_sub, sh_order_sub, roi_mask)
+                        for roi_name, roi_mask in rois.items()
+                    }
+                    gt_energy_by_stratum_sub = {
+                        roi_name: {stratum_name: sh_energy_by_order(
+                                       gt_shm_coeff_sub, sh_order_sub, stratum_mask)
+                                   for stratum_name, stratum_mask in complexity_masks(
+                                       roi_mask, gt_n_peaks, args.min_peaks_for_crossing).items()}
                         for roi_name, roi_mask in rois.items()
                     }
                 for roi_name, roi_mask in rois.items():
@@ -393,6 +572,10 @@ def _process_subject(e, tag, args, roi_tracts):
                                gt_energy_by_roi_sub.get(roi_name, {}))}
                     for l, (_e, frac) in energy_by_l.items():
                         row[f"energy_l{l}_frac"] = frac
+                    row.update(_stratified_columns(
+                        gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs, pred_vals,
+                        pred_shm_coeff, roi_mask, sh_order_sub, args.peak_match_threshold_deg,
+                        args.min_peaks_for_crossing, gt_energy_by_stratum_sub.get(roi_name, {})))
                     rows.append(row)
 
     return rows
@@ -442,6 +625,14 @@ def main():
                      help="tolerancia angular (graus) para considerar que um pico predito e "
                           "um pico do ground truth sao 'o mesmo' pico (default 25 -- mesma "
                           "ordem de grandeza do --min-separation-angle do proprio CSD).")
+    ap.add_argument("--min-peaks-for-crossing", type=int, default=2,
+                     help="numero minimo de picos do GROUND TRUTH (gt_n_peaks) para um voxel "
+                          "contar como estrato 'crossing' na estratificacao por complexidade "
+                          "(addendum secao 20.14) -- default 2 (qualquer cruzamento). Voxels "
+                          "com exatamente 1 pico do GT formam o estrato 'simple'; voxels com 0 "
+                          "picos do GT nao entram em nenhum dos dois estratos. Mesma "
+                          "convencao de threshold usada em scripts/crossing_fiber_stratified_"
+                          "eval.py.")
     ap.add_argument("--roi-tracts", default=None,
                      help="mesma convencao de --roi-tracts em 07_downstream_dti_noddi.py. "
                           "Tratos JHU conhecidos: " + ", ".join(
@@ -511,7 +702,9 @@ def main():
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     cols = ["subject", "tag", "method", "shell", "n_level", "roi", "sh_order", "fit_failed",
-            "TP", "FP", "FN", "TN_voxels", "energy_frac_high_order", "ref_energy_frac_high_order"]
+            "TP", "FP", "FN", "TN_voxels", "sum_tp_angle_deg",
+            "energy_frac_high_order", "ref_energy_frac_high_order",
+            *_STRATIFIED_COLS]
     if not all_rows:
         print(f"[shard {args.shard_index}/{args.shard_count}] nenhum resultado neste shard -- "
               f"gravando CSV vazio em {out_csv}", flush=True)
@@ -522,6 +715,17 @@ def main():
     df["precision"] = df["TP"] / (df["TP"] + df["FP"]).replace(0, np.nan)
     df["recall"] = df["TP"] / (df["TP"] + df["FN"]).replace(0, np.nan)
     df["f1"] = 2 * df["precision"] * df["recall"] / (df["precision"] + df["recall"])
+    # "mean_tp_angle_deg" (adicionado 2026-09-01, ver docstring de
+    # match_peaks_voxel/confusion_for_roi): erro angular MEDIO dos picos
+    # casados como TP, por LINHA (1 sujeito x metodo x roi) -- so' pra
+    # inspecao rapida do CSV linha a linha. Ao AGREGAR entre linhas (resumo
+    # abaixo, ou qualquer analise entre sujeitos depois), sempre reduzir
+    # "sum_tp_angle_deg"/"TP" (ambos aditivos), NUNCA fazer a media desta
+    # coluna diretamente -- media de medias pondera errado quando o numero
+    # de TP varia entre linhas (exatamente o mesmo motivo pelo qual
+    # "precision"/"recall" acima tambem nao sao usadas diretamente no
+    # groupby do resumo, so' TP/FP/FN brutos).
+    df["mean_tp_angle_deg"] = df["sum_tp_angle_deg"] / df["TP"].replace(0, np.nan)
     df.to_csv(out_csv, index=False)
     print("Metricas de confusao de picos (TP/FP/FN/TN) salvas em", out_csv)
 
@@ -530,10 +734,18 @@ def main():
         print(f"\n{n_failed} ajuste(s) de CSD falharam (ver [aviso] nos logs acima -- "
               f"excluidos do resumo abaixo, igual a poc_csd_direction_count.py faz).")
     ok = df[~df["fit_failed"].fillna(False)]
-    summary = ok.groupby(["method", "roi"])[["TP", "FP", "FN", "TN_voxels"]].sum()
+    summary = ok.groupby(["method", "roi"])[["TP", "FP", "FN", "TN_voxels", "sum_tp_angle_deg"]].sum()
     summary["precision"] = summary["TP"] / (summary["TP"] + summary["FP"]).replace(0, np.nan)
     summary["recall"] = summary["TP"] / (summary["TP"] + summary["FN"]).replace(0, np.nan)
+    summary["mean_tp_angle_deg"] = summary["sum_tp_angle_deg"] / summary["TP"].replace(0, np.nan)
     print(summary)
+    print("\nLeitura de 'mean_tp_angle_deg': erro angular MEDIO (graus) so' entre os picos "
+          "casados como TP (dentro de --peak-match-threshold-deg) -- diferente de "
+          "precision/recall, que so' contam SE casou ou nao, este numero mostra O QUAO BEM "
+          "casou. Dois metodos com precision/recall quase identicos ainda podem ter "
+          "mean_tp_angle_deg bem diferente -- sinal de que um reconstroi a direcao certa com "
+          "mais fidelidade que o outro, mesmo quando a contagem binaria de picos nao "
+          "diferencia os dois (ver addendum secao 20.15, achado de 2026-09-01).")
 
     if "energy_frac_high_order" in ok.columns:
         energy_summary = ok.groupby(["method", "roi"])[
@@ -547,6 +759,57 @@ def main():
               "ter recall/precision de picos ok e MESMO ASSIM ter essa fracao bem abaixo da "
               "referencia, sinal de que a estrutura recuperada e mais fraca/instavel do que a "
               "contagem de picos sozinha sugere.")
+
+    if "energy_frac_high_order_crossing" in ok.columns:
+        strat_cols = ["n_voxels_simple", "energy_frac_high_order_simple",
+                      "ref_energy_frac_high_order_simple", "n_voxels_crossing",
+                      "energy_frac_high_order_crossing", "ref_energy_frac_high_order_crossing"]
+        strat_summary = ok.groupby(["method", "roi"])[strat_cols].mean()
+        print(f"\nEnergia SH em l>=4, ESTRATIFICADA por complexidade do ground truth "
+              f"(--min-peaks-for-crossing={args.min_peaks_for_crossing}; 'simple' = voxel com "
+              f"exatamente 1 pico no GT, 'crossing' = voxel com >= {args.min_peaks_for_crossing} "
+              f"picos no GT; voxels com 0 picos no GT ficam de fora dos dois):")
+        print(strat_summary)
+        print("\nLeitura: compare o gap 'energy_frac_high_order_crossing' vs. "
+              "'ref_energy_frac_high_order_crossing' com o mesmo gap no estrato 'simple' -- um "
+              "metodo cujo deficit de energia de ordem alta (visto no resumo agregado por ROI "
+              "acima) se CONCENTRA no estrato 'crossing' (gap bem maior ali do que em 'simple') "
+              "esta especificamente suavizando cruzamentos genuinos, nao so perdendo energia de "
+              "forma uniforme por toda a ROI. n_voxels_* avisa quando um estrato tem poucos "
+              "voxels (estimativa mais ruidosa, sobretudo 'crossing' em ROIs de fibra "
+              "predominantemente unica).")
+
+    # "mean_tp_angle_deg_simple"/"mean_tp_angle_deg_crossing" (adicionado
+    # 2026-09-02, ver addendum secao 20.16 -- pendencia deixada em aberto na
+    # secao 20.15): mesmo teste de estratificacao ja feito para
+    # "energy_frac_high_order" acima, agora aplicado ao erro angular medio
+    # dos picos casados como TP. Reduz SEMPRE por soma bruta
+    # ("sum_tp_angle_deg_simple"/"sum_tp_angle_deg_crossing" sobre
+    # "TP_simple"/"TP_crossing", ambos aditivos) e NUNCA por media das
+    # medias por linha -- mesma disciplina/mesmo motivo ja documentado para
+    # "mean_tp_angle_deg" da ROI inteira, linhas acima.
+    if "sum_tp_angle_deg_crossing" in ok.columns:
+        angle_strat_cols = ["TP_simple", "sum_tp_angle_deg_simple",
+                             "TP_crossing", "sum_tp_angle_deg_crossing"]
+        angle_strat_summary = ok.groupby(["method", "roi"])[angle_strat_cols].sum()
+        angle_strat_summary["mean_tp_angle_deg_simple"] = (
+            angle_strat_summary["sum_tp_angle_deg_simple"]
+            / angle_strat_summary["TP_simple"].replace(0, np.nan))
+        angle_strat_summary["mean_tp_angle_deg_crossing"] = (
+            angle_strat_summary["sum_tp_angle_deg_crossing"]
+            / angle_strat_summary["TP_crossing"].replace(0, np.nan))
+        print(f"\nErro angular medio dos TP (graus), ESTRATIFICADO por complexidade do ground "
+              f"truth (--min-peaks-for-crossing={args.min_peaks_for_crossing}, mesmos estratos "
+              f"'simple'/'crossing' da tabela de energia SH acima):")
+        print(angle_strat_summary[["TP_simple", "mean_tp_angle_deg_simple",
+                                    "TP_crossing", "mean_tp_angle_deg_crossing"]])
+        print("\nLeitura: e' o teste direto da hipotese 'RCAE aponta melhor pro pico mas "
+              "descreve pior a estrutura de cruzamento inteira' (addendum secao 20.16) -- "
+              "compare 'mean_tp_angle_deg_crossing' entre metodos especificamente nos voxels "
+              "com cruzamento genuino no GT (>= 2 picos), em vez de so' o agregado da ROI "
+              "inteira (que mistura voxels simples e de cruzamento). TP_crossing avisa quando "
+              "a comparacao e' baseada em poucos pares casados (estimativa mais ruidosa), mesmo "
+              "cuidado ja documentado para 'n_voxels_crossing' na tabela de energia SH.")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=rrst815
+#SBATCH --job-name=rrs1500310
 #SBATCH --cluster=gpu
 #SBATCH --partition=a100
 #SBATCH --gres=gpu:1
@@ -85,7 +85,12 @@ echo "LR=$LR (default 1e-3)"
 QC_FLAG=()
 if [[ "${USE_QUALITY_COND:-0}" == "1" ]]; then
     QC_FLAG=(--use-quality-cond)
-    echo "USE_QUALITY_COND=1 -- treinando a variante consciente da qualidade de cada par do feixe"
+    echo "USE_QUALITY_COND=1 -- treinando a variante consciente da qualidade de cada par do feixe (condiciona o FlowNet3D)"
+fi
+WQC_FLAG=()
+if [[ "${WEIGHT_QUALITY_COND:-0}" == "1" ]]; then
+    WQC_FLAG=(--weight-quality-cond)
+    echo "WEIGHT_QUALITY_COND=1 -- alimentando residual_deg/gap_deg direto na PairWeightHead3D (condiciona a fusao, independente de USE_QUALITY_COND)"
 fi
 ONLY_VALID_FLAG=()
 if [[ "${ONLY_VALID:-1}" == "0" ]]; then
@@ -111,5 +116,5 @@ python scripts/04e_train_rrin_star.py \
     --epochs 150 --batch-size 8 --patch-size 10 \
     --lr "$LR" --num-workers 8 --max-cached-subjects 6 --patience 15 \
     --val-num-workers 4 --val-max-cached-subjects 1 \
-    "${RESUME_FLAG[@]}" "${QC_FLAG[@]}" "${ONLY_VALID_FLAG[@]}" "${NORM_TYPE_FLAG[@]}" \
+    "${RESUME_FLAG[@]}" "${QC_FLAG[@]}" "${WQC_FLAG[@]}" "${ONLY_VALID_FLAG[@]}" "${NORM_TYPE_FLAG[@]}" \
     --job-id "${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"
