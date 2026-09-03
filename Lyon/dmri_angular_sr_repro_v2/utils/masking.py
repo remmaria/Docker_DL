@@ -11,7 +11,11 @@ from pathlib import Path
 # Rotulos legiveis dos tratos do atlas JHU-ICBM usados na analise focada em
 # Alzheimer (fornix, cingulo, uncinado -- ver discussao no protocolo do
 # projeto). Nomes seguem exatamente o que aparece nos arquivos do usuario
-# (ex.: "JHU-ICBM-labels-1mm_warped_s_CGC_R.nii.gz").
+# (ex.: "JHU-ICBM-labels-1mm_warped_s_CGC_R.nii.gz"). CGC/CGH/UF sao
+# ipsilaterais (nao ha conexao real entre os dois lados) -- find_jhu_roi_mask
+# aceita "CGC_L"/"CGC_R"/etc (ver sua docstring e addendum secao 25.3) pra
+# pegar so' um hemisferio, em vez do OR R+L combinado default. FX e' a
+# excecao genuina de linha media, sem sufixo de lado no atlas.
 JHU_TRACT_LABELS = {
     "CGC": "Cingulo (giro do cingulo)",
     "CGH": "Cingulo (porcao hipocampal)",
@@ -112,12 +116,32 @@ def find_jhu_roi_mask(dwi_path: str, tract: str) -> tuple[np.ndarray | None, lis
     lateralizados no atlas (ex.: FX -- fornix e uma estrutura de linha
     media), tenta tambem o nome sem sufixo de lado.
 
+    ADITIVO 2026-09-02 (ver addendum secao 25.3): `tract` pode vir com
+    sufixo explicito de lado (ex. "CGC_L", "CGC_R") para pegar SO aquele
+    hemisferio, sem o OR automatico -- motivado pelo achado de que uma
+    streamline do corpo caloso cruzando a linha media podia tocar a
+    mascara OR'd R+L dos dois lados do cingulo e ser contada como
+    "conexao bilateral", que nao existe de verdade (o cingulo e' um trato
+    de associacao estritamente ipsilateral, nao comissural -- diferente do
+    fornix, que e' genuinamente de linha media). Nesse caso a lista de
+    lados devolvida tem um unico elemento (["L"] ou ["R"]).
+
     Devolve (mascara_bool_ou_None, lista_de_lados_encontrados) -- a lista de
     lados serve so para log/diagnostico (ex.: alertar se so achou "R" e nao
-    "L", o que pode indicar um arquivo faltando por engano).
+    "L", o que pode indicar um arquivo faltando por engano -- nao se aplica
+    quando o lado foi pedido explicitamente, ver load_roi_masks).
     """
     import nibabel as nib
     parent = Path(dwi_path).parent
+
+    for side_suffix, side in (("_L", "L"), ("_R", "R")):
+        if tract.endswith(side_suffix):
+            base_tract = tract[: -len(side_suffix)]
+            candidate = parent / f"JHU-ICBM-labels-1mm_warped_s_{base_tract}_{side}.nii.gz"
+            if not candidate.exists():
+                return None, []
+            return nib.load(str(candidate)).get_fdata() > 0.5, [side]
+
     found: dict[str, np.ndarray] = {}
     for side in ("R", "L"):
         candidate = parent / f"JHU-ICBM-labels-1mm_warped_s_{tract}_{side}.nii.gz"
@@ -174,12 +198,17 @@ def load_roi_masks(dwi_path: str, tracts: list[str], base_mask: np.ndarray | Non
 
     Cada nome em `tracts` pode ser (tentados nesta ordem):
     1. um trato do atlas JHU-ICBM (find_jhu_roi_mask -- combina R+L
-       automaticamente, ex. "FX", "CGC", "CGH", "UF"); ou
+       automaticamente, ex. "FX", "CGC", "CGH", "UF"; ou um lado especifico
+       so, ex. "CGC_L"/"CGC_R" -- ver addendum secao 25.3 e docstring de
+       find_jhu_roi_mask: recomendado para CGC/CGH/UF, que sao tratos
+       estritamente ipsilaterais -- o OR R+L combinado pode contar fibra
+       comissural cruzando a linha media como se fosse "conexao bilateral"
+       do trato, que nao existe de verdade); ou
     2. uma mascara de segmentacao por sujeito (find_seg_roi_mask -- ja
        lateralizada quando aplicavel, ver SEG_ROI_LABELS, ex. "WM",
        "CbWM_L", "Ctx_R", "Hipp_R", "SubCtx_L").
     Os dois tipos podem ser misturados na mesma lista (ex.
-    ROI_TRACTS="FX,CGC,CGH,UF,WM,CbWM_L,Ctx_R,Hipp_R,SubCtx_L").
+    ROI_TRACTS="FX,CGC_L,CGC_R,CGH_L,CGH_R,UF_L,UF_R,WM,Hipp_R").
 
     Devolve um dict {nome: mascara_bool} SOMENTE para as ROIs cujo arquivo
     foi encontrado (em qualquer uma das duas convencoes); ROIs ausentes sao
@@ -189,7 +218,12 @@ def load_roi_masks(dwi_path: str, tracts: list[str], base_mask: np.ndarray | Non
     rois: dict[str, np.ndarray] = {}
     for tract in tracts:
         mask, sides = find_jhu_roi_mask(dwi_path, tract)
-        if mask is not None and (sides == ["R"] or sides == ["L"]):
+        # lado pedido explicitamente (ex. "CGC_L") -- find_jhu_roi_mask ja
+        # devolve so' aquele lado de proposito (ver sua docstring), entao
+        # o aviso de "so achou um lado" abaixo NAO se aplica aqui (seria
+        # falso-positivo a cada chamada).
+        side_requested_explicitly = tract.endswith("_L") or tract.endswith("_R")
+        if mask is not None and not side_requested_explicitly and (sides == ["R"] or sides == ["L"]):
             print(f"[aviso] ROI '{tract}' para {dwi_path!r}: so encontrou o "
                   f"lado {sides[0]} (esperado R+L, a menos que este seja um "
                   f"trato de linha media) -- confira se nao falta arquivo.",

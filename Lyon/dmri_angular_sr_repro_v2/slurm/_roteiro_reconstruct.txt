@@ -39,7 +39,7 @@ TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 
 # M = 3 RES = 10
 TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m3r10 \
     RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
-    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star3/runs/3631329_0/best.pt \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star3/runs/36315684_0/best.pt \
     RECON_TAG=rrin_n16_star310 \
     ENSEMBLE_M=3 \
     sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
@@ -47,7 +47,7 @@ TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m3r10 
 
 # RCAE n16
 RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
-  CKPT_PATH="/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n16/runs/3632328_0/best.pt" \
+  CKPT_PATH="/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n16/runs/3635625_0/best.pt" \
   RECON_TAG=rcae_n16 \
   sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
@@ -55,7 +55,7 @@ RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
 # M = 8 RES = 15
 TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m8r15 \
     RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
-    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star8/runs/3634024_0/best.pt \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star8/runs/3636396_0/best.pt \
     RECON_TAG=rrin_n16_star815 \
     ENSEMBLE_M=8 \
     sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
@@ -64,7 +64,7 @@ TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m8r15 
 # M = 6 RES = 10
 TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 \
     RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
-    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star6_wqc/runs/3634030_0/best.pt \
+    CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star6_wqc/runs/3636402_0/best.pt \
     RECON_TAG=rrin_n16_star610wq \
     ENSEMBLE_M=6 \
     WEIGHT_QUALITY_COND=1 \

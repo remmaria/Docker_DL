@@ -29,3 +29,16 @@ SUBSAMPLED_ONLY=1 \
 SUBJECTS="20170417094841_802780_20170417094841_802780" \
 ROI_TRACTS="FX,CGC,CGH,UF" \
   sbatch 11_peak_confusion_by_roi.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+SUBSAMPLED_ONLY=1 \
+SUBJECTS="20170417094841_802780_20170417094841_802780" \
+ROI_TRACTS="FX,CGC,CGH,UF" \
+EXTRA_METHOD="naive_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_blend_recon,\
+naive_ensemble_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_ensemble_blend_recon,\
+rrin_n16_star610=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star610,\
+rrin_n16_star815=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star815,\
+implicit_n16=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/implicit_recon_implicit_n16,\
+rcae_n16=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_recon_rcae_n16" \
+  sbatch 08_downstream_tractography.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=pairflow_ft
 #SBATCH --cluster=gpu
-#SBATCH --partition=l40s
+#SBATCH --partition=a100
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -99,16 +99,15 @@ PRINT_EVERY="${PRINT_EVERY:-20}"
 echo "BATCH_LOG_EVERY=$BATCH_LOG_EVERY PRINT_EVERY=$PRINT_EVERY (default 10/20 -- ver "
 echo "scripts/04h_train_pairflow_finetune.py --help)"
 
-# VARY_SUBJECT_ORDER=1 / LOG_WORKER_LOADS=1 -- mesma flag/racional de
-# slurm/04g_train_pairflow_ssl.sh (diagnostico de gargalo de dataloading,
-# 2026-09-02: wait_s dominou 97% do tempo de epoca contra so 3% de
-# compute_s numa rodada real do 04g -- ver docstring de
-# utils.dataset.SubjectGroupedSampler.__init__). Por padrao a ordem dos
-# sujeitos fica CONGELADA entre epocas.
-VARY_ORDER_FLAG=()
-if [[ "${VARY_SUBJECT_ORDER:-0}" == "1" ]]; then
-    VARY_ORDER_FLAG=(--vary-subject-order)
-    echo "VARY_SUBJECT_ORDER=1 -- ordem dos sujeitos volta a mudar a cada epoca (comportamento antigo)"
+# FREEZE_SUBJECT_ORDER=1 / LOG_WORKER_LOADS=1 -- mesma flag/racional de
+# slurm/04g_train_pairflow_ssl.sh. Revertido a pedido explicito da usuaria
+# em 2026-09-02 (o experimento de congelar ordem nao resolveu o gargalo
+# real e coincidiu com uma rodada travada) -- comportamento default
+# voltou a ser o antigo (ordem reembaralhada a cada epoca).
+FREEZE_ORDER_FLAG=()
+if [[ "${FREEZE_SUBJECT_ORDER:-0}" == "1" ]]; then
+    FREEZE_ORDER_FLAG=(--freeze-subject-order)
+    echo "FREEZE_SUBJECT_ORDER=1 -- ordem dos sujeitos CONGELADA entre epocas (experimental, revertido por padrao)"
 fi
 LOG_WORKER_LOADS_FLAG=()
 if [[ "${LOG_WORKER_LOADS:-0}" == "1" ]]; then
@@ -126,5 +125,5 @@ python scripts/04h_train_pairflow_finetune.py \
     --val-num-workers 4 --val-max-cached-subjects 1 \
     --batch-log-every "$BATCH_LOG_EVERY" --print-every "$PRINT_EVERY" \
     "${RESUME_FLAG[@]}" "${INIT_FLAG[@]}" "${FREEZE_FLAG[@]}" "${ONLY_VALID_FLAG[@]}" \
-    "${NORM_TYPE_FLAG[@]}" "${VARY_ORDER_FLAG[@]}" "${LOG_WORKER_LOADS_FLAG[@]}" \
+    "${NORM_TYPE_FLAG[@]}" "${FREEZE_ORDER_FLAG[@]}" "${LOG_WORKER_LOADS_FLAG[@]}" \
     --job-id "${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"

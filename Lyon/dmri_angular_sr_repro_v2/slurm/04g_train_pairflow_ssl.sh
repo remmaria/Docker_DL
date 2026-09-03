@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=pairflow_ssl
 #SBATCH --cluster=gpu
-#SBATCH --partition=a100
+#SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -103,18 +103,19 @@ echo "BATCH_LOG_EVERY=$BATCH_LOG_EVERY PRINT_EVERY=$PRINT_EVERY (default 10/20)"
 GAP_HIST_STEP_DEG="${GAP_HIST_STEP_DEG:-15}"
 echo "GAP_HIST_STEP_DEG=$GAP_HIST_STEP_DEG (default 15, 0 desliga)"
 
-# VARY_SUBJECT_ORDER=1 (default 0 -- diagnostico de gargalo de dataloading,
-# 2026-09-02): por padrao a ordem dos sujeitos fica CONGELADA entre epocas
-# (--vary-subject-order NAO passado), pra o cache LRU de cada worker poder
-# reaproveitar entre epocas (ver docstring de
-# utils.dataset.SubjectGroupedSampler.__init__ -- achado real: wait_s
-# dominou 97% do tempo de epoca contra so 3% de compute_s numa rodada
-# real). VARY_SUBJECT_ORDER=1 volta ao comportamento antigo, so pra
-# comparar/depurar.
-VARY_ORDER_FLAG=()
-if [[ "${VARY_SUBJECT_ORDER:-0}" == "1" ]]; then
-    VARY_ORDER_FLAG=(--vary-subject-order)
-    echo "VARY_SUBJECT_ORDER=1 -- ordem dos sujeitos volta a mudar a cada epoca (comportamento antigo)"
+# FREEZE_SUBJECT_ORDER=1 (default 0 -- revertido a pedido explicito da
+# usuaria em 2026-09-02: o experimento de congelar a ordem dos sujeitos
+# entre epocas nao resolveu o gargalo real de dataloading -- confirmado
+# via LOG_WORKER_LOADS que o mesmo sujeito e' recarregado por TODOS os
+# workers a cada troca DENTRO da mesma epoca, o que freeze_order nao
+# evita -- e coincidiu com uma rodada travada). Comportamento default
+# agora e' o ANTIGO (ordem reembaralhada a cada epoca, como sempre foi).
+# FREEZE_SUBJECT_ORDER=1 liga de volta o experimento so' pra quem quiser
+# retestar deliberadamente.
+FREEZE_ORDER_FLAG=()
+if [[ "${FREEZE_SUBJECT_ORDER:-0}" == "1" ]]; then
+    FREEZE_ORDER_FLAG=(--freeze-subject-order)
+    echo "FREEZE_SUBJECT_ORDER=1 -- ordem dos sujeitos CONGELADA entre epocas (experimental, revertido por padrao)"
 fi
 
 # LOG_WORKER_LOADS=1 (default 0): imprime worker_id/subject_tag a cada
@@ -138,5 +139,5 @@ python scripts/04g_train_pairflow_ssl.py \
     --batch-log-every "$BATCH_LOG_EVERY" --print-every "$PRINT_EVERY" \
     --gap-hist-step-deg "$GAP_HIST_STEP_DEG" \
     "${RESUME_FLAG[@]}" "${GAP_FLAGS[@]}" "${NORM_TYPE_FLAG[@]}" \
-    "${VARY_ORDER_FLAG[@]}" "${LOG_WORKER_LOADS_FLAG[@]}" \
+    "${FREEZE_ORDER_FLAG[@]}" "${LOG_WORKER_LOADS_FLAG[@]}" \
     --job-id "${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"

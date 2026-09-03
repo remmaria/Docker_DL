@@ -1,0 +1,16 @@
+# só rodar a repetibilidade (b1000, três aquisições quase identicas) primeiro:
+MAKE_GLYPHS=1 
+MSMT=1 
+PROTOCOLS="SeqA1" 
+FIXED_PATCH_REFERENCE=SeqA1
+NORMALIZE=global
+SH_ORDER=6
+ROI_TRACTS="FX,CGC,CGH,UF"
+
+SH_ORDER=6 MSMT=1 MAKE_GLYPHS=1 FIXED_PATCH_REFERENCE=SeqA1 NORMALIZE=global \
+  sbatch poc_multiprotocol_gt_reliability.sh /ix1/tibrahim/rmm270/DATA/DWIs/studies/mrime-rflab_harm _geomcorr
+
+
+SUBJECTS=20170417094841_802780_20170417094841_802780 \
+  N_JOBS=9 MAKE_GLYPHS=1 GLYPH_N_LEVELS="6 10 16 20 24 32 48 54 60" \
+  sbatch poc_native_order_curve.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000

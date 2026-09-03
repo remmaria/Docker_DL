@@ -320,21 +320,26 @@ def render_glyph_field(ax, shm_patch, directions, sh_order, glyph_scale,
     return sf_max
 
 
-def glyph_patch_for_protocol_shell(mask, n_peaks_map, shm_coeff, args):
-    """Recorta um sub-volume centrado no centroide da mascara e acha o
-    melhor patch de cruzamento -- reaproveita n_peaks_map/shm_coeff JA
-    calculados (nao refaz CSD, so' fatiamento numpy). Retorna
-    (shm_patch, crossing_frac) ou None se nao achar patch valido (mascara
-    vazia, sub-volume menor que --patch-size, ou nenhum patch atingir
+def locate_patch_absolute(mask, n_peaks_map, args):
+    """Mesma busca de sempre (recorta sub-volume centrado no centroide da
+    mascara, desliza janela --patch-size procurando o melhor cruzamento),
+    mas devolve o patch em COORDENADAS ABSOLUTAS do volume inteiro (idx3,
+    uma tupla de 3 slices indexavel direto em qualquer array com o MESMO
+    shape) em vez de um array ja recortado -- isso permite reaproveitar a
+    MESMA localizacao em outro protocolo/shell (2026-09-02, --fixed-patch-
+    reference), desde que os dois tenham exatamente o mesmo shape espacial
+    (mesmo grid/afim -- ver aviso em main() sobre isso NAO valer sem
+    registro previo se os shapes diferirem). Retorna (idx3, crossing_frac)
+    ou None nas mesmas condicoes de falha de antes (mascara vazia,
+    sub-volume menor que --patch-size, ou nenhum patch atingindo
     --min-mask-frac)."""
     mask_bool = mask.astype(bool)
     if not mask_bool.any():
         return None
     centroid = tuple(int(round(c)) for c in np.argwhere(mask_bool).mean(axis=0))
-    slices, _origin = bounding_box(mask_bool, centroid, args.search_radius)
+    slices, origin = bounding_box(mask_bool, centroid, args.search_radius)
     sub_mask = mask_bool[slices]
     sub_n_peaks = n_peaks_map[slices]
-    sub_shm = shm_coeff[slices]
 
     found = find_best_crossing_patch(
         sub_n_peaks, sub_mask, args.patch_size, args.slice_axis,
@@ -346,10 +351,48 @@ def glyph_patch_for_protocol_shell(mask, n_peaks_map, shm_coeff, args):
 
     idx3 = [None, None, None]
     out_axes = [a for a in range(3) if a != args.slice_axis]
-    idx3[out_axes[0]] = slice(o0, o0 + args.patch_size)
-    idx3[out_axes[1]] = slice(o1, o1 + args.patch_size)
-    idx3[args.slice_axis] = slice(slice_idx, slice_idx + 1)
-    shm_patch = sub_shm[tuple(idx3)].reshape(args.patch_size, args.patch_size, -1)
+    idx3[out_axes[0]] = slice(origin[out_axes[0]] + o0, origin[out_axes[0]] + o0 + args.patch_size)
+    idx3[out_axes[1]] = slice(origin[out_axes[1]] + o1, origin[out_axes[1]] + o1 + args.patch_size)
+    idx3[args.slice_axis] = slice(origin[args.slice_axis] + slice_idx,
+                                   origin[args.slice_axis] + slice_idx + 1)
+    return tuple(idx3), crossing_frac
+
+
+def glyph_patch_for_protocol_shell(mask, n_peaks_map, shm_coeff, args, fixed_idx3=None):
+    """Recorta o patch de glifo pra um (protocolo, shell). Comportamento
+    default (fixed_idx3=None, de sempre): busca o MELHOR cruzamento
+    proprio deste protocolo (via locate_patch_absolute). NOVO
+    (2026-09-02): se `fixed_idx3` for passado (uma tupla de 3 slices em
+    coordenadas absolutas, tipicamente vinda de um protocolo de
+    referencia via --fixed-patch-reference), usa ESSE patch direto, sem
+    busca nenhuma -- garante o MESMO voxel fisico entre paineis, desde
+    que este array (`mask`/`n_peaks_map`/`shm_coeff`) tenha o MESMO shape
+    espacial de onde `fixed_idx3` foi calculado (responsabilidade do
+    chamador conferir isso ANTES de chamar com fixed_idx3 -- ver main()).
+    `crossing_frac` nesse modo reflete a fracao de cruzamento DESTE
+    protocolo especificamente NESSE patch (pode ser bem diferente do
+    melhor patch que ele teria escolhido sozinho -- e' esperado, e' o que
+    se quer medir). Retorna (shm_patch, crossing_frac) ou None (mascara
+    vazia/sub-volume pequeno demais/nenhum patch valido, so no modo
+    default; no modo fixed_idx3 so retorna None se n_masked==0 no patch
+    fixo, caso patologico de mascara vazia bem naquele local)."""
+    if fixed_idx3 is not None:
+        mask_bool = mask.astype(bool)
+        patch_mask = mask_bool[fixed_idx3]
+        n_masked = int(patch_mask.sum())
+        if n_masked == 0:
+            return None
+        crossing_bool = mask_bool & (n_peaks_map >= args.min_peaks_for_crossing)
+        patch_crossing = crossing_bool[fixed_idx3]
+        crossing_frac = float(patch_crossing.sum()) / n_masked
+        shm_patch = shm_coeff[fixed_idx3].reshape(args.patch_size, args.patch_size, -1)
+        return shm_patch, crossing_frac
+
+    located = locate_patch_absolute(mask, n_peaks_map, args)
+    if located is None:
+        return None
+    idx3, crossing_frac = located
+    shm_patch = shm_coeff[idx3].reshape(args.patch_size, args.patch_size, -1)
     return shm_patch, crossing_frac
 
 
@@ -580,11 +623,35 @@ def main():
                           "quando NENHUM painel e' um 'ground truth' comum (protocolos com "
                           "b-values/contrastes diferentes nao tem magnitude de FOD diretamente "
                           "comparavel). 'global': todos normalizados pelo pico do PRIMEIRO "
-                          "painel.")
+                          "painel -- com --fixed-patch-reference (mesmo voxel fisico em todos "
+                          "os paineis) isso passa a ser uma comparacao de magnitude tambem "
+                          "valida (ainda sujeita a diferenca de contraste por b-value em si, "
+                          "nao so por escolha de voxel).")
+    ap.add_argument("--fixed-patch-reference", default=None,
+                     help="(2026-09-02) nome do protocolo (subpasta, ex. 'SeqA1') cujo melhor "
+                          "patch de cruzamento sera usado como referencia -- o MESMO patch "
+                          "(mesmas coordenadas de voxel) e' entao reaproveitado em TODOS os "
+                          "outros paineis, em vez de cada protocolo buscar seu proprio melhor "
+                          "patch (default, sem esta flag). SO FAZ SENTIDO SE os protocolos "
+                          "estiverem no MESMO grid/afim (mesmo shape espacial) -- o script "
+                          "confere isso e PULA (com aviso) o painel de qualquer protocolo cujo "
+                          "shape difira do de referencia, em vez de recortar um voxel errado "
+                          "silenciosamente (comparacao voxel-a-voxel sem registro previo nao e' "
+                          "valida, ver docstring do modulo). Sem esta flag, comportamento "
+                          "identico ao de sempre (cada painel busca seu proprio melhor patch).")
+    ap.add_argument("--fixed-patch-shell", type=float, default=None,
+                     help="so' usado com --fixed-patch-reference: qual shell (b-value nominal) "
+                          "do protocolo de referencia usar pra localizar o patch, se ele tiver "
+                          "mais de uma shell nao-zero -- default (None) usa a MENOR shell "
+                          "nao-zero processada desse protocolo.")
     args = ap.parse_args()
 
     if args.make_glyphs and args.out_fig is None:
         sys.exit("--make-glyphs precisa de --out-fig")
+    if args.fixed_patch_reference and not args.make_glyphs:
+        sys.exit("--fixed-patch-reference so' faz sentido junto com --make-glyphs")
+    if args.fixed_patch_shell is not None and not args.fixed_patch_reference:
+        sys.exit("--fixed-patch-shell so' faz sentido junto com --fixed-patch-reference")
 
     roi_tracts = [t.strip() for t in args.roi_tracts.split(",")] if args.roi_tracts else None
     glyph_panels = []  # (label, shm_patch, sh_order, crossing_frac)
@@ -600,6 +667,60 @@ def main():
         if missing:
             print(f"[aviso] protocolo(s) pedido(s) e nao encontrado(s): {sorted(missing)}", flush=True)
     print(f"{len(found)} protocolo(s) encontrado(s): {[e['subject'] for e in found]}", flush=True)
+
+    # (2026-09-02) --fixed-patch-reference: localiza o patch UMA VEZ no
+    # protocolo de referencia, ANTES do loop principal, pra reaproveitar a
+    # mesma localizacao (coordenadas absolutas) em todos os paineis do
+    # loop abaixo. So' funciona pra protocolos com o MESMO shape espacial
+    # do de referencia -- checado por protocolo dentro do loop principal
+    # (nao aqui), com aviso+pulo do painel se divergir (comparacao
+    # voxel-a-voxel sem registro previo nao e' valida, ver docstring do
+    # modulo).
+    fixed_idx3 = None
+    fixed_shape = None
+    if args.fixed_patch_reference:
+        ref_entry = next((e for e in found if e["subject"] == args.fixed_patch_reference), None)
+        if ref_entry is None:
+            sys.exit(f"--fixed-patch-reference={args.fixed_patch_reference!r} nao encontrado "
+                      f"entre os protocolos descobertos: {[e['subject'] for e in found]}")
+        bvals_r, bvecs_r = load_bval_bvec(str(ref_entry["bval_path"]), str(ref_entry["bvec_path"]))
+        data_r, _affine_r, _header_r = load_dwi(str(ref_entry["dwi_path"]))
+        fixed_shape = data_r.shape[:3]
+        shells_r = split_shells(bvals_r, tol=args.shell_tol)
+        b0_idx_r = shells_r.get(0, np.array([], dtype=int))
+        if b0_idx_r.size == 0:
+            sys.exit(f"--fixed-patch-reference={args.fixed_patch_reference!r} nao tem volume b0")
+        shell_keys_r = sorted(k for k in shells_r if k != 0)
+        if not shell_keys_r:
+            sys.exit(f"--fixed-patch-reference={args.fixed_patch_reference!r} nao tem shell "
+                      f"nao-zero nenhuma")
+        if args.fixed_patch_shell is not None:
+            chosen_shell_r = min(shell_keys_r, key=lambda k: abs(k - args.fixed_patch_shell))
+            if abs(chosen_shell_r - args.fixed_patch_shell) > args.shell_tol:
+                sys.exit(f"--fixed-patch-shell={args.fixed_patch_shell} nao bate (tol="
+                          f"{args.shell_tol}) com nenhuma shell de "
+                          f"{args.fixed_patch_reference!r}: {shell_keys_r}")
+        else:
+            chosen_shell_r = shell_keys_r[0]
+        shell_idx_r = np.asarray(shells_r[chosen_shell_r], dtype=int)
+        b0_mean_r = data_r[..., b0_idx_r].mean(axis=-1)
+        mask_r = load_or_build_mask(str(ref_entry["dwi_path"]), b0_mean_r,
+                                     mask_suffix=args.mask_suffix)
+        sh_order_r = args.sh_order or max_order_for_n_directions(len(shell_idx_r))
+        idx_r = np.concatenate([b0_idx_r, shell_idx_r])
+        idx_r.sort()
+        n_peaks_map_r, _shm_coeff_r = fit_csd_peaks(
+            data_r[..., idx_r], bvals_r[idx_r], bvecs_r[idx_r], mask_r, sh_order_r,
+            args.npeaks, args.relative_peak_threshold, args.min_separation_angle)
+        located_r = locate_patch_absolute(mask_r, n_peaks_map_r, args)
+        if located_r is None:
+            sys.exit(f"nenhum patch de cruzamento encontrado em "
+                      f"{args.fixed_patch_reference!r} (b={chosen_shell_r:.0f}) -- tente "
+                      f"--search-radius maior ou --min-mask-frac menor")
+        fixed_idx3, _crossing_frac_r = located_r
+        print(f"--fixed-patch-reference={args.fixed_patch_reference!r} (b={chosen_shell_r:.0f}, "
+              f"shape={fixed_shape}): patch fixo localizado em {fixed_idx3} -- reaproveitado em "
+              f"todos os protocolos com o MESMO shape espacial", flush=True)
 
     all_rows = []
     ref_shape = None
@@ -637,12 +758,25 @@ def main():
                     print(f"{tag} b={shell_key:.0f} (n_dirs={len(shell_idx)}, "
                           f"sh_order={sh_order}): {len(rows)} linha(s)", flush=True)
                     if args.make_glyphs:
-                        found_glyph = glyph_patch_for_protocol_shell(
-                            mask, n_peaks_map, shm_coeff, args)
+                        skip_shape_mismatch = (fixed_idx3 is not None
+                                                and data.shape[:3] != fixed_shape)
+                        if skip_shape_mismatch:
+                            print(f"[aviso] {tag} b={shell_key:.0f}: shape espacial "
+                                  f"{data.shape[:3]} difere do protocolo de referencia "
+                                  f"{args.fixed_patch_reference!r} {fixed_shape} -- patch fixo "
+                                  f"exige o MESMO grid (sem registro previo, comparacao "
+                                  f"voxel-a-voxel nao e' valida) -- pulando este painel",
+                                  flush=True)
+                            found_glyph = None
+                        else:
+                            found_glyph = glyph_patch_for_protocol_shell(
+                                mask, n_peaks_map, shm_coeff, args, fixed_idx3=fixed_idx3)
                         if found_glyph is None:
-                            print(f"[aviso] {tag} b={shell_key:.0f}: nenhum patch de cruzamento "
-                                  f"encontrado pro glifo (tente --search-radius maior ou "
-                                  f"--min-mask-frac menor) -- pulando este painel", flush=True)
+                            if not skip_shape_mismatch:
+                                print(f"[aviso] {tag} b={shell_key:.0f}: nenhum patch de "
+                                      f"cruzamento encontrado pro glifo (tente --search-radius "
+                                      f"maior ou --min-mask-frac menor) -- pulando este painel",
+                                      flush=True)
                         else:
                             shm_patch, crossing_frac = found_glyph
                             label = f"{tag}\nb{shell_key:.0f} n{len(shell_idx)}"
@@ -668,11 +802,23 @@ def main():
                         print(f"{tag} MSMT-CSD (shells={shells_str}, n_dirs={n_dirs_total_msmt}, "
                               f"sh_order={sh_order_msmt}): {len(rows_msmt)} linha(s)", flush=True)
                         if args.make_glyphs:
-                            found_glyph = glyph_patch_for_protocol_shell(
-                                mask, n_peaks_map_msmt, shm_coeff_msmt, args)
+                            skip_shape_mismatch = (fixed_idx3 is not None
+                                                    and data.shape[:3] != fixed_shape)
+                            if skip_shape_mismatch:
+                                print(f"[aviso] {tag} MSMT-CSD: shape espacial "
+                                      f"{data.shape[:3]} difere do protocolo de referencia "
+                                      f"{args.fixed_patch_reference!r} {fixed_shape} -- "
+                                      f"pulando este painel", flush=True)
+                                found_glyph = None
+                            else:
+                                found_glyph = glyph_patch_for_protocol_shell(
+                                    mask, n_peaks_map_msmt, shm_coeff_msmt, args,
+                                    fixed_idx3=fixed_idx3)
                             if found_glyph is None:
-                                print(f"[aviso] {tag} MSMT-CSD: nenhum patch de cruzamento "
-                                      f"encontrado pro glifo -- pulando este painel", flush=True)
+                                if not skip_shape_mismatch:
+                                    print(f"[aviso] {tag} MSMT-CSD: nenhum patch de cruzamento "
+                                          f"encontrado pro glifo -- pulando este painel",
+                                          flush=True)
                             else:
                                 shm_patch, crossing_frac = found_glyph
                                 label = f"{tag}\nMSMT b{shells_str}"
@@ -759,9 +905,15 @@ def main():
                 amplitude_ref = peak
             ax.set_title(f"{label}\n({crossing_frac:.0%} cruzamento)", fontsize=8)
 
-        fig.suptitle(f"Glifos FOD por protocolo/shell -- melhor patch de cruzamento de CADA "
+        if args.fixed_patch_reference:
+            title = (f"Glifos FOD por protocolo/shell -- MESMO patch fisico em todos "
+                     f"(referencia: {args.fixed_patch_reference}, protocolos com shape "
+                     f"diferente foram pulados) -- normalizacao={args.normalize}")
+        else:
+            title = (f"Glifos FOD por protocolo/shell -- melhor patch de cruzamento de CADA "
                      f"um (nao necessariamente o mesmo voxel fisico entre paineis) -- "
-                     f"normalizacao={args.normalize}", fontsize=9)
+                     f"normalizacao={args.normalize}")
+        fig.suptitle(title, fontsize=9)
         fig.tight_layout(rect=[0, 0, 1, 0.92])
         out_fig = Path(args.out_fig)
         out_fig.parent.mkdir(parents=True, exist_ok=True)

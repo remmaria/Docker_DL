@@ -3,28 +3,38 @@
 NO_RESUME=1 \
     TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 \
     ENSEMBLE_M=6 ONLY_VALID=1  \
-    WEIGHT_QUALITY_COND=1 \
-    sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+    sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1500 16
 
 
 RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star6/runs/3582144_0/last.pt \
     ENSEMBLE_M=3 ONLY_VALID=1  \
     sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
-
-RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star3/runs/3582144_0/last.pt \
-    ENSEMBLE_M=3 ONLY_VALID=1  \
+TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 \
+    ENSEMBLE_M=6 ONLY_VALID=1  \
+    USE_QUALITY_COND=1 \
+    WEIGHT_QUALITY_COND=1 \
     sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
 
 # RCAE
-RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n16/runs/3582143_0/last.pt \
+RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n16/runs/3632328_0/last.pt \
     ONLY_VALID=1 \
     sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
     sbatch 04f_train_implicit.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
+sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1500 16
 
+
+LOG_WORKER_LOADS=1 \
 sbatch 04g_train_pairflow_ssl.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000
 
+INIT_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_ssl_checkpoints/shell1000/best.pt \
+  sbatch 04h_train_pairflow_finetune.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
+sbatch 04h_train_pairflow_finetune.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_ssl_checkpoints/shell1000/runs/3635732_0/last.pt NUM_WORKERS=2 VAL_NUM_WORKERS=1 \
+  sbatch 04g_train_pairflow_ssl.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000

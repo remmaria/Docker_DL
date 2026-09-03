@@ -193,11 +193,12 @@ def main():
     ap.add_argument("--print-every", type=int, default=20,
                      help="diagnostico GPU-vs-CPU em tempo real no stdout a cada N batches -- "
                           "ver mesmo flag em scripts/04g_train_pairflow_ssl.py. 0 = desligado.")
-    ap.add_argument("--vary-subject-order", action="store_true",
-                     help="mesma flag/racional de scripts/04g_train_pairflow_ssl.py -- por "
-                          "padrao a ordem dos sujeitos entre epocas fica CONGELADA (diagnostico "
-                          "de gargalo de dataloading, 2026-09-02). Passe pra voltar ao "
-                          "comportamento antigo.")
+    ap.add_argument("--freeze-subject-order", action="store_true",
+                     help="mesma flag/racional de scripts/04g_train_pairflow_ssl.py -- default "
+                          "DESLIGADO (ordem dos sujeitos reembaralhada a cada epoca, "
+                          "comportamento antigo). Passe pra ativar o diagnostico experimental "
+                          "de congelar a ordem, revertido a pedido explicito da usuaria em "
+                          "2026-09-02.")
     ap.add_argument("--log-worker-loads", action="store_true",
                      help="mesma flag/racional de scripts/04g_train_pairflow_ssl.py -- imprime "
                           "worker_id/subject_tag a cada carga real de disco em "
@@ -242,10 +243,10 @@ def main():
     persistent_train = args.num_workers > 0
     persistent_val = val_num_workers > 0
     train_sampler = SubjectGroupedSampler(train_ds, seed=args.seed,
-                                           freeze_order=not args.vary_subject_order)
-    if not args.vary_subject_order:
-        print("[dataloader] ordem dos sujeitos CONGELADA entre epocas (default -- ver "
-              "--vary-subject-order --help)", flush=True)
+                                           freeze_order=args.freeze_subject_order)
+    if args.freeze_subject_order:
+        print("[dataloader] ordem dos sujeitos CONGELADA entre epocas (--freeze-subject-order "
+              "explicito)", flush=True)
     winit = worker_init_fn if args.num_workers > 0 else None
     winit_val = worker_init_fn if val_num_workers > 0 else None
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler,

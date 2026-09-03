@@ -244,15 +244,15 @@ def main():
                           "ver docstring de utils/pairflow_ssl_dataset.py) esta de fato "
                           "acontecendo, mesmo com batches/epoca fixado pelo numero de tiles "
                           "espaciais (nao pelo numero de pares). 0 = desligado.")
-    ap.add_argument("--vary-subject-order", action="store_true",
-                     help="por padrao (SEM esta flag) a ordem dos sujeitos entre epocas fica "
-                          "CONGELADA (SubjectGroupedSampler(freeze_order=True), ver docstring "
-                          "la -- diagnostico de 2026-09-02: com --num-workers>0, reembaralhar a "
-                          "ordem toda epoca impede o cache LRU de cada worker de reaproveitar o "
-                          "que ja carregou de uma epoca pra outra, o que mostrou dominar o tempo "
-                          "de treino, ate 97% em wait_s vs. compute_s numa rodada real). Passe "
-                          "esta flag pra voltar ao comportamento antigo (ordem reembaralhada a "
-                          "cada epoca) -- so pra comparar/depurar, nao recomendado em producao.")
+    ap.add_argument("--freeze-subject-order", action="store_true",
+                     help="EXPERIMENTAL (2026-09-02), default DESLIGADO -- comportamento default "
+                          "voltou a ser o antigo (ordem dos sujeitos reembaralhada a cada epoca, "
+                          "SubjectGroupedSampler(freeze_order=False)). Passar esta flag ativa o "
+                          "diagnostico de congelar a ordem (SubjectGroupedSampler(freeze_order=True), "
+                          "ver docstring la) -- so pra testar/depurar gargalo de dataloading "
+                          "(ver addendum secao 20.15/20.17-bis), revertido a pedido explicito da "
+                          "usuaria em 2026-09-02 por nao ter resolvido o gargalo real e ter "
+                          "coincidido com uma rodada travada.")
     ap.add_argument("--log-worker-loads", action="store_true",
                      help="diagnostico (2026-09-02): imprime worker_id/subject_tag a cada carga "
                           "REAL de disco (cache MISS) em PairFlowSSLDataset._load_subject -- "
@@ -300,10 +300,10 @@ def main():
     persistent_train = args.num_workers > 0
     persistent_val = val_num_workers > 0
     train_sampler = SubjectGroupedSampler(train_ds, seed=args.seed,
-                                           freeze_order=not args.vary_subject_order)
-    if not args.vary_subject_order:
-        print("[dataloader] ordem dos sujeitos CONGELADA entre epocas (default -- ver "
-              "--vary-subject-order --help e utils.dataset.SubjectGroupedSampler.__init__)",
+                                           freeze_order=args.freeze_subject_order)
+    if args.freeze_subject_order:
+        print("[dataloader] ordem dos sujeitos CONGELADA entre epocas (--freeze-subject-order "
+              "explicito -- ver utils.dataset.SubjectGroupedSampler.__init__)",
               flush=True)
     winit = worker_init_fn if args.num_workers > 0 else None
     winit_val = worker_init_fn if val_num_workers > 0 else None

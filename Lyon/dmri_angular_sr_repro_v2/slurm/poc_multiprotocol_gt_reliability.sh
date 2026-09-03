@@ -78,6 +78,23 @@
 # segmentacao automatica de tecido, so' usados com MSMT=1; ajuste se a
 # segmentacao automatica falhar/ficar visualmente ruim pra este sujeito.
 #   MSMT=1 sbatch slurm/poc_multiprotocol_gt_reliability.sh /caminho/para/folder_main _geomcorr
+#
+# FIXED_PATCH_REFERENCE=<nome_protocolo> (2026-09-02, so' com MAKE_GLYPHS=1)
+# -- em vez de cada painel buscar seu proprio melhor patch de cruzamento
+# (default), localiza o patch UMA VEZ no protocolo indicado (ex. "SeqA1")
+# e reaproveita o MESMO voxel fisico em TODOS os outros paineis -- so'
+# funciona pra protocolos com o MESMO shape espacial do de referencia (o
+# script pula, com aviso, qualquer painel cujo shape difira -- comparacao
+# voxel-a-voxel sem registro previo nao e' valida). FIXED_PATCH_SHELL
+# (opcional, float, so' com FIXED_PATCH_REFERENCE) escolhe qual shell do
+# protocolo de referencia usar pra achar o patch, se ele tiver mais de
+# uma shell nao-zero -- default usa a menor. Com patch fixo, considere
+# tambem NORMALIZE=global (em vez do default per_voxel) -- com o MESMO
+# voxel em todos os paineis, comparar magnitude relativa entre protocolos
+# passa a fazer sentido (ainda sujeita a diferenca de contraste por
+# b-value em si, ver --help do script python).
+#   MAKE_GLYPHS=1 FIXED_PATCH_REFERENCE=SeqA1 NORMALIZE=global \
+#     sbatch slurm/poc_multiprotocol_gt_reliability.sh /caminho/para/folder_main _geomcorr
 set -euo pipefail
 mkdir -p logs
 DATA_ROOT="${1:?uso: sbatch poc_multiprotocol_gt_reliability.sh <data_root> <name_suffix> [out_csv]}"
@@ -131,6 +148,16 @@ if [[ "${MAKE_GLYPHS:-0}" == "1" ]]; then
                  --glyph-n-angles "${GLYPH_N_ANGLES:-72}"
                  --normalize "${NORMALIZE:-per_voxel}")
     echo "MAKE_GLYPHS=1 -- gerando tambem figura de glifos em $OUT_FIG"
+    if [[ -n "${FIXED_PATCH_REFERENCE:-}" ]]; then
+        GLYPH_FLAGS+=(--fixed-patch-reference "$FIXED_PATCH_REFERENCE")
+        echo "FIXED_PATCH_REFERENCE=$FIXED_PATCH_REFERENCE -- reaproveitando o MESMO patch " \
+             "fisico em todos os protocolos com o mesmo shape espacial"
+        if [[ -n "${FIXED_PATCH_SHELL:-}" ]]; then
+            GLYPH_FLAGS+=(--fixed-patch-shell "$FIXED_PATCH_SHELL")
+            echo "FIXED_PATCH_SHELL=$FIXED_PATCH_SHELL -- usando essa shell do protocolo de " \
+                 "referencia pra localizar o patch"
+        fi
+    fi
 fi
 
 python scripts/poc_multiprotocol_gt_reliability.py \
