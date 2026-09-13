@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=dmri_implicit_recon
 #SBATCH --cluster=gpu
-#SBATCH --partition=l40s
+#SBATCH --partition=h200
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1

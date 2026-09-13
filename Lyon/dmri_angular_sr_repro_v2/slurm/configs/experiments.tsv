@@ -1,14 +1,22 @@
 # Uma linha por experimento (shell_b, n_level). Colunas separadas por TAB.
-# Preenchido com base no shell_availability_summary.csv do work_dir novo
-# (all_bias apos remocao dos outliers listados em outliers.txt):
+#
+# ATUALIZADO 2026-09 para o work_dir HC-only (so controles saudaveis, ver
+# discussao do projeto sobre treinar a rede so com HC) -- contagens de
+# sujeitos abaixo vem do shell_availability_summary.csv desse work_dir:
 #
 #   b_value   n_subjects  n_directions (min-median-max)
-#   1000.0    743         32-64-64   <- maior N, resultado principal
-#   1500.0    406         64-64-64   <- N alto, super uniforme (todo mundo 64 dir)
-#   500.0     355         16-16-16   <- N alto, mas so 16 direcoes -- niveis baixos
+#   1000.0    401         32-64-64   <- maior N, resultado principal
+#   1500.0    225         64-64-64   <- N alto, super uniforme (todo mundo 64 dir)
+#   500.0     176         16-16-16   <- N alto, mas so 16 direcoes -- niveis baixos
 #   700.0      63         35-35-35  <- N ok, secundario/generalizacao
 #   2000.0     63         77-77-77  <- N ok, secundario/generalizacao
-#   750.0      51         28-28-28  <- N ok, secundario/generalizacao
+#   750.0      49         28-28-28  <- N ok, secundario/generalizacao
+#
+# n_directions (min-median-max) nao muda entre o dataset completo e o
+# HC-only -- depende so do protocolo de aquisicao de cada shell, nao de
+# quais sujeitos estao no manifesto -- por isso a LISTA DE NIVEIS abaixo
+# continua valida sem alteracao, so as contagens de sujeitos (acima) e o
+# tamanho esperado de cada experimento mudaram.
 #
 # Lista de niveis atualizada (ver protocolo/chat): 6 10 16 20 24 32 48 54 --
 # substitui a lista antiga (6 10 15 20 30 40 50). Cada shell so lista os

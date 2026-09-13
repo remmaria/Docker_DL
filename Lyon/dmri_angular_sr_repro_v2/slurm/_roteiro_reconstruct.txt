@@ -70,11 +70,31 @@ TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 
     WEIGHT_QUALITY_COND=1 \
     sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
+
+
+
+
+
 # IMPLICIT
-RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
-  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/implicit_checkpoints/shell1000_n16/runs/3634245_0/best.pt \
+RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/implicit_checkpoints_att_init_lr/shell1000_n16_attn/runs/3826697_0/best.pt \
   RECON_TAG=implicit_n16 \
   sbatch 05i_reconstruct_implicit.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
+RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_star_checkpoints_bs32_frozen_order_sslep131/shell1000_n16_pfstar8_pretrained_lr0.0002/runs/3827631_0/best.pt \
+  RECON_TAG=pairflow_star_n16 \
+  sbatch 05k_reconstruct_pairflow_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
-PRETRAINED=1 sbatch 05j_reconstruct_pairflow.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+RECON_TAG=noSH_postfix \
+CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n16/runs/3828683_0/best.pt \
+RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+  sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+RECON_TAG=SH_postfix \
+ANGULAR_LOSS=1 \
+CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n16_sh/runs/3828686_0/best.pt \
+RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+  sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+

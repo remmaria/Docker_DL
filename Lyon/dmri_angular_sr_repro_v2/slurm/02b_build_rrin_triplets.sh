@@ -57,6 +57,31 @@
 # dentro do teto, cai de volta no comportamento sem teto so naquele alvo.
 #   ENSEMBLE_MAX_GAP_DEG=25 sbatch slurm/02b_build_rrin_triplets.sh <work_dir>
 #
+# PREFER_CENTRAL_T_FRAC=1 (variavel de ambiente, default vazio/desligado,
+# comportamento identico a antes -- ver --prefer-central-t-frac em
+# scripts/02b_build_rrin_triplets.py e revisao de codigo 2026-09-11): usa
+# abs(t_frac-0.5) como criterio TERCIARIO de desempate (depois de gap_deg e
+# residual_deg, os dois de sempre) entre pares empatados -- prefere o par
+# em que o alvo cai mais perto do MEIO do arco (interpolacao mais genuina)
+# a um em que o alvo quase coincide com uma das pontas (quase-extrapolacao
+# mesmo dentro de [0,1]). Afeta o par unico e a semente do feixe. So use
+# pra comparar contra uma rodada sem a flag (ex. via OUT_DIR separado) --
+# nao ha garantia a priori de que ajude o treino, so uma hipotese a testar.
+#   PREFER_CENTRAL_T_FRAC=1 sbatch slurm/02b_build_rrin_triplets.sh <work_dir>
+#
+# ENSEMBLE_AVOID_SHARED_ANCHOR=1 (variavel de ambiente, default vazio/
+# desligado, comportamento identico a antes -- ver --ensemble-avoid-shared-anchor
+# em scripts/02b_build_rrin_triplets.py e utils/gradients.py:
+# find_star_ensemble_batch/_fps_avoid_shared_anchor): so tem efeito com
+# ENSEMBLE_M>0. Ao escolher os m-1 pares ALEM da semente do feixe, prefere
+# candidatos cujas duas pontas (direcoes de entrada) ainda nao apareceram
+# em nenhum outro par ja escolhido do MESMO feixe -- por padrao a
+# diversidade e' so por normal do plano (FPS), que pode escolher varios
+# pares que compartilham uma direcao, reduzindo o quanto os M pares de um
+# feixe carregam evidencia geometrica de fato independente entre si. Nunca
+# reduz quantos pares reais o feixe tem. Tambem so pra comparar/testar.
+#   ENSEMBLE_M=8 ENSEMBLE_AVOID_SHARED_ANCHOR=1 sbatch slurm/02b_build_rrin_triplets.sh <work_dir>
+#
 # OUT_DIR=<pasta> (variavel de ambiente, default "$WORK_DIR/subsampling" --
 # ATENCAO: esse e' o default de SEMPRE, o mesmo usado por qualquer treino
 # ja rodando que le desse work_dir): escreve os <tag>_rrin_triplets.npz
@@ -105,6 +130,20 @@ if [[ -n "$ENSEMBLE_MAX_GAP_DEG" ]]; then
     echo "ENSEMBLE_MAX_GAP_DEG=$ENSEMBLE_MAX_GAP_DEG -- preferindo pares de gap pequeno no feixe, quando possivel"
 fi
 
+PREFER_CENTRAL_T_FRAC="${PREFER_CENTRAL_T_FRAC:-}"
+CENTRAL_T_FRAC_FLAG=()
+if [[ -n "$PREFER_CENTRAL_T_FRAC" ]]; then
+    CENTRAL_T_FRAC_FLAG=(--prefer-central-t-frac)
+    echo "PREFER_CENTRAL_T_FRAC=$PREFER_CENTRAL_T_FRAC -- desempate terciario por alvo mais central no arco"
+fi
+
+ENSEMBLE_AVOID_SHARED_ANCHOR="${ENSEMBLE_AVOID_SHARED_ANCHOR:-}"
+AVOID_ANCHOR_FLAG=()
+if [[ -n "$ENSEMBLE_AVOID_SHARED_ANCHOR" ]]; then
+    AVOID_ANCHOR_FLAG=(--ensemble-avoid-shared-anchor)
+    echo "ENSEMBLE_AVOID_SHARED_ANCHOR=$ENSEMBLE_AVOID_SHARED_ANCHOR -- preferindo pares do feixe sem ancora compartilhada"
+fi
+
 python scripts/02b_build_rrin_triplets.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --scheme-dir "$WORK_DIR/subsampling" \
@@ -112,4 +151,6 @@ python scripts/02b_build_rrin_triplets.py \
     --max-residual-deg "$MAX_RESIDUAL_DEG" \
     "${ENSEMBLE_FLAG[@]}" \
     "${ENS_MAX_RESIDUAL_FLAG[@]}" \
-    "${ENS_MAX_GAP_FLAG[@]}"
+    "${ENS_MAX_GAP_FLAG[@]}" \
+    "${CENTRAL_T_FRAC_FLAG[@]}" \
+    "${AVOID_ANCHOR_FLAG[@]}"

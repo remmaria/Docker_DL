@@ -339,7 +339,13 @@ def main():
 
     persistent_train = args.num_workers > 0
     persistent_val = val_num_workers > 0
-    train_sampler = SubjectGroupedSampler(train_ds, seed=args.seed)
+    train_sampler = SubjectGroupedSampler(train_ds, seed=args.seed,
+                                           num_workers=args.num_workers, batch_size=args.batch_size)
+    if args.num_workers > 1:
+        print(f"[dataloader] SubjectGroupedSampler particionado por worker "
+              f"(num_workers={args.num_workers}, batch_size={args.batch_size}) -- "
+              f"elimina releitura redundante de sujeito entre workers na mesma epoca "
+              f"(ver utils.dataset.SubjectGroupedSampler.__init__, addendum 2026-09-03)", flush=True)
     winit = worker_init_fn if args.num_workers > 0 else None
     winit_val = worker_init_fn if val_num_workers > 0 else None
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler,

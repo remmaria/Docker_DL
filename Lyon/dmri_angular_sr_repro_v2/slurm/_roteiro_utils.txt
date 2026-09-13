@@ -14,3 +14,96 @@ SH_ORDER=6 MSMT=1 MAKE_GLYPHS=1 FIXED_PATCH_REFERENCE=SeqA1 NORMALIZE=global \
 SUBJECTS=20170417094841_802780_20170417094841_802780 \
   N_JOBS=9 MAKE_GLYPHS=1 GLYPH_N_LEVELS="6 10 16 20 24 32 48 54 60" \
   sbatch poc_native_order_curve.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000
+
+
+  sbatch 14_diagnose_implicit_pooling.sh \
+    /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir \
+    /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/implicit_checkpoints/shell1000_n16/runs/3634245_0/best.pt \
+    1000 16
+
+sbatch 04i_minitest_io.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+FREEZE_SUBJECT_ORDER=1 sbatch 04i_minitest_io.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+FREEZE_SUBJECT_ORDER=1 BATCH_SIZE=32 sbatch 04i_minitest_io.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+# referência (já rodada antes, pode pular): bs=8, LR=1e-4
+sbatch slurm/04i_minitest_io.sh <work_dir> 1000 16
+
+# candidato principal: bs=32 + freeze + LR escalada 4x (regra de escala linear)
+BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=4e-4 EPOCHS=6 sbatch 04i_minitest_io.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+# candidato conservador: mesma coisa mas com LR escalada só 2x (caso 4x seja instável sem warmup)
+BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=2e-4 EPOCHS=6 sbatch 04i_minitest_io.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+ENSEMBLE_M=6 TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 \
+  BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=4e-4 EPOCHS=6 \
+  sbatch 04i_minitest_io.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+ENSEMBLE_M=8 TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m8r15 \
+  BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=2e-4 EPOCHS=30 \
+  sbatch 04i_minitest_io.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+NO_RESUME=1 \
+N_TRAIN=64 N_VAL=16 MAX_CACHED_SUBJECTS=16 \
+  VAL_NUM_WORKERS=2 VAL_MAX_CACHED_SUBJECTS=8 \
+  NUM_WORKERS=8 BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=4e-3 EPOCHS=50 \
+  AGGREGATION=attention \
+  sbatch 04f_minitest_agg.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+AGGREGATION=attention sbatch 04f_minitest_agg.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+#--------------------------------------------------------
+NO_RESUME=1 \
+ENSEMBLE_M=8 TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m8r15 \
+  N_TRAIN=64 N_VAL=16 MAX_CACHED_SUBJECTS=16 \
+  VAL_NUM_WORKERS=2 VAL_MAX_CACHED_SUBJECTS=16 \
+  BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=2e-4 EPOCHS=30 \
+  sbatch 04i_minitest_io.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+INIT_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_ssl_checkpoints/shell1000/runs/3635639_0/best.pt \
+ENSEMBLE_M=8 TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m8r15 \
+  N_TRAIN=128 N_VAL=32 MAX_CACHED_SUBJECTS=20 \
+  VAL_NUM_WORKERS=2 VAL_MAX_CACHED_SUBJECTS=16 \
+  BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=2e-4 EPOCHS=100 \
+  sbatch 04i_minitest_io.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+INIT_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_ssl_checkpoints/shell1000/runs/3635639_0/best.pt \
+FREEZE_FLOW=1 \
+ENSEMBLE_M=8 TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m8r15 \
+  N_TRAIN=64 N_VAL=16 MAX_CACHED_SUBJECTS=16 \
+  VAL_NUM_WORKERS=2 VAL_MAX_CACHED_SUBJECTS=16 \
+  BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=2e-4 EPOCHS=30 \
+  sbatch 04i_minitest_io.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+
+
+WORK_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir
+
+ENSEMBLE_M=8 TRIPLETS_DIR=$WORK_DIR/subsampling_ens_m8r15 \
+  N_TRAIN=64 N_VAL=16 MAX_CACHED_SUBJECTS=16 \
+  VAL_NUM_WORKERS=2 VAL_MAX_CACHED_SUBJECTS=8 \
+  BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=5e-4 EPOCHS=15 \
+  INIT_CHECKPOINT=$WORK_DIR/pairflow_ssl_checkpoints/shell1000/last.pt \
+  WARMUP_STEPS=500 ZERO_INIT_REFINE_OUTPUT=1 \
+  sbatch 04i_minitest_io.sh $WORK_DIR 1000 16
+
+ENSEMBLE_M=8 TRIPLETS_DIR=$WORK_DIR/subsampling_ens_m8r15 \
+  N_TRAIN=64 N_VAL=16 MAX_CACHED_SUBJECTS=16 \
+  VAL_NUM_WORKERS=2 VAL_MAX_CACHED_SUBJECTS=8 \
+  BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=1e-3 EPOCHS=15 \
+  INIT_CHECKPOINT=$WORK_DIR/pairflow_ssl_checkpoints/shell1000/last.pt \
+  WARMUP_STEPS=500 ZERO_INIT_REFINE_OUTPUT=1 \
+  sbatch 04i_minitest_io.sh $WORK_DIR 1000 16
+
+ENSEMBLE_M=8 TRIPLETS_DIR=$WORK_DIR/subsampling_ens_m8r15 \
+  N_TRAIN=64 N_VAL=16 MAX_CACHED_SUBJECTS=16 \
+  VAL_NUM_WORKERS=2 VAL_MAX_CACHED_SUBJECTS=8 \
+  BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=2e-3 EPOCHS=15 \
+  INIT_CHECKPOINT=$WORK_DIR/pairflow_ssl_checkpoints/shell1000/last.pt \
+  WARMUP_STEPS=500 ZERO_INIT_REFINE_OUTPUT=1 \
+  sbatch 04i_minitest_io.sh $WORK_DIR 1000 16

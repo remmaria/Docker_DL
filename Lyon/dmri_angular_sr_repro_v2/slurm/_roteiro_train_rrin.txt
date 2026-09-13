@@ -1,0 +1,13 @@
+USE_QUALITY_COND=1 — condiciona o FlowNet3D em residual_deg/gap_deg da trinca.
+ONLY_VALID=0 (default 1) — inclui trincas geometricamente inválidas no treino/val.
+NUM_LAYERS=<K> (default 1) — usa RRIN3DLayered (K≥2) em vez do RRIN3D original.
+NORM_TYPE=batch (default instance) — exige treino do zero.
+LR=<valor> (default 1e-3, já alinhado com o RCAE).
+ANGULAR_LOSS_WEIGHT=<valor> (default 0.0) + 
+SH_LOSS_Q_OUT (default 16, aqui sim exposta), 
+SH_LOSS_HIGH_ORDER_MIN (default 4), 
+SH_LOSS_LMAX_CAP (default 8)
+Todas as variantes têm sufixo automático de run_tag (_qc, _inclinv, _k<K>, _bn, _sh), então dá pra rodar em paralelo sem colidir checkpoint.
+
+
+sbatch slurm/04b_train_rrin.sh <work_dir> <shell_b> <n_level>

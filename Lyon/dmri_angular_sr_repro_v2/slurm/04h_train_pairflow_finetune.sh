@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=pairflow_ft
 #SBATCH --cluster=gpu
-#SBATCH --partition=a100
+#SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1

@@ -1,0 +1,29 @@
+L_MAX=<int> (default automático por n_level), 
+BASE_CH=<int> (default 16), 
+NORM_TYPE=batch (default instance, exige zero)
+AGGREGATION=attention (default mean) — troca a agregação simples por atenção aprendida por voxel
+INIT_OUTPUT_BIAS_FROM_DATA=1, 
+WARMUP_STEPS=<int> (default 0)
+ANGULAR_LOSS_WEIGHT=<valor> + 
+SH_LOSS_HIGH_ORDER_MIN/SH_LOSS_LMAX_CAP.
+QOUT=<int> (default 10) — essa é a variável que corrigimos hoje; teto de N_out em treino E validação. Com o default, sustenta só l_max=2.
+CKPT_TAG=<string> — importante porque o run_tag calculado não leva em conta INIT_OUTPUT_BIAS_FROM_DATA/WARMUP_STEPS; sem CKPT_TAG, duas rodadas com essas flags diferentes na mesma config colidem no mesmo diretório.
+Combinação prática: ANGULAR_LOSS_WEIGHT=0.5 QOUT=16 sbatch slurm/04f_train_implicit.sh <work_dir> <shell_b> <n_level>.
+
+ANGULAR_LOSS_WEIGHT=0.5 \
+  QOUT=16 \
+  NO_RESUME=1 \
+  AGGREGATION=attention CKPT_TAG=att_init_lr_sh \
+  sbatch 04f_train_implicit.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+  NO_RESUME=1 \
+  INIT_OUTPUT_BIAS_FROM_DATA=1 \
+  WARMUP_STEPS=500 \
+  AGGREGATION=attention \
+  ANGULAR_LOSS_WEIGHT=0.5 \
+  QOUT=16 \
+  CKPT_TAG=att_init_lr_sh_ok \
+  sbatch slurm/04f_train_implicit.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+  

@@ -180,6 +180,31 @@ def main():
                           "confiar em cada par, SEM contaminar a comparacao ja feita de "
                           "RRIN3D/AMT3D no par unico (que usa --max-residual-deg, nao este). "
                           "Sem efeito se --ensemble-m nao for passado (>0).")
+    ap.add_argument("--prefer-central-t-frac", action="store_true",
+                     help="ADITIVO (default desligado, comportamento identico a antes -- ver "
+                          "revisao de codigo 2026-09-11 / utils/gradients.py:find_best_bracket_batch "
+                          "e find_star_ensemble_batch): usa abs(t_frac-0.5) como criterio TERCIARIO "
+                          "de desempate (depois de gap_deg minimo e residual_deg minimo, os dois "
+                          "de sempre) entre pares com o MESMO gap_deg/residual_deg -- prefere o par "
+                          "em que o alvo cai mais perto do MEIO do arco (interpolacao mais genuina) "
+                          "a um em que o alvo quase coincide com uma das pontas do par (t_frac perto "
+                          "de 0 ou 1, quase-extrapolacao mesmo dentro de [0,1]). Como gap_deg/"
+                          "residual_deg raramente empatam exatamente, e' uma preferencia leve, nao "
+                          "uma mudanca de regime -- use e compare com/sem antes de assumir que ajuda "
+                          "o treino. Afeta tanto o par unico quanto a semente/ordenacao do feixe "
+                          "(--ensemble-m), se ligado.")
+    ap.add_argument("--ensemble-avoid-shared-anchor", action="store_true",
+                     help="ADITIVO (default desligado, comportamento identico a antes -- ver "
+                          "utils/gradients.py:find_star_ensemble_batch/_fps_avoid_shared_anchor): "
+                          "so tem efeito com --ensemble-m > 0. Ao escolher os m-1 pares ALEM da "
+                          "semente do feixe, prefere candidatos cujas duas pontas (indices em "
+                          "input_idx) ainda nao apareceram em nenhum outro par ja escolhido do "
+                          "MESMO feixe -- por padrao a diversidade e' so por normal do plano (FPS), "
+                          "que pode escolher varios pares que compartilham uma das duas direcoes de "
+                          "entrada, reduzindo o quanto os m pares de um feixe carregam evidencia "
+                          "geometrica de fato independente entre si. Nunca reduz quantos pares reais "
+                          "o feixe tem -- cai no comportamento antigo (so FPS) quando nao ha "
+                          "candidato remanescente com ancora livre.")
     ap.add_argument("--ensemble-max-gap-deg", type=float, default=None,
                      help="ADITIVO (default None = sem teto de gap, comportamento de sempre): "
                           "teto de gap_deg (separacao angular do par a/b) usado para preferir, "
@@ -250,14 +275,56 @@ def main():
             input_bvecs = bvecs[input_idx]
             target_bvecs = bvecs[target_idx]
 
-            # find_best_bracket_batch: mesma logica de find_best_bracket, mas
-            # vetorizada sobre TODOS os alvos deste combo de uma vez so (~800x
-            # mais rapido que chamar find_best_bracket num loop Python por
-            # alvo -- ver utils/gradients.py -- e verificado numericamente
-            # identico, nao so mais rapido).
-            result = find_best_bracket_batch(input_bvecs, target_bvecs,
-                                              max_residual_deg=args.max_residual_deg,
-                                              require_between=require_between)
+            ens = None
+            if args.ensemble_m > 0:
+                # ADITIVO -- ver docstring do modulo e utils/gradients.py:
+                # find_star_ensemble_batch. Mesmos input_bvecs/target_bvecs,
+                # mesmo require_between desta mesma chamada -- so o teto de
+                # residuo pode divergir do par unico se --ensemble-max-residual-deg
+                # tiver sido passado (default None = usa o mesmo de sempre).
+                ens_max_residual = (args.ensemble_max_residual_deg
+                                     if args.ensemble_max_residual_deg is not None
+                                     else args.max_residual_deg)
+                ens = find_star_ensemble_batch(input_bvecs, target_bvecs, args.ensemble_m,
+                                                max_residual_deg=ens_max_residual,
+                                                require_between=require_between,
+                                                max_gap_deg=args.ensemble_max_gap_deg,
+                                                prefer_central_t_frac=args.prefer_central_t_frac,
+                                                avoid_shared_anchor=args.ensemble_avoid_shared_anchor)
+
+            if ens is not None and ens_max_residual == args.max_residual_deg:
+                # feixe e par unico usam o MESMO teto de residuo (o caso
+                # default, sem --ensemble-max-residual-deg) -- a posicao 0
+                # do feixe e', por construcao, IDENTICA ao que
+                # find_best_bracket_batch devolveria sozinha chamada com os
+                # mesmos argumentos (ver docstring de find_star_ensemble_batch,
+                # equivalencia com m=1) -- reaproveita em vez de recomputar a
+                # MESMA geometria pairwise (O(n_pares x n_alvos)) duas vezes
+                # por combo (ver revisao de codigo 2026-09-11 / eliminacao de
+                # duplicacao em utils/gradients.py:_pairwise_bracket_geometry).
+                result = {
+                    "i": ens["i"][:, 0], "j": ens["j"][:, 0],
+                    "residual_deg": ens["residual_deg"][:, 0],
+                    "gap_deg": ens["gap_deg"][:, 0],
+                    "t_frac": ens["t_frac"][:, 0],
+                    "between": ens["between"][:, 0],
+                }
+            else:
+                # sem ensemble, OU ensemble com --ensemble-max-residual-deg
+                # DIFERENTE do teto do par unico -- nesse 2o caso o feixe e o
+                # par unico usam pools de residuo genuinamente diferentes,
+                # entao precisam mesmo de duas selecoes/duas chamadas.
+                #
+                # find_best_bracket_batch: mesma logica de find_best_bracket, mas
+                # vetorizada sobre TODOS os alvos deste combo de uma vez so (~800x
+                # mais rapido que chamar find_best_bracket num loop Python por
+                # alvo -- ver utils/gradients.py -- e verificado numericamente
+                # identico, nao so mais rapido).
+                result = find_best_bracket_batch(input_bvecs, target_bvecs,
+                                                  max_residual_deg=args.max_residual_deg,
+                                                  require_between=require_between,
+                                                  prefer_central_t_frac=args.prefer_central_t_frac)
+
             pair_a = input_idx[result["i"]]
             pair_b = input_idx[result["j"]]
             t_frac = result["t_frac"]
@@ -276,19 +343,7 @@ def main():
             save_dict[f"{base}__between"] = between
             save_dict[f"{base}__valid"] = valid
 
-            if args.ensemble_m > 0:
-                # ADITIVO -- ver docstring do modulo e utils/gradients.py:
-                # find_star_ensemble_batch. Mesmos input_bvecs/target_bvecs,
-                # mesmo require_between desta mesma chamada -- so o teto de
-                # residuo pode divergir do par unico se --ensemble-max-residual-deg
-                # tiver sido passado (default None = usa o mesmo de sempre).
-                ens_max_residual = (args.ensemble_max_residual_deg
-                                     if args.ensemble_max_residual_deg is not None
-                                     else args.max_residual_deg)
-                ens = find_star_ensemble_batch(input_bvecs, target_bvecs, args.ensemble_m,
-                                                max_residual_deg=ens_max_residual,
-                                                require_between=require_between,
-                                                max_gap_deg=args.ensemble_max_gap_deg)
+            if ens is not None:
                 ens_i, ens_j = ens["i"], ens["j"]  # (n_alvos, M), -1 = padding
                 pad = ens_i < 0
                 ens_pair_a = np.where(pad, -1, input_idx[np.clip(ens_i, 0, None)])

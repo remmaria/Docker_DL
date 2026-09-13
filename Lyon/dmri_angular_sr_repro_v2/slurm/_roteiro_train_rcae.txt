@@ -1,0 +1,16 @@
+
+
+DECODER_TYPE=sh (default direct): liga o Decoder3DSH, prevê coeficientes SH em vez de sinal por direção. Exige NO_RESUME=1
+    SH_DECODER_LMAX=<l> [4]
+
+ANGULAR_LOSS_WEIGHT=<valor> (default 0.0) + SH_LOSS_HIGH_ORDER_MIN=<l> (default 4).
+--q-out está fixo em 10
+
+
+
+ANGULAR_LOSS_WEIGHT=0.5 \
+SH_LOSS_HIGH_ORDER_MIN=2 \
+sbatch slurm/03_train_rcae.sh sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+ (com --q-out=10 fixo, l_max=2 é o teto sustentável).
+
+

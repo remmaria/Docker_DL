@@ -1,6 +1,28 @@
 
 EXTRA_METHOD="naive_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_blend_recon,\
 naive_ensemble_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_ensemble_blend_recon,\
+implicit_n16=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/implicit_recon_implicit_n16,\
+pairflowstar_n16=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_star_recon, \
+rcae_n16=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_recon_noSH_postfix, \
+rcae_n16_sh=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_recon_SH_postfix" \
+    SUBSAMPLED_ONLY=1 \
+    ROI_TRACTS="FX,CGC,CGH,UF,WM,CbWM_L,CbWM_R,Ctx_L,Ctx_R,Hipp_L,Hipp_R,SubCtx_L,SubCtx_R" \
+    RECON_SUBJECTS="20170920171326_616_20170920171326_616" \
+    sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+RECON_TAG=noSH_postfix \
+ROI_TRACTS="FX,CGC,CGH,UF,WM,CbWM_L,CbWM_R,Ctx_L,Ctx_R,Hipp_L,Hipp_R,SubCtx_L,SubCtx_R" \
+  sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+RECON_TAG=SH_postfix \
+ROI_TRACTS="FX,CGC,CGH,UF,WM,CbWM_L,CbWM_R,Ctx_L,Ctx_R,Hipp_L,Hipp_R,SubCtx_L,SubCtx_R" \
+  sbatch 05_evaluate_and_downstream.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+
+EXTRA_METHOD="naive_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_blend_recon,\
+naive_ensemble_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_ensemble_blend_recon,\
 rrin_n16_star35=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star35,\
 rrin_n16_star65=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star65,\
 rrin_n16_star310=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star310,\
@@ -33,7 +55,9 @@ ROI_TRACTS="FX,CGC,CGH,UF" \
 
 SUBSAMPLED_ONLY=1 \
 SUBJECTS="20170417094841_802780_20170417094841_802780" \
-ROI_TRACTS="FX,CGC,CGH,UF" \
+ROI_TRACTS="FX,CGC_L,CGC_R,CGH_L,CGH_R,UF_L,UF_R" \
+ROI_PAIR="FX_Hipp_R=FX+Hipp_R,FX_Hipp_L=FX+Hipp_L" \
+ROI_DILATE="Hipp_R=2,Hipp_L=2" \
 EXTRA_METHOD="naive_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_blend_recon,\
 naive_ensemble_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_ensemble_blend_recon,\
 rrin_n16_star610=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star610,\
@@ -41,4 +65,8 @@ rrin_n16_star815=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rr
 implicit_n16=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/implicit_recon_implicit_n16,\
 rcae_n16=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_recon_rcae_n16" \
   sbatch 08_downstream_tractography.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+ROI_TRACTS="FX,CGC_L,CGC_R,CGH_L,CGH_R,UF_L,UF_R" \
+ROI_PAIR="FX_Hipp_R=FX+Hipp_R,FX_Hipp_L=FX+Hipp_L" \
+  sbatch slurm/08_downstream_tractography.sh $WORK_DIR 1000 16
 

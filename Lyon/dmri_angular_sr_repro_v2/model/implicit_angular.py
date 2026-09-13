@@ -69,6 +69,28 @@ PURO, nunca uma dependencia desta linha experimental, ver addendum secao
 (`_conv3d`/`_norm3d`/`_repeat_vec_3d`), ja usados por mais de um modelo
 desta linha (rrin3d.py e rrin3d_star.py), portanto nao especificos do RCAE.
 
+AGREGACAO -- `aggregation="mean"` (default, comportamento ORIGINAL desta
+linha, sem nenhuma mudanca) ou `aggregation="attention"` (ADITIVO, ver
+addendum 2026-09-03, secao 29): motivado pelo diagnostico de
+`scripts/14_diagnose_implicit_pooling.py` (secao 28.1) -- num checkpoint
+real (epoca 15), as n_level saidas de `PerDirectionEncoder3D` ja divergem
+bastante entre si ANTES da agregacao ("colapso de agregacao" alto, ~0,54),
+mas a sensibilidade de remover qualquer direcao da MEDIA e' so' moderada
+(~0,30) -- leitura mista, nem forte a favor nem contra trocar a media por
+algo aprendido, mas material suficiente pra tentar. `AttentionAggregator3D`
+(abaixo) substitui a media simples por uma media PONDERADA, com pesos
+aprendidos POR VOXEL (nao um peso global por direcao) via um pequeno "gated
+attention pooling" (mesmo espirito de Ilse et al. 2018, e do
+`PairWeightHead3D` que `model/rrin3d_star.py` ja usa pra fundir candidatos
+do feixe em estrela -- aqui fundindo DIRECOES DE ENTRADA em vez de PARES).
+Critico: o escore de cada direcao e' uma funcao SO da propria feature dela
+(pesos compartilhados entre direcoes, nenhuma nocao de posicao/ordem) --
+permutar a ordem das n_level direcoes de entrada permuta escores e
+features JUNTOS, entao a soma ponderada final nao muda -- a propriedade de
+permutation-invariance da secao anterior (motivada por DeepSets) e'
+preservada por construcao, nao um acidente; ver teste de permutacao para
+"attention" em `_smoke_test`, espelhando o teste ja existente pra "mean".
+
 Requer PyTorch (nao disponivel neste ambiente de desenvolvimento -- revisado
 manualmente, testado apenas por compilacao de sintaxe; validar no cluster
 com `python -m model.implicit_angular`, smoke test no fim do arquivo, mesmo
@@ -158,6 +180,50 @@ class PerDirectionEncoder3D(nn.Module):
         return self.net(x)
 
 
+class AttentionAggregator3D(nn.Module):
+    """Agregacao alternativa a media simples de `ImplicitAngularModel3D.
+    encode` -- "gated attention pooling" adaptado a 3D+espaco (mesmo
+    espirito de Ilse et al. 2018, e do `PairWeightHead3D` que
+    `model/rrin3d_star.py` ja usa pra fundir candidatos do feixe em
+    estrela -- aqui fundindo DIRECOES DE ENTRADA, nao pares). Ver docstring
+    do modulo (secao "AGREGACAO") para a motivacao completa.
+
+    Calcula um escore ESPACIAL (por voxel, nao um escalar global por
+    direcao) pra cada uma das n_level direcoes, de pesos COMPARTILHADOS
+    (mesma rede aplicada independentemente a cada direcao, igual ao
+    `PerDirectionEncoder3D` -- nenhuma direcao ve as demais nesta etapa),
+    normaliza por softmax ENTRE AS DIRECOES (nao entre voxels) e agrega por
+    media ponderada. PERMUTATION-INVARIANT por construcao: o escore de
+    cada direcao depende so' da propria feature dela, entao permutar a
+    ordem de entrada permuta escores e features juntos, sem mudar a soma
+    ponderada final -- ver teste em `_smoke_test`."""
+
+    def __init__(self, in_ch: int, hidden_ch: int | None = None, norm_type: str = "instance"):
+        super().__init__()
+        hidden_ch = hidden_ch if hidden_ch is not None else max(in_ch // 2, 4)
+        self.net = nn.Sequential(
+            _conv3d(in_ch, hidden_ch, norm_type=norm_type),
+            nn.Conv3d(hidden_ch, 1, kernel_size=3, padding=1),
+        )
+
+    def forward(self, feat: torch.Tensor):
+        """feat: (B, n_level, C, D, H, W). Retorna (state, alpha):
+        state: (B, C, D, H, W) -- media ponderada entre as n_level
+            direcoes (substitui `feat.mean(dim=1)` do caminho "mean").
+        alpha: (B, n_level, 1, D, H, W) -- pesos de atencao (softmax sobre
+            o eixo das n_level direcoes, POR VOXEL), devolvido pra
+            diagnostico/inspecao futura (mesmo espirito de `extra["pi"]`
+            em `model/rrin3d_star.py:RRIN3DStar.forward(return_pairs=True)`)."""
+        b, n_level, c = feat.shape[0], feat.shape[1], feat.shape[2]
+        spatial = feat.shape[-3:]
+        feat_flat = feat.reshape(b * n_level, c, *spatial)
+        score_flat = self.net(feat_flat)                        # (B*n_level, 1, D,H,W)
+        score = score_flat.reshape(b, n_level, 1, *spatial)
+        alpha = torch.softmax(score, dim=1)                      # softmax ENTRE DIRECOES
+        state = (alpha * feat).sum(dim=1)                        # (B, C, D,H,W)
+        return state, alpha
+
+
 class SpatialTrunk3D(nn.Module):
     """Pequena U-Net 3D (2 niveis de downsample), MESMA topologia de
     `FlowNet3D.enc1/enc2/enc3/dec2/dec1/head` em model/rrin3d.py -- reusada
@@ -238,6 +304,15 @@ class ImplicitAngularModel3D(nn.Module):
         resolucao angular da representacao a quantas direcoes sao
         realmente medidas, mesma convencao do baseline_sh.
 
+    aggregation: "mean" (default, comportamento ORIGINAL desta linha) ou
+        "attention" (ADITIVO, ver `AttentionAggregator3D`/docstring do
+        modulo, secao "AGREGACAO", e addendum 2026-09-03 secao 29) -- troca
+        a media simples entre as n_level direcoes por uma media ponderada
+        aprendida, com pesos POR VOXEL. FIXO na construcao (adiciona
+        parametros novos ao modelo quando "attention" -- nao pode mudar em
+        --resume-checkpoint, mesma logica de l_max/base_ch/norm_type, ver
+        scripts/04f_train_implicit.py).
+
     Uso:
         model = build_implicit_model(n_level=16)
         pred = model(input_vols, input_bvecs, target_bvecs)
@@ -251,21 +326,27 @@ class ImplicitAngularModel3D(nn.Module):
     """
 
     def __init__(self, n_level: int, l_max: int | None = None, base_ch: int = 16,
-                 norm_type: str = "instance"):
+                 norm_type: str = "instance", aggregation: str = "mean"):
         super().__init__()
+        if aggregation not in ("mean", "attention"):
+            raise ValueError(f"aggregation deve ser 'mean' ou 'attention', recebi {aggregation!r}")
         self.n_level = n_level
         self.l_max = l_max if l_max is not None else max_order_for_n_directions(n_level)
         self.sh_dim = sh_dim_for_lmax(self.l_max)
         self.base_ch = base_ch
         self.norm_type = norm_type
+        self.aggregation = aggregation
 
         self.per_dir_encoder = PerDirectionEncoder3D(self.sh_dim, base_ch=base_ch,
                                                        norm_type=norm_type)
+        self.attn_aggregator = (AttentionAggregator3D(base_ch, norm_type=norm_type)
+                                 if aggregation == "attention" else None)
         self.trunk = SpatialTrunk3D(base_ch, base_ch=base_ch, norm_type=norm_type)
         self.decoder_head = ImplicitDecoderHead3D(base_ch, self.sh_dim, base_ch=base_ch,
                                                     norm_type=norm_type)
 
-    def encode(self, input_vols: torch.Tensor, input_bvecs: torch.Tensor) -> torch.Tensor:
+    def encode(self, input_vols: torch.Tensor, input_bvecs: torch.Tensor,
+               return_attn: bool = False):
         """input_vols: (B, n_level, 1, D, H, W); input_bvecs: (B, n_level, 3).
         Retorna o "estado" espacial (B, base_ch, D, H, W) -- ANTES de
         condicionar em qualquer direcao-alvo (mesmo papel do `state` de
@@ -273,7 +354,14 @@ class ImplicitAngularModel3D(nn.Module):
         so por isso o metodo se chama `encode`, para os scripts de
         treino/debug poderem reaproveitar o MESMO padrao de plotar
         input/target/pred/contexto que ja usam para o RCAE, sem duplicar a
-        logica de visualizacao)."""
+        logica de visualizacao).
+
+        return_attn (default False, ADITIVO -- todo chamador existente
+        continua recebendo so' o tensor `state`, comportamento identico ao
+        de antes do aggregation="attention" existir): quando True, retorna
+        `(state, alpha)`, com `alpha=None` no caminho "mean" (nao ha' peso
+        nenhum pra devolver) ou o tensor de pesos (B, n_level, 1, D, H, W)
+        no caminho "attention" -- ver `AttentionAggregator3D.forward`."""
         b, n_level = input_vols.shape[0], input_vols.shape[1]
         spatial = input_vols.shape[-3:]
 
@@ -283,20 +371,32 @@ class ImplicitAngularModel3D(nn.Module):
         feat_flat = self.per_dir_encoder(vols_flat, sh_flat)           # (B*n_level, base_ch, D,H,W)
         feat = feat_flat.reshape(b, n_level, self.base_ch, *spatial)
 
-        # agregacao PERMUTATION-INVARIANT (media simples, estilo DeepSets --
-        # Zaheer et al. 2017): a ORDEM das n_level direcoes de entrada nunca
-        # deveria importar (nao ha nenhuma nocao de "primeira"/"ultima"
-        # direcao medida, ao contrario de uma sequencia de video) -- media
-        # (ou soma/max) sao as agregacoes canonicas que garantem isso por
-        # construcao. Deliberadamente NAO uma ConvLSTM3D (como o encoder do
-        # RCAE usa, ver model/rcae.py:ConvLSTM3D) -- alem de manter esta
-        # linha independente do RCAE (decisao explicita do usuario, ver
-        # addendum secao 20.8), uma LSTM processa a sequencia em ORDEM,
-        # deixando de ser estritamente permutation-invariant sem embaralhar
-        # a ordem de entrada a cada epoca como paliativo.
-        agg = feat.mean(dim=1)                                          # (B, base_ch, D,H,W)
+        if self.aggregation == "mean":
+            # agregacao PERMUTATION-INVARIANT (media simples, estilo DeepSets
+            # -- Zaheer et al. 2017): a ORDEM das n_level direcoes de entrada
+            # nunca deveria importar (nao ha nenhuma nocao de
+            # "primeira"/"ultima" direcao medida, ao contrario de uma
+            # sequencia de video) -- media (ou soma/max) sao as agregacoes
+            # canonicas que garantem isso por construcao. Deliberadamente NAO
+            # uma ConvLSTM3D (como o encoder do RCAE usa, ver
+            # model/rcae.py:ConvLSTM3D) -- alem de manter esta linha
+            # independente do RCAE (decisao explicita do usuario, ver
+            # addendum secao 20.8), uma LSTM processa a sequencia em ORDEM,
+            # deixando de ser estritamente permutation-invariant sem
+            # embaralhar a ordem de entrada a cada epoca como paliativo.
+            agg = feat.mean(dim=1)                                      # (B, base_ch, D,H,W)
+            alpha = None
+        else:
+            # agregacao aprendida, TAMBEM permutation-invariant por
+            # construcao (ver docstring de AttentionAggregator3D/secao
+            # "AGREGACAO" do modulo) -- so troca COMO as n_level direcoes sao
+            # ponderadas, nao introduz nenhuma nocao de ordem.
+            agg, alpha = self.attn_aggregator(feat)                     # (B, base_ch, D,H,W)
 
-        return self.trunk(agg)                                          # (B, base_ch, D,H,W)
+        state = self.trunk(agg)                                         # (B, base_ch, D,H,W)
+        if return_attn:
+            return state, alpha
+        return state
 
     def decode(self, state: torch.Tensor, target_bvecs: torch.Tensor) -> torch.Tensor:
         """state: (B, base_ch, D, H, W) -- saida de `encode`. target_bvecs:
@@ -324,15 +424,16 @@ class ImplicitAngularModel3D(nn.Module):
 
 
 def build_implicit_model(n_level: int, l_max: int | None = None, base_ch: int = 16,
-                          norm_type: str = "instance") -> ImplicitAngularModel3D:
+                          norm_type: str = "instance",
+                          aggregation: str = "mean") -> ImplicitAngularModel3D:
     """Factory unica -- usar em scripts/04f_train_implicit.py e
     scripts/05i_reconstruct_implicit.py em vez de instanciar
     ImplicitAngularModel3D diretamente, mesmo espirito de
     `build_rrin_model`/`build_star_model` (mantem as duas pontas
-    sincronizadas; o checkpoint grava l_max/base_ch/norm_type em `args`, e a
-    reconstrucao le de la)."""
+    sincronizadas; o checkpoint grava l_max/base_ch/norm_type/aggregation em
+    `args`, e a reconstrucao le de la)."""
     return ImplicitAngularModel3D(n_level=n_level, l_max=l_max, base_ch=base_ch,
-                                   norm_type=norm_type)
+                                   norm_type=norm_type, aggregation=aggregation)
 
 
 def _smoke_test():
@@ -412,6 +513,51 @@ def _smoke_test():
     pred_bn = model_bn(input_vols, input_bvecs, target_bvecs)
     assert pred_bn.shape == expected
     print(f"smoke test OK (norm_type=batch), output shape: {tuple(pred_bn.shape)}")
+
+    # aggregation="attention" (ADITIVO, ver addendum 2026-09-03 secao 29) --
+    # mesmos testes de shape/permutation-invariance da media, mais o formato
+    # do tensor de pesos `alpha` e a checagem de que ele soma 1 entre
+    # direcoes (softmax valido) em cada voxel.
+    model_attn = build_implicit_model(n_level=n_level, base_ch=8, aggregation="attention")
+    assert model_attn.attn_aggregator is not None
+    pred_attn = model_attn(input_vols, input_bvecs, target_bvecs)
+    assert pred_attn.shape == expected
+    print(f"smoke test OK (aggregation=attention), output shape: {tuple(pred_attn.shape)}")
+
+    model_attn.eval()
+    with torch.no_grad():
+        state_attn, alpha = model_attn.encode(input_vols, input_bvecs, return_attn=True)
+        pred_split_attn = model_attn.decode(state_attn, target_bvecs)
+        pred_direct_attn = model_attn(input_vols, input_bvecs, target_bvecs)
+        assert torch.allclose(pred_split_attn, pred_direct_attn, atol=1e-6), \
+            "encode(return_attn=True)+decode() deveria bater com forward() em aggregation=attention"
+        assert alpha.shape == (b, n_level, 1, d, h, w)
+        alpha_sum = alpha.sum(dim=1)  # deveria ser 1.0 em todo voxel (softmax sobre n_level)
+        assert torch.allclose(alpha_sum, torch.ones_like(alpha_sum), atol=1e-5), \
+            "alpha deveria somar 1 entre as n_level direcoes em cada voxel (softmax valido)"
+    print("OK: encode(return_attn=True)+decode() == forward() e alpha e' um softmax valido "
+          "(aggregation=attention)")
+
+    # permutation invariance TAMBEM com aggregation="attention" -- prova de
+    # que o escore aprendido nao introduz nenhuma dependencia de ORDEM (ver
+    # docstring de AttentionAggregator3D: escore de cada direcao depende so'
+    # da propria feature dela, pesos compartilhados entre direcoes).
+    model_attn.eval()
+    with torch.no_grad():
+        pred_orig_attn = model_attn(input_vols, input_bvecs, target_bvecs)
+        pred_perm_attn = model_attn(input_vols[:, perm], input_bvecs[:, perm], target_bvecs)
+    assert torch.allclose(pred_orig_attn, pred_perm_attn, atol=1e-5), \
+        "aggregation=attention deveria continuar invariante a permutacao da ORDEM de entrada"
+    print("OK: aggregation=attention tambem e' invariante a permutacao das n_level direcoes "
+          "de entrada (escore por direcao depende so da propria feature, nao da posicao)")
+
+    # aggregation invalido deve falhar cedo, na construcao (nao silenciosamente
+    # cair pra "mean" nem so' falhar tarde dentro de encode/forward).
+    try:
+        build_implicit_model(n_level=n_level, base_ch=8, aggregation="max")
+        raise AssertionError("aggregation invalido deveria levantar ValueError na construcao")
+    except ValueError:
+        print("OK: aggregation invalido ('max') levanta ValueError na construcao, como esperado")
 
 
 if __name__ == "__main__":

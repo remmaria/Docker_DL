@@ -64,6 +64,33 @@ class RRINTripletDataset(Dataset):
             ja sabe ignorar posicoes invalidas, mesmo mecanismo do padding
             de collate_variable_targets no RCAE).
 
+            CORRECAO/EXTENSAO (2026-09-09, pedido da usuaria apos observar
+            que a loss angular com peso 0.5 estava piorando o loss_signal
+            do PairFlowStar de forma mensuravel ja na epoca 1 -- ver
+            addendum secao 33.34): quando `sh_q_out>0` E `ensemble_m>0`
+            SIMULTANEAMENTE (caso do PairFlowStar, scripts/
+            04i_train_pairflow_star.py), o item TAMBEM devolve, pra cada
+            uma das `sh_q_out` direcoes do feixe, um ensemble COMPLETO de
+            ate `ensemble_m` pares candidatos (campos "*_sh_ens" abaixo,
+            forma (sh_q_out, ensemble_m, ...)) -- em vez de so' o par
+            "principal" daquela trinca (*_sh, forma (sh_q_out, ...), que
+            continua sendo gravado do mesmo jeito, sem mudanca, pra nao
+            quebrar scripts/04b_train_rrin.py, que nao usa ensemble_m).
+            NAO precisou mudar o formato do `<tag>_rrin_triplets.npz` da
+            etapa 2b -- os campos `ens_pair_a`/`ens_valid`/etc ja sao
+            gravados por scripts/02b_build_rrin_triplets.py com shape
+            (n_alvos, M), UM feixe de M candidatos por trinca, "na mesma
+            ordem de target_idx" (ver docstring daquele script) -- ou
+            seja, ja existiam feixes de ensemble pra QUALQUER trinca do
+            sujeito, nao so' pra trinca escolhida como item principal.
+            So' faltava o dataset ler esses feixes tambem para as
+            `sh_q_out` trincas extras, o que este metodo agora faz
+            reaproveitando `_ensemble_tensors(d, k2, ...)` pra cada k2 do
+            feixe SH (mesmo metodo ja usado pro item principal). Ver
+            scripts/04i_train_pairflow_star.py:_sh_bundle_forward_star
+            para como isso substitui a aproximacao anterior de "cada
+            direcao do feixe SH roda como ensemble degenerado M=1".
+
         ensemble_m: (default 0 = desligado, comportamento identico a antes)
             quando > 0, cada item TAMBEM devolve um feixe de ate
             `ensemble_m` pares de entrada DIVERSOS para a MESMA
@@ -448,8 +475,27 @@ class RRINTripletDataset(Dataset):
             t_frac_sh = np.zeros((K,), dtype=np.float32)
             quality_sh = np.zeros((K, 2), dtype=np.float32)
             sh_mask = np.zeros((K,), dtype=bool)
+
+            # feixe de ensemble COMPLETO por direcao do feixe SH (ver
+            # docstring de sh_q_out acima, "CORRECAO/EXTENSAO 2026-09-09")
+            # -- so' construido quando ensemble_m>0 (PairFlowStar); RRIN
+            # (04b_train_rrin.py, ensemble_m=0 sempre) continua so' com os
+            # campos *_sh de um par por direcao, sem custo extra.
+            build_ens_bundle = self.ensemble_m > 0
+            if build_ens_bundle:
+                M = self.ensemble_m
+                vol_a_sh_ens = np.zeros((K, M, 1, ps, ps, ps), dtype=np.float32)
+                vol_b_sh_ens = np.zeros((K, M, 1, ps, ps, ps), dtype=np.float32)
+                bvec_a_sh_ens = np.zeros((K, M, 3), dtype=np.float32)
+                bvec_b_sh_ens = np.zeros((K, M, 3), dtype=np.float32)
+                bvec_t_sh_ens = np.zeros((K, M, 3), dtype=np.float32)
+                t_frac_sh_ens = np.zeros((K, M), dtype=np.float32)
+                quality_sh_ens = np.zeros((K, M, 2), dtype=np.float32)
+                ensemble_mask_sh = np.zeros((K, M), dtype=bool)
+
             for slot, k2 in enumerate(sh_idxs):
-                t = self._triplet_tensors(d, int(k2), ox, oy, oz, mask_patch, xmax)
+                k2 = int(k2)
+                t = self._triplet_tensors(d, k2, ox, oy, oz, mask_patch, xmax)
                 vol_a_sh[slot] = t["vol_a"]
                 vol_b_sh[slot] = t["vol_b"]
                 target_sh[slot] = t["target"]
@@ -459,6 +505,34 @@ class RRINTripletDataset(Dataset):
                 t_frac_sh[slot] = t["t_frac"]
                 quality_sh[slot] = t["quality"]
                 sh_mask[slot] = True
+                if build_ens_bundle:
+                    ens = self._ensemble_tensors(d, k2, ox, oy, oz, mask_patch, xmax)
+                    vol_a_sh_ens[slot] = ens["vol_a_ens"]
+                    vol_b_sh_ens[slot] = ens["vol_b_ens"]
+                    bvec_a_sh_ens[slot] = ens["bvec_a_ens"]
+                    bvec_b_sh_ens[slot] = ens["bvec_b_ens"]
+                    bvec_t_sh_ens[slot] = ens["bvec_t_ens"]
+                    t_frac_sh_ens[slot] = ens["t_frac_ens"]
+                    quality_sh_ens[slot] = ens["quality_ens"]
+                    ensemble_mask_sh[slot] = ens["ensemble_mask"]
+
+            if build_ens_bundle and len(sh_idxs) < K:
+                # slots de PADDING do feixe SH (sujeito com menos de
+                # sh_q_out trincas validas disponiveis, ver n_valid_sh
+                # acima) -- ensemble_mask_sh fica todo False nesses slots
+                # (mesmo mecanismo de sh_mask=False), mas uma linha
+                # totalmente mascarada (todo logit=-inf) faz a softmax de
+                # PairFlowWeightHead3D virar NaN (0/0); mesmo os elementos
+                # de pred nessas posicoes sendo descartados depois por
+                # sh_mask=False em compute_sh_angular_loss (via indexacao
+                # avancada, que NAO propaga o valor dos elementos
+                # excluidos), o backward da softmax ainda pode gerar
+                # gradiente NaN pros pesos COMPARTILHADOS de
+                # PairFlowWeightHead3D (grad_output=0 nessas posicoes, mas
+                # 0*NaN=NaN, nao 0 -- efeito colateral conhecido do
+                # softmax+mascara no PyTorch). Marca um slot dummy [0]=True
+                # (dado zerado, sem custo real) pra evitar o NaN de raiz.
+                ensemble_mask_sh[len(sh_idxs):, 0] = True
 
             item.update({
                 "vol_a_sh": torch.from_numpy(vol_a_sh),
@@ -471,5 +545,16 @@ class RRINTripletDataset(Dataset):
                 "quality_sh": torch.from_numpy(quality_sh),
                 "sh_mask": torch.from_numpy(sh_mask),
             })
+            if build_ens_bundle:
+                item.update({
+                    "vol_a_sh_ens": torch.from_numpy(vol_a_sh_ens),
+                    "vol_b_sh_ens": torch.from_numpy(vol_b_sh_ens),
+                    "bvec_a_sh_ens": torch.from_numpy(bvec_a_sh_ens),
+                    "bvec_b_sh_ens": torch.from_numpy(bvec_b_sh_ens),
+                    "bvec_t_sh_ens": torch.from_numpy(bvec_t_sh_ens),
+                    "t_frac_sh_ens": torch.from_numpy(t_frac_sh_ens),
+                    "quality_sh_ens": torch.from_numpy(quality_sh_ens),
+                    "ensemble_mask_sh": torch.from_numpy(ensemble_mask_sh),
+                })
 
         return item

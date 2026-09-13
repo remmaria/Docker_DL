@@ -70,6 +70,29 @@ CONCENTRA especificamente em voxels de cruzamento genuino (consistente com
 ver o glifo da secao 20.6) ou esta espalhado uniformemente entre voxels
 simples e de cruzamento dentro da mesma ROI (ver `complexity_masks`).
 
+ESTRATIFICACAO POR ANGULO DE CRUZAMENTO (2026-09-03, ver addendum secoes
+20.16/20.17/31 -- ADITIVA, sempre calculada, sem flag pra ligar/desligar,
+so' --crossing-angle-bin-edges pra ajustar as faixas): teste direto da
+hipotese levantada quando a familia estrela (`rrin_n16_star*`) bateu o RCAE
+especificamente no trato UF (fasciculo uncinado) em precisao angular de
+pico E em FA_r2 -- a hipotese de trabalho era que o UF tem uma geometria de
+cruzamento "particularmente favorecida por um pool rico de candidatos"
+(mais diversa/menos alinhada com o padrao dominante do resto do cerebro),
+mas isso nunca foi testado DIRETO, so inferido do ROTULO do trato. Aqui,
+em vez de estratificar por trato anatomico, cada voxel de cruzamento
+(gt_n_peaks >= --min-peaks-for-crossing) e' classificado pelo ANGULO entre
+os dois MAIORES picos do ground truth (`crossing_angle_deg_map`, ciente da
+simetria antipodal -- sempre em [0,90] por construcao), agrupado em faixas
+(`--crossing-angle-bin-edges`, default "0,45,70,90" -> faixas "0-45"/
+"45-70"/"70-90"), com as MESMAS metricas de TP/FP/FN/energia SH
+recalculadas dentro de cada faixa, sufixadas "_ang_<lo>_<hi>" (ex.
+"TP_ang_45_70"). Como isso e' calculado dentro de QUALQUER ROI (inclusive
+"whole_mask", sempre presente), da' pra comparar o ganho da familia estrela
+por FAIXA DE ANGULO no cerebro inteiro, agnostico a trato: se o efeito for
+mesmo geometrico (nao um acidente de trato), voxels de OUTROS tratos com o
+mesmo angulo de cruzamento tipico do UF deveriam mostrar o mesmo padrao de
+vantagem da familia estrela, mesmo fora do UF.
+
 Uso:
     python scripts/11_peak_confusion_by_roi.py \
         --manifest work_dir/manifest.csv \
@@ -269,6 +292,86 @@ def match_peaks_voxel(true_dirs, true_vals, pred_dirs, pred_vals, threshold_deg)
     return n_tp, n_fp, n_fn, sum_ang_tp
 
 
+def crossing_angle_deg_map(gt_dirs, gt_vals):
+    """Angulo (graus, ciente da simetria antipodal -- mesma convencao de
+    `match_peaks_voxel`, `cos = abs(dot)`) entre os DOIS MAIORES picos do
+    ground truth (por `gt_vals`), calculado POR VOXEL -- "geometria do
+    proprio cruzamento", independente de qual ROI/trato anatomico o voxel
+    pertence (ver docstring do modulo, secao "ESTRATIFICACAO POR ANGULO DE
+    CRUZAMENTO").
+
+    `gt_dirs`: (X,Y,Z,npeaks,3). `gt_vals`: (X,Y,Z,npeaks) -- saida de
+    `peaks_from_model` (slot com `vals[...,k]==0` e' padding/vazio, mesma
+    convencao usada em `match_peaks_voxel`).
+
+    Retorna array (X,Y,Z) de float64: angulo em graus (sempre em [0,90],
+    por causa do `abs(dot)`) nos voxels com >=2 picos reais (`vals>0`);
+    `NaN` em todo o resto (inclusive fora da mascara, onde `peaks_from_model`
+    ja zera `gt_vals`, e em voxels de fibra unica/vazios, que nao tem um
+    "segundo maior pico" pra formar angulo nenhum).
+
+    Custo: um loop Python sobre os voxels com >=2 picos (tipicamente uma
+    fracao da ROI, nunca o volume inteiro) -- mesmo estilo/ordem de
+    grandeza de `confusion_for_roi`/`match_peaks_voxel` acima, calculado
+    UMA VEZ por sujeito (do ground truth, nao por metodo) e reaproveitado
+    por todos os metodos/ROIs em `_process_subject`, exatamente como
+    `gt_n_peaks`/`gt_dirs`/`gt_vals` em si."""
+    n_valid_peaks = np.sum(gt_vals > 0, axis=-1)
+    shape = n_valid_peaks.shape
+    out = np.full(shape, np.nan, dtype=np.float64)
+    for (x, y, z) in np.argwhere(n_valid_peaks >= 2):
+        x, y, z = int(x), int(y), int(z)
+        vals = gt_vals[x, y, z]
+        order = np.argsort(vals)[::-1]  # maior valor primeiro
+        i0, i1 = int(order[0]), int(order[1])
+        v0, v1 = gt_dirs[x, y, z, i0], gt_dirs[x, y, z, i1]
+        cos = abs(float(np.dot(v0, v1)))
+        cos = min(1.0, max(-1.0, cos))
+        out[x, y, z] = float(np.degrees(np.arccos(cos)))
+    return out
+
+
+def crossing_angle_bin_masks(crossing_mask, angle_map, bin_edges):
+    """Divide os voxels de `crossing_mask` (ja restrito a UMA ROI e a
+    gt_n_peaks>=min_peaks_for_crossing, ver `complexity_masks`) em faixas de
+    ANGULO DE CRUZAMENTO (`bin_edges`, sequencia crescente em graus, ex.
+    `[0,45,70,90]` -> faixas `[0,45)`, `[45,70)`, `[70,90]`), usando o mapa
+    por voxel de `crossing_angle_deg_map` -- ver docstring do modulo/secao
+    "ESTRATIFICACAO POR ANGULO DE CRUZAMENTO".
+
+    A ultima faixa e' fechada dos dois lados (`<=` no limite superior) pra
+    nao perder voxels com angulo EXATAMENTE 90 -- caso legitimo e nao raro
+    (cruzamento ortogonal), nao um erro de arredondamento.
+
+    Voxels de `crossing_mask` cujo angulo (por construcao, sempre em
+    [0,90]) caia fora de `[bin_edges[0], bin_edges[-1]]` -- so acontece se
+    `bin_edges` for passado com limites mais estreitos que [0,90] de
+    proposito -- ficam de fora de TODAS as faixas (nao contam em nenhum
+    bin, nao levantam erro).
+
+    Retorna dict `{label: mask_bool}`, `label` no formato `"ang_<lo>_<hi>"`
+    (ex. `"ang_45_70"`), mesmo shape espacial de `crossing_mask`."""
+    out = {}
+    n_bins = len(bin_edges) - 1
+    for k in range(n_bins):
+        lo, hi = bin_edges[k], bin_edges[k + 1]
+        label = f"ang_{lo:g}_{hi:g}"
+        if k == n_bins - 1:
+            in_bin = (angle_map >= lo) & (angle_map <= hi)
+        else:
+            in_bin = (angle_map >= lo) & (angle_map < hi)
+        out[label] = crossing_mask & in_bin
+    return out
+
+
+def _angle_bin_labels(bin_edges):
+    """Labels na MESMA ordem/formato que `crossing_angle_bin_masks` produz
+    -- usado pra montar a lista de colunas ANTES de processar qualquer
+    sujeito (ex. `_failed_rows`, cabecalho do CSV), sem precisar rodar o
+    binning de verdade."""
+    return [f"ang_{bin_edges[k]:g}_{bin_edges[k + 1]:g}" for k in range(len(bin_edges) - 1)]
+
+
 def complexity_masks(roi_mask, gt_n_peaks, min_peaks_for_crossing):
     """Estratifica uma ROI em dois subconjuntos de voxels, pela COMPLEXIDADE
     angular do ground truth (numero de picos de FOD do proprio ground
@@ -390,6 +493,59 @@ _STRATIFIED_COLS = [f"{base}_{stratum}"
                      for stratum in ("simple", "crossing")]
 
 
+def _angle_stratified_columns(gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs, pred_vals,
+                               pred_shm_coeff, roi_mask, sh_order, threshold_deg,
+                               min_peaks_for_crossing, angle_map, bin_edges,
+                               gt_energy_by_anglebin):
+    """Mesma logica de `_stratified_columns`, mas estratificando os voxels
+    de CRUZAMENTO (gt_n_peaks >= min_peaks_for_crossing) por FAIXA DE
+    ANGULO do proprio cruzamento (ver `crossing_angle_deg_map`/
+    `crossing_angle_bin_masks`), em vez de por trato anatomico -- teste
+    direto da hipotese de que o ganho da familia estrela no UF e' explicado
+    pela geometria do cruzamento (angulo), nao pelo rotulo do trato em si
+    (ver docstring do modulo/addendum secoes 20.16/20.17/31).
+
+    `gt_energy_by_anglebin` e' um dict `{label: energy_by_l}` com a
+    referencia do GROUND TRUTH ja calculada por faixa (mesmo racional de
+    `gt_energy_by_stratum` em `_stratified_columns`, reaproveitada aqui, nao
+    recalculada por metodo).
+
+    Retorna dict de colunas ADITIVAS, sufixadas por faixa (ex.
+    `"TP_ang_45_70"`, `"energy_frac_high_order_ang_0_45"`), prontas pra
+    `row.update(...)` sem tocar nas colunas ja existentes."""
+    crossing_mask = complexity_masks(roi_mask, gt_n_peaks, min_peaks_for_crossing)["crossing"]
+    bins = crossing_angle_bin_masks(crossing_mask, angle_map, bin_edges)
+    cols = {}
+    for label, bin_mask in bins.items():
+        conf = confusion_for_roi(gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs,
+                                  pred_vals, bin_mask, threshold_deg)
+        energy_by_l = sh_energy_by_order(pred_shm_coeff, sh_order, bin_mask)
+        cols[f"n_voxels_{label}"] = int(bin_mask.sum())
+        cols[f"TP_{label}"] = conf["TP"]
+        cols[f"FP_{label}"] = conf["FP"]
+        cols[f"FN_{label}"] = conf["FN"]
+        cols[f"TN_voxels_{label}"] = conf["TN_voxels"]
+        cols[f"sum_tp_angle_deg_{label}"] = conf["sum_tp_angle_deg"]
+        cols[f"energy_frac_high_order_{label}"] = _energy_frac_high_order(energy_by_l)
+        cols[f"ref_energy_frac_high_order_{label}"] = _energy_frac_high_order(
+            gt_energy_by_anglebin.get(label, {}))
+    return cols
+
+
+def _angle_stratified_col_names(bin_edges):
+    """Lista de nomes de coluna que `_angle_stratified_columns` produz para
+    um dado `bin_edges` -- usada ANTES de processar qualquer sujeito (ex.
+    `_failed_rows`, cabecalho do CSV final), sem rodar o binning de
+    verdade. Mesmo espirito/uso de `_STRATIFIED_COLS`, so que dependente de
+    `--crossing-angle-bin-edges` (por isso e' uma funcao, nao uma constante
+    de modulo como `_STRATIFIED_COLS`)."""
+    labels = _angle_bin_labels(bin_edges)
+    return [f"{base}_{label}"
+            for base in ("n_voxels", "TP", "FP", "FN", "TN_voxels", "sum_tp_angle_deg",
+                          "energy_frac_high_order", "ref_energy_frac_high_order")
+            for label in labels]
+
+
 def _process_subject(e, tag, args, roi_tracts):
     bvals, bvecs = load_bval_bvec(e.bval_path, e.bvec_path)
     data, _affine, _header = load_dwi(e.dwi_path)
@@ -436,6 +592,23 @@ def _process_subject(e, tag, args, roi_tracts):
         for roi_name, roi_mask in rois.items()
     }
 
+    # mapa de angulo de cruzamento do GT (secao "ESTRATIFICACAO POR ANGULO
+    # DE CRUZAMENTO" no docstring do modulo) -- calculado UMA VEZ por
+    # sujeito, do proprio ground truth, reaproveitado por todos os
+    # metodos/ROIs abaixo (mesmo padrao de gt_n_peaks/gt_dirs/gt_vals).
+    gt_crossing_angle_map = crossing_angle_deg_map(gt_dirs, gt_vals)
+    # referencia de energia do GT por FAIXA DE ANGULO (mesmo racional de
+    # gt_energy_by_stratum_full acima, so que a estratificacao e' por
+    # angulo de cruzamento em vez de simple/crossing).
+    gt_energy_by_anglebin_full = {
+        roi_name: {label: sh_energy_by_order(gt_shm_coeff, sh_order_full, bin_mask)
+                   for label, bin_mask in crossing_angle_bin_masks(
+                       complexity_masks(roi_mask, gt_n_peaks,
+                                        args.min_peaks_for_crossing)["crossing"],
+                       gt_crossing_angle_map, args.crossing_angle_bin_edges).items()}
+        for roi_name, roi_mask in rois.items()
+    }
+
     rows = []
 
     def _failed_rows(method, order):
@@ -450,7 +623,8 @@ def _process_subject(e, tag, args, roi_tracts):
                  "TP": np.nan, "FP": np.nan, "FN": np.nan, "TN_voxels": np.nan,
                  "sum_tp_angle_deg": np.nan,
                  "energy_frac_high_order": np.nan, "ref_energy_frac_high_order": np.nan,
-                 **{c: np.nan for c in _STRATIFIED_COLS}}
+                 **{c: np.nan for c in _STRATIFIED_COLS},
+                 **{c: np.nan for c in _angle_stratified_col_names(args.crossing_angle_bin_edges)}}
                 for roi_name in rois]
 
     methods_to_try = [("baseline_sh", args.baseline_dir), ("rcae", args.rcae_dir)] + args.extra_methods
@@ -495,6 +669,11 @@ def _process_subject(e, tag, args, roi_tracts):
                 gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs, pred_vals,
                 pred_shm_coeff, roi_mask, sh_order_full, args.peak_match_threshold_deg,
                 args.min_peaks_for_crossing, gt_energy_by_stratum_full.get(roi_name, {})))
+            row.update(_angle_stratified_columns(
+                gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs, pred_vals,
+                pred_shm_coeff, roi_mask, sh_order_full, args.peak_match_threshold_deg,
+                args.min_peaks_for_crossing, gt_crossing_angle_map, args.crossing_angle_bin_edges,
+                gt_energy_by_anglebin_full.get(roi_name, {})))
             rows.append(row)
 
     if args.subsampled_only:
@@ -545,6 +724,7 @@ def _process_subject(e, tag, args, roi_tracts):
                 if sh_order_sub == sh_order_full:
                     gt_energy_by_roi_sub = gt_energy_by_roi_full
                     gt_energy_by_stratum_sub = gt_energy_by_stratum_full
+                    gt_energy_by_anglebin_sub = gt_energy_by_anglebin_full
                 else:
                     _gt_n_sub, _gt_dirs_sub, _gt_vals_sub, gt_shm_coeff_sub = fit_peaks(
                         data, bvals, bvecs, args.shell_b, mask, args.shell_tol, sh_order_sub,
@@ -558,6 +738,21 @@ def _process_subject(e, tag, args, roi_tracts):
                                        gt_shm_coeff_sub, sh_order_sub, stratum_mask)
                                    for stratum_name, stratum_mask in complexity_masks(
                                        roi_mask, gt_n_peaks, args.min_peaks_for_crossing).items()}
+                        for roi_name, roi_mask in rois.items()
+                    }
+                    # mesma logica de gt_energy_by_stratum_sub acima, agora
+                    # para a estratificacao por angulo de cruzamento -- os
+                    # BINS em si (gt_crossing_angle_map/complexity_masks)
+                    # continuam vindo do fit em sh_order_full (mesma escolha
+                    # ja feita pra "simple"/"crossing"), so a referencia de
+                    # ENERGIA precisa do re-fit em sh_order_sub.
+                    gt_energy_by_anglebin_sub = {
+                        roi_name: {label: sh_energy_by_order(gt_shm_coeff_sub, sh_order_sub,
+                                                              bin_mask)
+                                   for label, bin_mask in crossing_angle_bin_masks(
+                                       complexity_masks(roi_mask, gt_n_peaks,
+                                                        args.min_peaks_for_crossing)["crossing"],
+                                       gt_crossing_angle_map, args.crossing_angle_bin_edges).items()}
                         for roi_name, roi_mask in rois.items()
                     }
                 for roi_name, roi_mask in rois.items():
@@ -576,6 +771,11 @@ def _process_subject(e, tag, args, roi_tracts):
                         gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs, pred_vals,
                         pred_shm_coeff, roi_mask, sh_order_sub, args.peak_match_threshold_deg,
                         args.min_peaks_for_crossing, gt_energy_by_stratum_sub.get(roi_name, {})))
+                    row.update(_angle_stratified_columns(
+                        gt_n_peaks, gt_dirs, gt_vals, pred_n_peaks, pred_dirs, pred_vals,
+                        pred_shm_coeff, roi_mask, sh_order_sub, args.peak_match_threshold_deg,
+                        args.min_peaks_for_crossing, gt_crossing_angle_map,
+                        args.crossing_angle_bin_edges, gt_energy_by_anglebin_sub.get(roi_name, {})))
                     rows.append(row)
 
     return rows
@@ -633,6 +833,17 @@ def main():
                           "picos do GT nao entram em nenhum dos dois estratos. Mesma "
                           "convencao de threshold usada em scripts/crossing_fiber_stratified_"
                           "eval.py.")
+    ap.add_argument("--crossing-angle-bin-edges", default="0,45,70,90",
+                     help="faixas (graus, lista crescente separada por virgula, default "
+                          "'0,45,70,90' -> faixas 0-45/45-70/70-90) usadas para estratificar os "
+                          "voxels de cruzamento (gt_n_peaks>=--min-peaks-for-crossing) pelo "
+                          "ANGULO entre os dois maiores picos do ground truth (ver "
+                          "crossing_angle_deg_map/docstring do modulo, secao 'ESTRATIFICACAO "
+                          "POR ANGULO DE CRUZAMENTO') -- teste geometrico direto da hipotese de "
+                          "que o ganho da familia estrela no UF e' explicado pelo angulo de "
+                          "cruzamento tipico ali, nao pelo rotulo do trato. O angulo (ciente da "
+                          "simetria antipodal) e' sempre <=90 por construcao -- nao faz sentido "
+                          "passar um limite acima de 90.")
     ap.add_argument("--roi-tracts", default=None,
                      help="mesma convencao de --roi-tracts em 07_downstream_dti_noddi.py. "
                           "Tratos JHU conhecidos: " + ", ".join(
@@ -659,6 +870,20 @@ def main():
         sys.exit("--subsampled-only precisa de --triplets-dir")
     if not (0 <= args.shard_index < max(args.shard_count, 1)):
         sys.exit(f"--shard-index ({args.shard_index}) fora do intervalo [0, {args.shard_count})")
+
+    try:
+        bin_edges = [float(x.strip()) for x in args.crossing_angle_bin_edges.split(",") if x.strip()]
+    except ValueError:
+        sys.exit(f"--crossing-angle-bin-edges invalido: {args.crossing_angle_bin_edges!r} "
+                  f"(esperado lista de numeros separados por virgula, ex. '0,45,70,90')")
+    if len(bin_edges) < 2 or any(b2 <= b1 for b1, b2 in zip(bin_edges, bin_edges[1:])):
+        sys.exit(f"--crossing-angle-bin-edges precisa ter >=2 valores estritamente crescentes "
+                  f"(recebido {bin_edges})")
+    if bin_edges[0] < 0 or bin_edges[-1] > 90:
+        print(f"[aviso] --crossing-angle-bin-edges={bin_edges} sai de [0,90] -- o angulo "
+              f"(ciente da simetria antipodal) nunca ultrapassa 90, entao qualquer faixa fora "
+              f"desse intervalo nunca recebe voxel nenhum.", flush=True)
+    args.crossing_angle_bin_edges = bin_edges
 
     roi_tracts = [t.strip() for t in args.roi_tracts.split(",") if t.strip()] if args.roi_tracts else []
 
@@ -704,7 +929,7 @@ def main():
     cols = ["subject", "tag", "method", "shell", "n_level", "roi", "sh_order", "fit_failed",
             "TP", "FP", "FN", "TN_voxels", "sum_tp_angle_deg",
             "energy_frac_high_order", "ref_energy_frac_high_order",
-            *_STRATIFIED_COLS]
+            *_STRATIFIED_COLS, *_angle_stratified_col_names(args.crossing_angle_bin_edges)]
     if not all_rows:
         print(f"[shard {args.shard_index}/{args.shard_count}] nenhum resultado neste shard -- "
               f"gravando CSV vazio em {out_csv}", flush=True)
@@ -810,6 +1035,50 @@ def main():
               "inteira (que mistura voxels simples e de cruzamento). TP_crossing avisa quando "
               "a comparacao e' baseada em poucos pares casados (estimativa mais ruidosa), mesmo "
               "cuidado ja documentado para 'n_voxels_crossing' na tabela de energia SH.")
+
+    # ESTRATIFICACAO POR ANGULO DE CRUZAMENTO (2026-09-03, ver docstring do
+    # modulo/addendum secoes 20.16/20.17/31): mesmo teste ja feito acima para
+    # "simple"/"crossing" (por TRATO/ROI), agora aplicado as FAIXAS DE
+    # ANGULO de cruzamento (--crossing-angle-bin-edges) -- teste direto da
+    # hipotese de que o ganho da familia estrela no UF e' explicado pelo
+    # angulo de cruzamento tipico ali, nao pelo rotulo do trato. Como
+    # "whole_mask" e' sempre uma das ROIs, a linha (metodo, "whole_mask")
+    # desta tabela ja da' o corte AGNOSTICO A TRATO (todo o cerebro,
+    # agrupado so por angulo de cruzamento) -- comparar essa linha com as
+    # linhas de ROIs especificas (ex. "UF") na MESMA faixa de angulo e' o
+    # que decide se o efeito e' geometrico (deveria aparecer em qualquer
+    # trato com aquele angulo tipico) ou especifico do trato (so aparece
+    # rotulado "UF", nao em outros voxels com o mesmo angulo).
+    angle_bin_labels = _angle_bin_labels(args.crossing_angle_bin_edges)
+    tp_cols = [f"TP_{label}" for label in angle_bin_labels]
+    if all(c in ok.columns for c in tp_cols):
+        sum_cols = tp_cols + [f"sum_tp_angle_deg_{label}" for label in angle_bin_labels] \
+            + [f"n_voxels_{label}" for label in angle_bin_labels]
+        angle_bin_summary = ok.groupby(["method", "roi"])[sum_cols].sum()
+        display_cols = []
+        for label in angle_bin_labels:
+            angle_bin_summary[f"mean_tp_angle_deg_{label}"] = (
+                angle_bin_summary[f"sum_tp_angle_deg_{label}"]
+                / angle_bin_summary[f"TP_{label}"].replace(0, np.nan))
+            display_cols += [f"n_voxels_{label}", f"TP_{label}", f"mean_tp_angle_deg_{label}"]
+        print(f"\nErro angular medio dos TP (graus) e contagem de voxels, ESTRATIFICADO por "
+              f"FAIXA DE ANGULO DE CRUZAMENTO do ground truth (--crossing-angle-bin-edges="
+              f"{args.crossing_angle_bin_edges}, so' dentro dos voxels de cruzamento -- "
+              f"gt_n_peaks>=--min-peaks-for-crossing={args.min_peaks_for_crossing}):")
+        print(angle_bin_summary[display_cols])
+        print("\nLeitura: teste geometrico direto (nao mais por ROTULO de trato) da hipotese "
+              "'a familia estrela ganha do RCAE especificamente em cruzamentos com geometria "
+              "mais diversa' (addendum secoes 20.16/20.17). Compare a linha (metodo, "
+              "'whole_mask') -- todo o cerebro, agnostico a trato -- entre metodos, na MESMA "
+              "faixa de angulo: se 'star610'/'star815' vencerem o RCAE em "
+              "'mean_tp_angle_deg_ang_<faixa>' no whole_mask INTEIRO na mesma faixa onde ja "
+              "venciam no UF, o efeito e' explicado pelo angulo de cruzamento (deveria "
+              "aparecer em qualquer trato com essa geometria, nao so' no UF). Se o whole_mask "
+              "nao mostrar essa vantagem mesmo na faixa de angulo tipica do UF, o efeito e' "
+              "especifico do trato (outro fator, nao capturado so' pelo angulo entre os dois "
+              "maiores picos) -- n_voxels_ang_<faixa> avisa quando uma faixa tem poucos "
+              "voxels (estimativa mais ruidosa, mesmo cuidado ja documentado para "
+              "'n_voxels_crossing' acima).")
 
 
 if __name__ == "__main__":

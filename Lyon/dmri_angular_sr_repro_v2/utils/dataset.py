@@ -413,26 +413,49 @@ def collate_variable_targets(batch: list[dict]) -> dict:
     target ate o maior N_out do batch (zeros) e devolvemos "target_mask"
     (B, N_out_max) para a loss ignorar as posicoes de padding -- ver
     run_epoch em scripts/04_train_rcae.py.
+
+    OTIMIZACAO (2026-09-03, ver addendum secao 33.14/33.15): a maioria
+    dos batches tem N_out IGUAL pra todos os sujeitos (padding so' e'
+    necessario nos casos raros de shell com poucas direcoes disponiveis
+    -- ver _dynamic_split/_load_subject). Nesse caso comum, evitamos o
+    loop Python de copia manual -- que rodava sempre, mesmo sem padding
+    de verdade, e escalava com o tamanho do batch, contribuindo pro
+    `wait` (esse collate roda no processo worker, antes do batch chegar
+    na GPU) -- e usamos `torch.stack` vetorizado (C), igual ao collate
+    padrao do PyTorch. So' cai no loop de padding manual quando o batch
+    tem N_out realmente distinto entre sujeitos (caso raro). Saida
+    (shape/dtype/valores) e' IDENTICA nos dois caminhos.
     """
     input_vols = torch.stack([b["input_vols"] for b in batch], dim=0)
     input_bvecs = torch.stack([b["input_bvecs"] for b in batch], dim=0)
     input_bvals = torch.stack([b["input_bvals"] for b in batch], dim=0)
 
-    n_out_max = max(b["target_vols"].shape[0] for b in batch)
+    n_outs = [b["target_vols"].shape[0] for b in batch]
+    n_out_max = max(n_outs)
     bsz = len(batch)
-    vol_shape = batch[0]["target_vols"].shape[1:]  # (1, ps, ps, ps)
 
-    target_vols = torch.zeros((bsz, n_out_max, *vol_shape), dtype=torch.float32)
-    target_bvecs = torch.zeros((bsz, n_out_max, 3), dtype=torch.float32)
-    target_bvals = torch.zeros((bsz, n_out_max), dtype=torch.float32)
-    target_mask = torch.zeros((bsz, n_out_max), dtype=torch.bool)
+    if all(n_out == n_out_max for n_out in n_outs):
+        # Caminho rapido (caso comum): nenhum sujeito precisa de
+        # padding -- stack vetorizado direto, sem loop Python.
+        target_vols = torch.stack([b["target_vols"] for b in batch], dim=0)
+        target_bvecs = torch.stack([b["target_bvecs"] for b in batch], dim=0)
+        target_bvals = torch.stack([b["target_bvals"] for b in batch], dim=0)
+        target_mask = torch.ones((bsz, n_out_max), dtype=torch.bool)
+    else:
+        # Caminho lento (caso raro): pelo menos um sujeito do batch tem
+        # N_out < n_out_max -- precisa de padding de verdade.
+        vol_shape = batch[0]["target_vols"].shape[1:]  # (1, ps, ps, ps)
 
-    for i, b in enumerate(batch):
-        n_out = b["target_vols"].shape[0]
-        target_vols[i, :n_out] = b["target_vols"]
-        target_bvecs[i, :n_out] = b["target_bvecs"]
-        target_bvals[i, :n_out] = b["target_bvals"]
-        target_mask[i, :n_out] = True
+        target_vols = torch.zeros((bsz, n_out_max, *vol_shape), dtype=torch.float32)
+        target_bvecs = torch.zeros((bsz, n_out_max, 3), dtype=torch.float32)
+        target_bvals = torch.zeros((bsz, n_out_max), dtype=torch.float32)
+        target_mask = torch.zeros((bsz, n_out_max), dtype=torch.bool)
+
+        for i, (b, n_out) in enumerate(zip(batch, n_outs)):
+            target_vols[i, :n_out] = b["target_vols"]
+            target_bvecs[i, :n_out] = b["target_bvecs"]
+            target_bvals[i, :n_out] = b["target_bvals"]
+            target_mask[i, :n_out] = True
 
     return {
         "input_vols": input_vols,
@@ -478,7 +501,8 @@ class SubjectGroupedSampler(torch.utils.data.Sampler):
     garantia) -- agrupa direto a partir de `dataset.tile_index`.
     """
 
-    def __init__(self, dataset: "DWIPatchDataset", seed: int = 0, freeze_order: bool = False):
+    def __init__(self, dataset: "DWIPatchDataset", seed: int = 0, freeze_order: bool = False,
+                 num_workers: "int | None" = None, batch_size: "int | None" = None):
         """
         freeze_order (default False, ADITIVO -- comportamento de todo
         chamador existente continua identico sem passar isso explicitamente,
@@ -488,7 +512,7 @@ class SubjectGroupedSampler(torch.utils.data.Sampler):
         sujeito, mais abaixo em `__iter__`, continua variando por epoca
         normalmente, ja que usa o mesmo `rng` sequencialmente).
 
-        Motivacao (diagnostico de gargalo de dataloading no treino
+        Motivacao original (diagnostico de gargalo de dataloading no treino
         `pairflow_ssl`, ver scripts/04g_train_pairflow_ssl.py): com
         `num_workers>0`, o `DataLoader` do PyTorch despacha os batches pros
         workers em ROUND-ROBIN (worker 0,1,...,N-1,0,1,...), nao em blocos
@@ -497,19 +521,47 @@ class SubjectGroupedSampler(torch.utils.data.Sampler):
         worker, e cada worker tem seu PROPRIO cache LRU
         (`max_cached_subjects`) isolado dos demais (processos separados).
         Resultado: o MESMO sujeito e' recarregado do disco em ate
-        `num_workers` workers diferentes por epoca -- e, se a ordem dos
-        sujeitos muda a cada epoca (comportamento antigo, default), o
-        mapeamento sujeito->worker tambem muda, entao nem entre epocas um
-        worker consegue reaproveitar o que ja carregou. Congelar a ordem
-        (freeze_order=True) NAO elimina a redundancia entre workers dentro
-        de uma mesma epoca (isso exigiria particionar sujeitos por worker,
-        mudanca maior, nao feita aqui), mas garante que o mapeamento
-        sujeito->worker fique ESTAVEL de epoca pra epoca -- entao, depois
-        da primeira epoca "fria", cada worker tende a ja ter em cache os
-        MESMOS sujeitos que vai precisar de novo, reduzindo releituras de
-        disco nas epocas seguintes (contanto que `max_cached_subjects` seja
-        grande o suficiente pra cobrir os sujeitos que aquele worker
-        especificamente revisita)."""
+        `num_workers` workers diferentes por epoca. `freeze_order=True`
+        sozinho NAO elimina essa redundancia DENTRO de uma mesma epoca (so
+        estabiliza o mapeamento sujeito->worker DE EPOCA EM EPOCA) -- por
+        isso foi revertido em 2026-09-02 ("nao resolveu o gargalo real").
+
+        num_workers / batch_size (ADITIVOS, ver addendum 2026-09-03 --
+        gargalo real medido no treino do modelo `implicit`: 95-99% do tempo
+        de epoca gasto esperando I/O, so' 1-5% em compute): quando
+        `num_workers` e' passado e > 1, este sampler PARTICIONA os sujeitos
+        em `num_workers` grupos disjuntos (round-robin sobre a ordem
+        embaralhada dos sujeitos a cada epoca) e monta a sequencia de
+        indices de forma que TODO batch consecutivo de tamanho
+        `batch_size` pertenca inteiramente a UM grupo so', e os grupos se
+        alternem em round-robin estrito (batch 0 do grupo 0, batch 0 do
+        grupo 1, ..., batch 0 do grupo N-1, batch 1 do grupo 0, ...). Como o
+        `DataLoader` do PyTorch tambem despacha os batches em round-robin
+        estrito pro pool de workers (worker `k % num_workers` sempre recebe
+        o batch `k`, contando que a `BatchSampler` default agrupe o stream
+        deste `Sampler` em blocos sequenciais e IMUTAVEIS de `batch_size` --
+        o que so' e' verdade fielmente com `drop_last=True`, ja usado em
+        todo treino que usa este sampler), isso garante que o worker `w` SO'
+        recebe batches montados a partir do grupo `w` -- eliminando a
+        releitura redundante do mesmo sujeito por workers diferentes DENTRO
+        da mesma epoca (o problema que `freeze_order` sozinho nao resolvia).
+
+        Requer `batch_size` junto com `num_workers>1` (senao nao da' pra
+        alinhar os blocos aos batches que o DataLoader vai formar -- levanta
+        ValueError). `num_workers<=1` (ou None, default) mantem o
+        comportamento antigo sem particionamento (nao ha' redundancia
+        cross-worker possivel com 0 ou 1 worker).
+
+        Como os sujeitos tem numeros de tiles desiguais, os grupos-de-worker
+        tambem ficam com totais desiguais; pra manter o alinhamento de
+        round-robin batch-a-batch ATE' O FIM da epoca (sem o que um grupo
+        que "acaba" antes dos outros bagunçaria o mapeamento batch->worker
+        dali em diante), cada grupo e' ciclicamente repetido (reaproveitando
+        indices ja' emitidos naquele mesmo grupo) ate' virar um multiplo
+        exato de `batch_size` E todos os grupos terem o MESMO numero de
+        batches (o maior entre eles) -- isso reamostra uma fracao pequena de
+        tiles a mais por epoca (tipicamente bem menor que 1 batch extra por
+        grupo), aceitavel frente ao ganho de eliminar I/O redundante."""
         groups = defaultdict(list)
         for flat_idx, (si, _origin) in enumerate(dataset.tile_index):
             groups[si].append(flat_idx)
@@ -517,6 +569,14 @@ class SubjectGroupedSampler(torch.utils.data.Sampler):
         self.seed = seed
         self.freeze_order = freeze_order
         self._epoch = 0
+        if num_workers is not None and num_workers > 1 and batch_size is None:
+            raise ValueError(
+                "SubjectGroupedSampler: num_workers>1 requer batch_size "
+                "explicito (necessario pra alinhar os blocos de indices aos "
+                "batches que o DataLoader vai formar -- ver docstring)."
+            )
+        self.num_workers = num_workers if (num_workers is not None and num_workers > 1) else None
+        self.batch_size = batch_size
 
     def set_epoch(self, epoch: int):
         # opcional: chame antes de cada epoca se quiser uma ordem diferente
@@ -529,12 +589,67 @@ class SubjectGroupedSampler(torch.utils.data.Sampler):
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self._epoch)
         order = rng.permutation(len(self.groups))
-        indices = []
-        for gi in order:
+        if self.num_workers is None:
+            indices = []
+            for gi in order:
+                block = list(self.groups[gi])
+                rng.shuffle(block)  # ainda ha variedade DENTRO do sujeito
+                indices.extend(block)
+            return iter(indices)
+        return iter(self._iter_partitioned(rng, order))
+
+    def _iter_partitioned(self, rng: np.random.Generator, order: np.ndarray) -> list:
+        """Monta o stream de indices particionado por worker -- ver docstring
+        do __init__ pra motivacao/garantias. `order` ja' e' a permutacao dos
+        sujeitos sorteada em __iter__ (mesma rng, consumida sequencialmente
+        adiante pra embaralhar os tiles dentro de cada sujeito)."""
+        num_workers = self.num_workers
+        bs = self.batch_size
+
+        # 1) particiona sujeitos em `num_workers` buckets, round-robin sobre
+        #    a ordem ja embaralhada -- cada bucket vira uma lista flat de
+        #    indices de tile (embaralhados dentro de cada sujeito).
+        buckets: list = [[] for _ in range(num_workers)]
+        for pos, gi in enumerate(order):
             block = list(self.groups[gi])
-            rng.shuffle(block)  # ainda ha variedade DENTRO do sujeito
-            indices.extend(block)
-        return iter(indices)
+            rng.shuffle(block)
+            buckets[pos % num_workers].extend(block)
+
+        # 2) cada bucket precisa virar um multiplo exato de `bs`, e todos os
+        #    buckets precisam ter o MESMO numero de batches (o maior entre
+        #    eles) -- senao o mapeamento batch->worker desalinha assim que
+        #    o primeiro bucket "acabar". Ciclicamente repete os indices de
+        #    cada bucket (do proprio bucket, nunca de outro -- nao mistura
+        #    sujeitos entre workers) ate atingir esse tamanho.
+        n_batches_per_bucket = [max(1, -(-len(b) // bs)) for b in buckets]  # ceil
+        n_batches = max(n_batches_per_bucket) if buckets else 0
+        target_len = n_batches * bs
+
+        padded = []
+        for b in buckets:
+            if not b:
+                # bucket vazio (mais workers que sujeitos nesta epoca) --
+                # nao deveria acontecer em uso normal (num_workers <=
+                # n_sujeitos), mas nao quebra: fica sem contribuir batches
+                # (o DataLoader so vai chamar esse worker se sobrar indice
+                # pra ele; com todos os buckets do mesmo tamanho isso nao
+                # ocorre a menos que TODOS os buckets estejam vazios).
+                padded.append([])
+                continue
+            reps = -(-target_len // len(b))  # ceil
+            cycled = (b * reps)[:target_len]
+            padded.append(cycled)
+
+        # 3) intercala em round-robin ESTRITO na granularidade de batch:
+        #    batch global k vem do bucket (k % num_workers) -- casa
+        #    exatamente com o despacho round-robin do DataLoader
+        #    (worker k % num_workers recebe o batch k).
+        indices = []
+        for r in range(n_batches):
+            for w in range(num_workers):
+                chunk = padded[w][r * bs:(r + 1) * bs]
+                indices.extend(chunk)
+        return indices
 
     def __len__(self):
         return sum(len(g) for g in self.groups)

@@ -1,4 +1,4 @@
-CENTER_VOXEL="59,58,26" PATCH_SIZE=3 \
+CENTER_VOXEL="59,53,26" PATCH_SIZE=3 \
 EXTRA_METHOD="naive_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_blend_recon,\
 naive_ensemble_blend=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/naive_ensemble_blend_recon,\
 rrin_n16_star35=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_recon_rrin_n16_star35,\

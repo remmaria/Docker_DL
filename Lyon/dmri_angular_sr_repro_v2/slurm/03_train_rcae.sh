@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=rc150016
+#SBATCH --job-name=train_rcae
 #SBATCH --cluster=gpu
-#SBATCH --partition=a100
+#SBATCH --partition=h200
 #SBATCH --gres=gpu:1
-# SBATCH --constraint=l40s
+# SBATCH --constraint=h200
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=0-23:00:00
+#SBATCH --time=2-23:00:00
 #SBATCH --account=tibrahim
 #SBATCH --error=logs/train.%A_%a.err
 #SBATCH --output=logs/train.%A_%a.out
@@ -157,6 +157,48 @@ if [[ "$DECODER_TYPE" != "direct" ]]; then
     echo "DECODER_TYPE=$DECODER_TYPE SH_DECODER_LMAX=$SH_DECODER_LMAX -- treinando a variante com Decoder3DSH (checkpoint em .../_shdec/, exige treino do zero)"
 fi
 
+# DEBUG_PLOT_EVERY / DEBUG_PLOT_EVERY_BATCHES (variaveis de ambiente,
+# default 1 / 200 -- comportamento de sempre): controlam --debug-plot-every
+# (snapshot do patch fixo de validacao a cada N epocas) e
+# --debug-plot-every-batches (snapshot do batch atual a cada N batches de
+# treino) de scripts/04_train_rcae.py. 0 desativa cada um (ver ajuda dos
+# respectivos --flags no proprio script). O snapshot por batch
+# (DEBUG_PLOT_EVERY_BATCHES) e' salvo com bastante frequencia por padrao
+# (a cada 200 batches, ~186x por epoca com batch_size=4/35471 batches) --
+# o tempo de salvar o PNG entra contado no "wait" do PROXIMO batch no log
+# de treino (ver comentario em scripts/04_train_rcae.py:run_epoch), entao
+# desligar isso reduz genuinamente tempo de parede, nao so poluicao de
+# disco. Rode com DEBUG_PLOT_EVERY_BATCHES=0 pra desativar so os
+# snapshots por batch (mantendo o snapshot fixo por epoca, que e' barato
+# -- 1x por epoca) ou DEBUG_PLOT_EVERY=0 tambem pra desligar os dois.
+#   DEBUG_PLOT_EVERY_BATCHES=0 sbatch slurm/03_train_rcae.sh <work_dir> 1000 16
+DEBUG_PLOT_EVERY="${DEBUG_PLOT_EVERY:-1}"
+DEBUG_PLOT_EVERY_BATCHES="${DEBUG_PLOT_EVERY_BATCHES:-200}"
+if [[ "$DEBUG_PLOT_EVERY_BATCHES" == "0" ]]; then
+    echo "DEBUG_PLOT_EVERY_BATCHES=0 -- snapshots de debug por BATCH desativados"
+fi
+if [[ "$DEBUG_PLOT_EVERY" == "0" ]]; then
+    echo "DEBUG_PLOT_EVERY=0 -- snapshot de debug por EPOCA (patch fixo) desativado"
+fi
+
+# BATCH_LOG_EVERY (variavel de ambiente, default 5 -- comportamento de
+# sempre): controla --batch-log-every de scripts/04_train_rcae.py, ou
+# seja, a cada quantos batches uma linha e' gravada (com flush() -- I/O
+# sincrono, nao soamento em buffer) em batch_log.csv. Com 35471
+# batches/epoca e o default 5, isso ainda e' ~7100 flush()s por epoca de
+# treino -- cada um um round-trip de escrita no filesystem de rede
+# ($WORK_DIR), que conta no "wait" do batch seguinte igual ao snapshot de
+# debug (ver comentario em scripts/04_train_rcae.py:run_epoch). Espaçar
+# mais (ex. 20-50) reduz isso proporcionalmente as custa de granularidade
+# menor no CSV (ainda grava sempre o 1o batch da epoca, entao a curva de
+# loss no INICIO de cada epoca nunca some). --batch-log-every 1 grava
+# todo batch (oposto do que foi pedido aqui, so documentando).
+#   BATCH_LOG_EVERY=25 sbatch slurm/03_train_rcae.sh <work_dir> 1000 16
+BATCH_LOG_EVERY="${BATCH_LOG_EVERY:-5}"
+if [[ "$BATCH_LOG_EVERY" != "5" ]]; then
+    echo "BATCH_LOG_EVERY=$BATCH_LOG_EVERY -- batch_log.csv gravado a cada $BATCH_LOG_EVERY batches (default 5)"
+fi
+
 python scripts/04_train_rcae.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --scheme-dir "$WORK_DIR/subsampling" \
@@ -164,7 +206,8 @@ python scripts/04_train_rcae.py \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --epochs 150 --batch-size 4 --patch-size 10 --q-out 10 \
     --lr 1e-3 --num-workers 8 --max-cached-subjects 6 --patience 15 \
-    --debug-plot-every 1 --debug-plot-every-batches 200 \
+    --debug-plot-every "$DEBUG_PLOT_EVERY" --debug-plot-every-batches "$DEBUG_PLOT_EVERY_BATCHES" \
+    --batch-log-every "$BATCH_LOG_EVERY" \
     --val-num-workers 4 --val-max-cached-subjects 1 \
     --angular-loss-weight "$ANGULAR_LOSS_WEIGHT" \
     --sh-loss-high-order-min "$SH_LOSS_HIGH_ORDER_MIN" \

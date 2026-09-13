@@ -84,12 +84,13 @@ def main():
         l_max=ckpt_args.get("l_max"),
         base_ch=ckpt_args.get("base_ch", 16),
         norm_type=ckpt_args.get("norm_type", "instance"),
+        aggregation=ckpt_args.get("aggregation", "mean"),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     print(f"Checkpoint carregado (epoca {ckpt.get('epoch')}, val_loss {ckpt.get('val_loss')}, "
           f"l_max={model.l_max}, sh_dim={model.sh_dim}, base_ch={model.base_ch}, "
-          f"norm_type={model.norm_type})")
+          f"norm_type={model.norm_type}, aggregation={model.aggregation})")
 
     entries = [e for e in load_manifest(args.manifest) if e.split == args.split]
 

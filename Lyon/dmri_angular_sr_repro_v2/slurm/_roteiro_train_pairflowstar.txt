@@ -1,0 +1,20 @@
+ENSEMBLE_M=<M> (default 3) — precisa ser ≤ M gravado no .npz das trincas.
+INIT_CHECKPOINT=<caminho> — inicializa flow_net do pré-treino SSL (etapa 4g). FREEZE_FLOW=1 congela esse flow (exige INIT_CHECKPOINT).
+WEIGHT_QUALITY_COND=1 — condiciona a fusão (PairFlowWeightHead3D) em qualidade da trinca (não existe USE_QUALITY_COND aqui, só isso).
+ONLY_VALID=0, NORM_TYPE=batch — mesma semântica do RRIN.
+LR=<valor> (default 1e-4, diferente do RRIN).
+BATCH_SIZE=<N> (default 8), FREEZE_SUBJECT_ORDER=1, MAX_CACHED_SUBJECTS=<N> (default 6) — ajustes de I/O; BATCH_SIZE/FREEZE_SUBJECT_ORDER mudam o path do checkpoint automaticamente.
+WARMUP_STEPS, ZERO_INIT_REFINE_OUTPUT=1 — mesmos aditivos do implicit, adaptados (zera a última camada do RefineNet3D).
+ANGULAR_LOSS_WEIGHT=<valor> + SH_LOSS_HIGH_ORDER_MIN/SH_LOSS_LMAX_CAP/SH_LOSS_Q_OUT (default 16) — acabei de atualizar o comentário deste bloco, que ainda dizia "M=1 degenerado" (a aproximação antiga); agora reflete a correção que fizemos (ensemble completo). Atenção ao custo: com os defaults ENSEMBLE_M=8/SH_LOSS_Q_OUT=16, o feixe SH passa a extrair até 128 pares por item.
+CKPT_TAG=<string> — essencial aqui: o OUT_DIR só é montado a partir de BATCH_SIZE/FREEZE_SUBJECT_ORDER, não leva em conta qual INIT_CHECKPOINT foi usado. Duas rodadas com pré-treinos diferentes na mesma config de batch/freeze colidem sem aviso — sempre passe um CKPT_TAG diferente ao trocar de checkpoint inicial.
+Combinação de produção (a que você tem rodando): 
+
+
+ENSEMBLE_M=8 TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m8r15 \
+ANGULAR_LOSS_WEIGHT=0.5 \
+  NO_RESUME=1 \
+  INIT_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_ssl_checkpoints/shell1000/last.pt \
+  BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=2e-4 \
+  WARMUP_STEPS=500 ZERO_INIT_REFINE_OUTPUT=1 \
+  CKPT_TAG=sslep131sh \
+  sbatch 04i_train_pairflow_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16

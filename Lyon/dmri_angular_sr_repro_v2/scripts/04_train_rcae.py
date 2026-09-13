@@ -94,6 +94,15 @@ def run_epoch(model, loader, optimizer, device, train: bool, b_ref: float,
     """
     model.train(mode=train)
     total_loss = 0.0
+    # totais separados de loss_signal (MAE de sinal) e loss_angular (termo
+    # SH, quando ativo) -- pedido da usuaria em 2026-09-08 pra poder ver se
+    # a loss angular esta de fato baixando durante o treino, em vez de so
+    # ver a loss COMBINADA (que pode "esconder" um dos dois termos parado
+    # ou piorando se o outro estiver compensando). total_loss continua
+    # identico a antes (usado pro early-stopping/scheduler); os dois novos
+    # sao so pra log/diagnostico.
+    total_loss_signal = 0.0
+    total_loss_angular = 0.0
     n_batches = 0
     n_samples = 0
     total_wait_s = 0.0
@@ -172,6 +181,9 @@ def run_epoch(model, loader, optimizer, device, train: bool, b_ref: float,
         compute_s = t_compute_end - t_received
 
         total_loss += loss.item()
+        total_loss_signal += loss_signal.item()
+        if loss_angular is not None:
+            total_loss_angular += loss_angular.item()
         n_batches += 1
         n_samples += input_vols.shape[0]
         total_wait_s += wait_s
@@ -248,7 +260,13 @@ def run_epoch(model, loader, optimizer, device, train: bool, b_ref: float,
               f"wait total {total_wait_s:.1f}s ({pct_wait:.0f}%) | compute total "
               f"{total_compute_s:.1f}s | {throughput:.2f} patches/s", flush=True)
 
-    return total_loss / max(1, n_batches)
+    avg_loss_signal = total_loss_signal / max(1, n_batches)
+    # avg_loss_angular fica None (nao 0.0) quando o termo esta desativado --
+    # mesma convencao ja usada em batch_log.csv (coluna vazia em vez de
+    # "0.0", que poderia ser confundido com "termo ativo mas convergiu pra
+    # zero").
+    avg_loss_angular = (total_loss_angular / max(1, n_batches)) if angular_loss_weight > 0 else None
+    return total_loss / max(1, n_batches), avg_loss_signal, avg_loss_angular
 
 
 def plot_fixed_debug_patch(model, fixed_batch, device, b_ref, plot_dir, epoch, val_loss=None,
@@ -536,11 +554,17 @@ def main():
     # SUJEITO (mantendo os patches de cada sujeito agrupados), pra reduzir
     # a troca de sujeito quase a cada batch que anulava o cache LRU do
     # DWIPatchDataset -- ver utils/dataset.py:SubjectGroupedSampler.
-    train_sampler = SubjectGroupedSampler(train_ds, seed=args.seed)
+    train_sampler = SubjectGroupedSampler(train_ds, seed=args.seed,
+                                           num_workers=args.num_workers, batch_size=args.batch_size)
     # worker_init_fn: sem isso, todo worker herda uma copia identica do RNG
     # de amostragem de patch (mesma seed) e fica em lockstep com os outros
     # -- ver comentario em utils/dataset.py:worker_init_fn e
     # DWIPatchDataset.__init__. So relevante com num_workers > 0.
+    if args.num_workers > 1:
+        print(f"[dataloader] SubjectGroupedSampler particionado por worker "
+              f"(num_workers={args.num_workers}, batch_size={args.batch_size}) -- "
+              f"elimina releitura redundante de sujeito entre workers na mesma epoca "
+              f"(ver utils.dataset.SubjectGroupedSampler.__init__, addendum 2026-09-03)", flush=True)
     winit = worker_init_fn if args.num_workers > 0 else None
     winit_val = worker_init_fn if val_num_workers > 0 else None
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler,
@@ -812,7 +836,16 @@ def main():
 
     log_path = run_dir / "train_log.csv"
     with open(log_path, "w") as f:
-        f.write("epoch,train_loss,val_loss,lr\n")
+        # train_loss_signal/train_loss_angular/val_loss_signal/val_loss_angular:
+        # colunas novas no FIM (nao mudam a posicao das colunas antigas,
+        # nenhum script que so le epoch/train_loss/val_loss/lr quebra) --
+        # pedido da usuaria em 2026-09-08 pra separar a MAE de sinal (loss_signal)
+        # do termo angular/SH (loss_angular) na media POR EPOCA, nao so por
+        # batch (que ja existia em batch_log.csv) -- fica vazio quando
+        # --angular-loss-weight=0.0 (mesma convencao do batch_log.csv).
+        f.write("epoch,train_loss,val_loss,lr,"
+                "train_loss_signal,train_loss_angular,"
+                "val_loss_signal,val_loss_angular\n")
 
     # log por batch (nao so por epoca) -- da pra ver progresso dentro de uma
     # epoca longa e conferir se os valores de patch (input/target) estao
@@ -832,26 +865,41 @@ def main():
     try:
         for epoch in range(start_epoch, args.epochs + 1):
             train_sampler.set_epoch(epoch)  # ordem de sujeitos diferente a cada epoca
-            train_loss = run_epoch(model, train_loader, optimizer, device, train=True,
-                                    b_ref=args.shell_b, epoch=epoch, batch_log_f=batch_log_f,
-                                    debug_state=debug_state, outlier_threshold=args.outlier_threshold,
-                                    batch_log_every=args.batch_log_every,
-                                    angular_loss_weight=args.angular_loss_weight,
-                                    sh_loss_high_order_min=args.sh_loss_high_order_min,
-                                    sh_loss_lmax_cap=args.sh_loss_lmax_cap)
-            val_loss = run_epoch(model, val_loader, optimizer, device, train=False,
-                                  b_ref=args.shell_b, epoch=epoch, batch_log_f=batch_log_f,
-                                  outlier_threshold=args.outlier_threshold,
-                                  batch_log_every=args.batch_log_every,
-                                  angular_loss_weight=args.angular_loss_weight,
-                                  sh_loss_high_order_min=args.sh_loss_high_order_min,
-                                  sh_loss_lmax_cap=args.sh_loss_lmax_cap)
+            train_loss, train_loss_signal, train_loss_angular = run_epoch(
+                model, train_loader, optimizer, device, train=True,
+                b_ref=args.shell_b, epoch=epoch, batch_log_f=batch_log_f,
+                debug_state=debug_state, outlier_threshold=args.outlier_threshold,
+                batch_log_every=args.batch_log_every,
+                angular_loss_weight=args.angular_loss_weight,
+                sh_loss_high_order_min=args.sh_loss_high_order_min,
+                sh_loss_lmax_cap=args.sh_loss_lmax_cap)
+            val_loss, val_loss_signal, val_loss_angular = run_epoch(
+                model, val_loader, optimizer, device, train=False,
+                b_ref=args.shell_b, epoch=epoch, batch_log_f=batch_log_f,
+                outlier_threshold=args.outlier_threshold,
+                batch_log_every=args.batch_log_every,
+                angular_loss_weight=args.angular_loss_weight,
+                sh_loss_high_order_min=args.sh_loss_high_order_min,
+                sh_loss_lmax_cap=args.sh_loss_lmax_cap)
             scheduler.step(val_loss)
             current_lr = optimizer.param_groups[0]["lr"]
 
+            train_loss_angular_str = f"{train_loss_angular:.6f}" if train_loss_angular is not None else ""
+            val_loss_angular_str = f"{val_loss_angular:.6f}" if val_loss_angular is not None else ""
             with open(log_path, "a") as f:
-                f.write(f"{epoch},{train_loss:.6f},{val_loss:.6f},{current_lr:.2e}\n")
-            print(f"epoch {epoch:03d} | train {train_loss:.6f} | val {val_loss:.6f} | lr {current_lr:.2e}")
+                f.write(f"{epoch},{train_loss:.6f},{val_loss:.6f},{current_lr:.2e},"
+                        f"{train_loss_signal:.6f},{train_loss_angular_str},"
+                        f"{val_loss_signal:.6f},{val_loss_angular_str}\n")
+            # linha de stdout tambem ganha o detalhamento MAE/angular quando o
+            # termo esta ativo, pra dar pra acompanhar direto no log do SLURM
+            # sem precisar abrir o CSV.
+            if args.angular_loss_weight > 0:
+                print(f"epoch {epoch:03d} | train {train_loss:.6f} "
+                      f"(mae {train_loss_signal:.6f}, ang {train_loss_angular:.6f}) | "
+                      f"val {val_loss:.6f} (mae {val_loss_signal:.6f}, ang {val_loss_angular:.6f}) | "
+                      f"lr {current_lr:.2e}")
+            else:
+                print(f"epoch {epoch:03d} | train {train_loss:.6f} | val {val_loss:.6f} | lr {current_lr:.2e}")
 
             if debug_fixed_batch is not None and (epoch % args.debug_plot_every == 0):
                 plot_fixed_debug_patch(model, debug_fixed_batch, device, args.shell_b,

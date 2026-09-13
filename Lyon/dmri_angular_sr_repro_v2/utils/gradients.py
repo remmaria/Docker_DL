@@ -98,21 +98,269 @@ def farthest_point_sampling(bvecs: np.ndarray, n_select: int, seed_idx: int = 0,
     return np.array(sorted(selected)) if sort else np.array(selected)
 
 
+def _pairwise_electrostatic_energy(unit_vecs: np.ndarray) -> np.ndarray:
+    """Matriz (n,n) de energia eletrostatica de Jones et al. 1999 entre pares
+    de direcoes unitarias, tratando v e -v como equivalentes (antipodal-
+    simetrico por construcao -- soma o termo de repulsao contra v_j E
+    contra -v_j, em vez de escolher um sinal canonico como o metodo legado
+    fazia, que e a fonte do bug de formula inconsistente descrito nas notas
+    do projeto). Diagonal fica zero (auto-energia nao definida/nao usada).
+
+    Porte fiel de pairwise_energy_matrix em select_pair_rep_centroid_v2.py
+    (mesma formula: e = 1/|v_i-v_j|^2 + 1/|v_i+v_j|^2).
+    """
+    n = unit_vecs.shape[0]
+    E = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d_minus = np.linalg.norm(unit_vecs[i] - unit_vecs[j])
+            d_plus = np.linalg.norm(unit_vecs[i] + unit_vecs[j])
+            e = 1.0 / (d_minus ** 2 + 1e-12) + 1.0 / (d_plus ** 2 + 1e-12)
+            E[i, j] = E[j, i] = e
+    return E
+
+
+def _subset_energy(E: np.ndarray, idx_list) -> float:
+    idx = list(idx_list)
+    return E[np.ix_(idx, idx)].sum() / 2.0
+
+
+def direction_set_quality(bvecs: np.ndarray) -> dict:
+    """Diagnostico geometrico de um subconjunto de direcoes JA SELECIONADO
+    (nao faz selecao nenhuma -- so mede a qualidade do que foi passado).
+    Mesmas 3 metricas que select_pair_rep_centroid_v2.py imprimia no log
+    (angulo minimo, |centro de massa|), mais a energia eletrostatica do
+    subconjunto -- usado por scripts/02d_diagnose_subsampling.py para
+    auditar esquemas ja gerados (por fps OU electrostatic), sujeito a
+    sujeito ou agregado no dataset inteiro.
+
+    bvecs: (N,3), N>=2. Nao precisam vir normalizados.
+
+    Retorna dict: {"min_angle_deg", "mean_nn_angle_deg", "centroid_norm",
+    "electrostatic_energy"}.
+      - min_angle_deg: menor angulo (antipodal-aware, ou seja tratando v e
+        -v como identicos) entre qualquer par do subconjunto -- quanto
+        maior, melhor (mais espalhado); compare contra o teto real do
+        protocolo de origem (ver notas do projeto -- ex.: ~14,3 graus no
+        esquema de 64 direcoes usado aqui), nao contra uma expectativa de
+        esfera uniforme de livro-texto.
+      - mean_nn_angle_deg: media do angulo ate o VIZINHO MAIS PROXIMO de
+        cada direcao (nao a media de todos os pares) -- menos dominado por
+        outliers que "angulo minimo" sozinho, mais sensivel a aglomeracoes
+        localizadas que um unico min_angle_deg pode esconder.
+      - centroid_norm: |media dos vetores unitarios do subconjunto| -- 0 =
+        perfeitamente balanceado ao redor da esfera, valores maiores
+        indicam vies de direcao (todas puxando pra um lado).
+      - electrostatic_energy: mesma formula de _pairwise_electrostatic_energy
+        (Jones et al. 1999), somada sobre o subconjunto -- quanto menor,
+        melhor (mais disperso); permite comparar fps vs electrostatic no
+        MESMO criterio que o metodo electrostatic otimiza diretamente
+        (fps nao otimiza isso, entao e esperado que saia pior aqui).
+    """
+    bvecs = np.asarray(bvecs, dtype=float)
+    n = bvecs.shape[0]
+    if n < 2:
+        raise ValueError("direction_set_quality precisa de pelo menos 2 direcoes")
+    norms = np.linalg.norm(bvecs, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    unit = bvecs / norms
+
+    cos_abs = np.abs(unit @ unit.T)
+    cos_abs = np.clip(cos_abs, -1.0, 1.0)
+    ang = np.degrees(np.arccos(cos_abs))
+    np.fill_diagonal(ang, np.inf)  # nunca contar auto-angulo (0 graus)
+
+    min_angle_deg = float(ang.min())
+    mean_nn_angle_deg = float(ang.min(axis=1).mean())
+    centroid_norm = float(np.linalg.norm(unit.mean(axis=0)))
+    energy = float(_subset_energy(_pairwise_electrostatic_energy(unit), range(n)))
+
+    return {
+        "min_angle_deg": min_angle_deg,
+        "mean_nn_angle_deg": mean_nn_angle_deg,
+        "centroid_norm": centroid_norm,
+        "electrostatic_energy": energy,
+    }
+
+
+def _greedy_energy_init(E: np.ndarray, n_select: int, seed_idx: int) -> list[int]:
+    n = E.shape[0]
+    selected = [seed_idx]
+    remaining = set(range(n)) - {seed_idx}
+    while len(selected) < n_select:
+        best_cand, best_cost = None, np.inf
+        for c in remaining:
+            cost = sum(E[c, s] for s in selected)
+            if cost < best_cost:
+                best_cost, best_cand = cost, c
+        selected.append(best_cand)
+        remaining.remove(best_cand)
+    return selected
+
+
+def _local_search_polish(E: np.ndarray, selected, n_total: int, max_iter: int = 150):
+    """Busca local 2-opt (swap 1-a-1, primeira melhora): tenta trocar cada
+    ponto selecionado por cada ponto nao-selecionado, aceita a primeira
+    troca que reduz a energia total do subconjunto, reinicia a varredura;
+    para quando uma passada completa nao encontra melhora nenhuma ou o
+    teto de iteracoes e atingido.
+    """
+    selected = set(selected)
+    not_selected = set(range(n_total)) - selected
+    best_energy = _subset_energy(E, selected)
+    improved = True
+    it = 0
+    while improved and it < max_iter:
+        improved = False
+        it += 1
+        for out_i in list(selected):
+            trial_base = selected - {out_i}
+            for in_i in list(not_selected):
+                candidate = trial_base | {in_i}
+                e = _subset_energy(E, candidate)
+                if e < best_energy - 1e-9:
+                    selected = candidate
+                    not_selected = (not_selected - {in_i}) | {out_i}
+                    best_energy = e
+                    improved = True
+                    break
+            if improved:
+                break
+    return sorted(selected), best_energy, it
+
+
+def electrostatic_repulsion_sampling(bvecs: np.ndarray, n_select: int,
+                                      n_starts: int = 20, max_local_iter: int = 150,
+                                      seed: int = 42, sort: bool = True):
+    """Seleciona um subconjunto de direcoes minimizando energia eletrostatica
+    de Jones et al. 1999 (repulsao par-a-par, antipodal-simetrica por
+    construcao) -- porte de select_directions em select_pair_rep_centroid_v2.py
+    (usado no pre-processamento clinico via run_pipeline.sh --sub_qspace),
+    trazido para este repo para que o pipeline de TREINO (build_subsampling_scheme)
+    possa usar o mesmo criterio de selecao, evitando o domain gap geometrico
+    descrito nas notas do projeto "Subamostragem angular e pipeline de
+    treino da rede" (farthest_point_sampling, o metodo historico deste
+    modulo, e sistematicamente pior: pra N=16 a partir de um esquema real
+    de 64 direcoes, o v2 alcanca ~28,4 graus de angulo minimo contra o teto
+    do proprio protocolo de aquisicao de ~14,3 graus -- quase o dobro).
+
+    bvecs: (N, 3) vetores de uma unica shell (ja filtrados, sem b0) --
+    nao precisam vir normalizados, este metodo normaliza internamente.
+    n_select: quantas direcoes manter.
+    n_starts: quantas sementes aleatorias tentar (greedy_init + polimento
+    2-opt cada uma, mantendo a de menor energia final) -- 20 e o default
+    atual (reduzido de 80 em 2026-09 apos calibracao automatica, ver
+    scripts/02e_calibrate_electrostatic_nstarts.py e
+    electrostatic_nstarts_calibration.csv): testado em 38 combinacoes de
+    shell (500-2000) x N (6-54) com 5 sujeitos cada, ja com n_starts=10 a
+    energia mediana ficava a <1% (media 0,16%) da energia obtida com
+    n_starts=160 -- ou seja, a convergencia e rapida mesmo pros N mais
+    altos (onde o espaco de busca e maior), sem necessidade de mais
+    sementes. 20 mantem margem de seguranca de 2x sobre o menor valor
+    testado (10) que ja bastava, a um custo bem menor que 80 (speedup de
+    ~6-8x em N=48/54 no teste). O pequeno gap de min_angle_deg observado
+    contra farthest_point_sampling em N alto (mediana <1,3 grau, ver
+    subsampling_quality.csv vs. subsampling_quality_fps.csv) PERSISTE
+    mesmo com n_starts alto -- e um efeito geometrico do regime
+    quase-saturado (poucas direcoes de fora pra trocar quando N esta
+    perto do total disponivel), nao um artefato de sub-otimizacao.
+    Revalidar com scripts/02e_calibrate_electrostatic_nstarts.py se o
+    dataset ou os niveis de N mudarem muito.
+    max_local_iter: teto de iteracoes da busca local 2-opt por semente --
+    100-150 valida (convergencia tipica em ~11 iteracoes para N=16,
+    independente de tetos ate 300 testados nas notas do projeto).
+    seed: semente do gerador de numeros aleatorios que escolhe as sementes
+    de n_starts (reprodutibilidade).
+    sort: quando True (default, mesma convencao de farthest_point_sampling),
+    devolve os indices selecionados em ordem numerica crescente. Quando
+    False, devolve na ordem interna do algoritmo (sem significado de
+    "ordem de selecao" aqui, ao contrario de farthest_point_sampling, ja
+    que a busca local pode trocar qualquer posicao a qualquer momento).
+
+    Retorna array de indices LOCAIS (relativos a bvecs). Note: ao contrario
+    de select_pair_rep_centroid_v2.py (que tambem imprime energia/angulo
+    minimo/centro de massa para diagnostico), esta funcao devolve so os
+    indices -- quem chamar pode recalcular esses diagnosticos a partir do
+    subconjunto devolvido, se quiser (ver exemplo em
+    scripts/02_subsample_directions.py).
+    """
+    bvecs = np.asarray(bvecs, dtype=float)
+    n = bvecs.shape[0]
+    if n_select > n:
+        raise ValueError(f"n_select ({n_select}) nao pode exceder o numero de direcoes disponiveis ({n})")
+    if n_select < 1:
+        raise ValueError("n_select deve ser >= 1")
+    if n_select == n:
+        order = np.arange(n)
+        return order if sort else order
+
+    norms = np.linalg.norm(bvecs, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    unit = bvecs / norms
+
+    E = _pairwise_electrostatic_energy(unit)
+    rng = np.random.default_rng(seed)
+    seeds_tried = rng.choice(n, size=min(n_starts, n), replace=False)
+
+    best_selection, best_energy = None, np.inf
+    for s in seeds_tried:
+        init_sel = _greedy_energy_init(E, n_select, int(s))
+        polished_sel, polished_energy, _n_iter = _local_search_polish(E, init_sel, n, max_local_iter)
+        if polished_energy < best_energy:
+            best_energy = polished_energy
+            best_selection = polished_sel
+
+    selected = np.array(best_selection)
+    return np.array(sorted(selected)) if sort else selected
+
+
 def subsample_shell(bvals: np.ndarray, bvecs: np.ndarray, shell_indices: np.ndarray,
-                     n_select: int, seed_idx: int = 0):
-    """Aplica farthest_point_sampling dentro de uma shell especifica (indices globais).
+                     n_select: int, seed_idx: int = 0, method: str = "fps",
+                     n_starts: int = 20, max_local_iter: int = 150, seed: int = 42):
+    """Aplica a selecao de direcoes dentro de uma shell especifica (indices globais).
+
+    method: "fps" (default, farthest_point_sampling -- comportamento
+    historico deste modulo, usado por todo o pipeline de treino ate
+    2026-09) ou "electrostatic" (energia eletrostatica de Jones et al.
+    1999 + multi-start + polimento por busca local 2-opt, ver
+    electrostatic_repulsion_sampling -- porte de select_pair_rep_centroid_v2.py,
+    usado no pipeline de pre-processamento clinico via --sub_qspace). Ver
+    docstring de electrostatic_repulsion_sampling para o porque de preferir
+    esse metodo (dispersao angular bem melhor -- ex.: ~28,4 graus de angulo
+    minimo vs. o teto do proprio protocolo de ~14,3 graus, para N=16 a
+    partir de um esquema real de 64 direcoes) e para o cuidado de manter
+    treino e avaliacao com o MESMO metodo (evitar um domain gap geometrico
+    entre os dois, alem do domain gap de SNR ja documentado no protocolo).
+
+    n_starts/max_local_iter/seed: repassados a electrostatic_repulsion_sampling
+    quando method="electrostatic" (ignorados para method="fps").
 
     Retorna os indices GLOBAIS (relativos ao array bvals/bvecs completo) selecionados.
     """
     local_bvecs = bvecs[shell_indices]
-    local_selected = farthest_point_sampling(local_bvecs, n_select, seed_idx=seed_idx)
+    if method == "fps":
+        local_selected = farthest_point_sampling(local_bvecs, n_select, seed_idx=seed_idx)
+    elif method == "electrostatic":
+        local_selected = electrostatic_repulsion_sampling(
+            local_bvecs, n_select, n_starts=n_starts, max_local_iter=max_local_iter, seed=seed)
+    else:
+        raise ValueError(f"method desconhecido: {method!r} (use 'fps' ou 'electrostatic')")
     return shell_indices[local_selected]
 
 
 def build_subsampling_scheme(bvals: np.ndarray, bvecs: np.ndarray, n_levels: list[int],
-                              tol: float = 100.0, seed_idx: int = 0):
+                              tol: float = 100.0, seed_idx: int = 0, method: str = "fps",
+                              n_starts: int = 20, max_local_iter: int = 150, seed: int = 42):
     """Gera, para cada shell (exceto b0) e cada nivel em n_levels, os indices
     globais de direcoes de entrada (subamostradas) e o complemento (alvo/held-out).
+
+    method/n_starts/max_local_iter/seed: ver subsample_shell -- "fps"
+    (default, comportamento historico) ou "electrostatic" (recomendado a
+    partir de 2026-09, ver notas do projeto "Subamostragem angular e
+    pipeline de treino da rede": usar o MESMO metodo do pre-processamento
+    clinico (--sub_qspace/select_pair_rep_centroid_v2.py) tambem para gerar
+    os pares de treino, para nao introduzir um domain gap geometrico entre
+    o que a rede viu no treino e o que ve na validacao/producao).
 
     Retorna dict:
       {shell_b: {n_level: {"input_idx": arr, "target_idx": arr, "n_available": int}}}
@@ -134,7 +382,9 @@ def build_subsampling_scheme(bvals: np.ndarray, bvecs: np.ndarray, n_levels: lis
                     "n_available": n_available,
                 }
                 continue
-            input_idx = subsample_shell(bvals, bvecs, idxs, n_level, seed_idx=seed_idx)
+            input_idx = subsample_shell(bvals, bvecs, idxs, n_level, seed_idx=seed_idx,
+                                         method=method, n_starts=n_starts,
+                                         max_local_iter=max_local_iter, seed=seed)
             target_idx = np.setdiff1d(idxs, input_idx)
             scheme[b_key][n_level] = {
                 "input_idx": input_idx,
@@ -368,9 +618,180 @@ def find_best_bracket(candidate_bvecs: np.ndarray, target_bvec: np.ndarray,
     }
 
 
+def _pairwise_bracket_geometry(candidate_bvecs: np.ndarray, target_bvecs: np.ndarray):
+    """Geometria compartilhada entre find_best_bracket_batch e
+    find_star_ensemble_batch -- fatorada em 2026-09-11 porque as duas
+    funcoes recomputavam, de forma independente, EXATAMENTE o mesmo
+    calculo O(n_pares x n_alvos) (mesmos dot(a,b), plano/normal, t_frac
+    com sinal, residuo) sempre que scripts/02b_build_rrin_triplets.py
+    chamava as duas no mesmo (candidate_bvecs, target_bvecs) -- ou seja,
+    toda vez que --ensemble-m > 0, a geometria pairwise de um combo
+    (shell, n_level, sujeito) era paga em dobro. Agora
+    02b_build_rrin_triplets.py so chama find_star_ensemble_batch quando o
+    ensemble esta ligado (a posicao 0 do feixe e' sempre, por construcao,
+    o mesmo par que find_best_bracket_batch devolveria sozinha -- ver
+    docstring de find_star_ensemble_batch), entao o calculo pairwise so e'
+    feito uma vez por combo em qualquer dos dois casos. Numericamente
+    IDENTICA ao que cada funcao computava inline antes desta refatoracao
+    -- so extraida, nenhuma formula mudou.
+
+    Retorna dict com, para n_pairs = M*(M-1)/2 pares (i,j), i<j, de
+    candidate_bvecs (M,3), e K alvos de target_bvecs (K,3):
+      "iu", "ju": (n_pairs,) indices LOCAIS de cada par em candidate_bvecs.
+      "gap_deg_pairs": (n_pairs,) angulo entre os dois candidatos do par,
+          em graus -- nao depende do alvo.
+      "n_hat": (n_pairs,3) normal do plano de cada par.
+      "t_frac": (n_pairs,K) posicao com sinal do alvo no arco a->b.
+      "residual_deg": (n_pairs,K) desvio de colinearidade, em graus.
+      "between": (n_pairs,K) bool, 0<=t_frac<=1.
+      "centrality": (n_pairs,K) abs(t_frac-0.5) -- 0 = alvo exatamente no
+          meio do par (interpolacao mais "genuina"), 0.5 = alvo coincide
+          com uma das pontas do par (quase-extrapolacao) -- usado so
+          quando prefer_central_t_frac=True nas funcoes que chamam este
+          helper (ver find_best_bracket_batch/find_star_ensemble_batch).
+      "degenerate": (n_pairs,) bool, par quase-paralelo (sem plano bem
+          definido -- residuo tratado como maximo, ver spherical_triplet_residual).
+    """
+    candidate_bvecs = np.asarray(candidate_bvecs, dtype=float)
+    target_bvecs = np.atleast_2d(np.asarray(target_bvecs, dtype=float))
+    m = candidate_bvecs.shape[0]
+    if m < 2:
+        raise ValueError("geometria de pares precisa de pelo menos 2 direcoes candidatas")
+
+    u_norm = np.linalg.norm(candidate_bvecs, axis=1, keepdims=True)
+    u_norm[u_norm == 0] = 1.0
+    U = candidate_bvecs / u_norm
+
+    t_norm = np.linalg.norm(target_bvecs, axis=1, keepdims=True)
+    t_norm[t_norm == 0] = 1.0
+    T = target_bvecs / t_norm
+
+    iu, ju = np.triu_indices(m, k=1)  # mesma ordem de enumeracao de find_best_bracket
+
+    a_pairs = U[iu]  # (n_pairs, 3) -- papel de "a" = candidato de indice menor
+    b_raw = U[ju]    # (n_pairs, 3)
+    dot_ij = np.sum(a_pairs * b_raw, axis=1)
+    ang_ab = np.arccos(np.clip(np.abs(dot_ij), 0.0, 1.0))  # (n_pairs,) -- nao depende do alvo
+
+    # b SIGN-FIXADO (dot(a,b)>=0) -- precisamos do vetor de verdade (nao so
+    # do angulo sem sinal) pra montar a base ortonormal do plano usada no
+    # t_frac com sinal abaixo (ver nota no docstring do modulo, correcao de
+    # 2026-08-27).
+    sign_b = np.where(dot_ij >= 0.0, 1.0, -1.0)
+    b_pairs = b_raw * sign_b[:, None]
+
+    cross_ij = np.cross(a_pairs, b_pairs)  # (n_pairs, 3) -- consistente com b sign-fixado
+    cross_norm = np.linalg.norm(cross_ij, axis=1)
+    degenerate = cross_norm < 1e-8
+    n_hat = np.zeros_like(cross_ij)
+    ok = ~degenerate
+    n_hat[ok] = cross_ij[ok] / cross_norm[ok, None]
+
+    # e2 = componente de b perpendicular a a, normalizada -- junto com a,
+    # forma a base ortonormal do plano do grande circulo (mesma construcao
+    # de spherical_triplet_residual).
+    e2 = np.cross(n_hat, a_pairs)  # (n_pairs, 3)
+    e2_norm = np.linalg.norm(e2, axis=1)
+    e2_ok = e2_norm > 1e-12
+    e2_safe = np.zeros_like(e2)
+    e2_safe[e2_ok] = e2[e2_ok] / e2_norm[e2_ok, None]
+    e2 = e2_safe
+
+    dot_it = U @ T.T  # (M, K) -- dot(candidato_i_bruto, alvo_bruto)
+    dot_at = dot_it[iu, :]  # (n_pairs, K) -- dot(a_pairs, alvo_bruto)
+    sign_t = np.where(dot_at >= 0.0, 1.0, -1.0)  # sign-fix do alvo relativo a a_pairs
+    comp_a = np.abs(dot_at)  # dot(alvo_sign-fixado, a_pairs) -- sempre >=0 por construcao
+
+    dot_te_raw = e2 @ T.T  # (n_pairs, K) -- dot(e2, alvo_bruto)
+    comp_e2 = sign_t * dot_te_raw  # dot(alvo_sign-fixado, e2)
+
+    theta_t = np.arctan2(comp_e2, comp_a)  # (n_pairs, K) -- angulo COM SINAL de a para o alvo
+    ang_ab_col = ang_ab[:, None]
+    t_frac = np.divide(theta_t, ang_ab_col, out=np.zeros_like(theta_t), where=ang_ab_col > 1e-8)
+    t_frac[degenerate, :] = 0.0  # mesmo fallback do par degenerado usado em spherical_triplet_residual
+
+    dot_tn = n_hat @ T.T  # (n_pairs, K)
+    residual = np.arcsin(np.clip(np.abs(dot_tn), 0.0, 1.0))
+    residual[degenerate, :] = np.pi / 2.0  # par degenerado (i~=j): sem plano bem definido
+
+    between = (t_frac >= 0.0) & (t_frac <= 1.0)
+    gap_deg_pairs = np.degrees(ang_ab)
+    residual_deg = np.degrees(residual)
+    centrality = np.abs(t_frac - 0.5)
+
+    return {
+        "iu": iu, "ju": ju,
+        "gap_deg_pairs": gap_deg_pairs,
+        "n_hat": n_hat,
+        "t_frac": t_frac,
+        "residual_deg": residual_deg,
+        "between": between,
+        "centrality": centrality,
+        "degenerate": degenerate,
+    }
+
+
+def _fps_avoid_shared_anchor(unit_vecs: np.ndarray, anchors_i: np.ndarray, anchors_j: np.ndarray,
+                              n_select: int, seed_idx: int = 0) -> np.ndarray:
+    """Variante de farthest_point_sampling usada por find_star_ensemble_batch
+    quando avoid_shared_anchor=True (ver docstring la): mesma selecao
+    gulosa por distancia maxima (aqui sobre as NORMAIS dos pares do pool,
+    nao bvecs brutos), mas em cada passo PREFERE, entre os candidatos, um
+    cuja "ancora" (indice do candidato i OU j do proprio par) ainda nao
+    apareca em nenhum par ja escolhido do feixe -- evita que duas posicoes
+    do mesmo feixe reusem a mesma direcao de entrada como uma das pontas,
+    o que daria a rede duas "evidencias" menos independentes entre si do
+    que a diversidade de plano (FPS por normal) sozinha sugere. Cai de
+    volta no candidato de maior distancia SEM essa restricao quando
+    nenhum candidato remanescente tem ancora livre (mesmo padrao de
+    fallback ja usado por max_gap_deg -- nunca reduz quantos pares o feixe
+    tem, so influencia QUAIS sao escolhidos quando ha opcao de sobra).
+
+    unit_vecs: (P,3) normais dos pares do pool (ja unitarias).
+    anchors_i, anchors_j: (P,) indices LOCAIS (em candidate_bvecs) dos dois
+    candidatos de cada par do pool, na MESMA ordem/indexacao de unit_vecs.
+    """
+    unit_vecs = np.asarray(unit_vecs, dtype=float)
+    n = unit_vecs.shape[0]
+    if n_select >= n:
+        rest = [i for i in range(n) if i != seed_idx]
+        return np.array([seed_idx] + rest)
+    if n_select < 1:
+        raise ValueError("n_select deve ser >= 1")
+
+    selected = [seed_idx]
+    used_anchors = {int(anchors_i[seed_idx]), int(anchors_j[seed_idx])}
+    cos_to_seed = np.abs(unit_vecs @ unit_vecs[seed_idx])
+    min_dist = 1.0 - cos_to_seed
+
+    while len(selected) < n_select:
+        min_dist[selected[-1]] = -np.inf
+        order = np.argsort(-min_dist)  # do mais distante ao menos distante
+        picked = None
+        for idx in order:
+            if min_dist[idx] == -np.inf:
+                break  # resto ja e' tudo selecionado antes (distancia -inf)
+            if int(anchors_i[idx]) not in used_anchors and int(anchors_j[idx]) not in used_anchors:
+                picked = int(idx)
+                break
+        if picked is None:
+            # nenhum candidato remanescente tem ancora livre -- cai para o
+            # de maior distancia mesmo (comportamento sem esta restricao).
+            picked = int(np.argmax(min_dist))
+        selected.append(picked)
+        used_anchors.add(int(anchors_i[picked]))
+        used_anchors.add(int(anchors_j[picked]))
+        cos_new = np.abs(unit_vecs @ unit_vecs[picked])
+        dist_new = 1.0 - cos_new
+        min_dist = np.minimum(min_dist, dist_new)
+
+    return np.array(selected)
+
+
 def find_best_bracket_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarray,
                              max_residual_deg: float | None = None,
-                             require_between: bool = True):
+                             require_between: bool = True,
+                             prefer_central_t_frac: bool = False):
     """Equivalente VETORIZADO de chamar find_best_bracket uma vez por linha
     de target_bvecs (mesmos candidate_bvecs para todos os alvos) -- usado
     por scripts/02b_build_rrin_triplets.py, que precisava disso pra cada
@@ -404,6 +825,19 @@ def find_best_bracket_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarra
     "gap_deg", "t_frac", "between" -- exatamente os mesmos campos e a
     MESMA semantica de find_best_bracket.
 
+    prefer_central_t_frac (default False, flag ADITIVA -- ver revisao de
+    codigo 2026-09-11): quando True, usa abs(t_frac-0.5) como criterio
+    TERCIARIO de desempate (depois de gap_deg minimo e residual_deg
+    minimo, os dois criterios de sempre) entre pares aceitaveis com o
+    MESMO gap_deg e residual_deg -- prefere o par em que o alvo cai mais
+    perto do meio do arco (interpolacao "genuina") a um em que o alvo
+    quase coincide com uma das pontas do par (t_frac perto de 0 ou 1,
+    quase-extrapolacao mesmo estando dentro de [0,1]). Na pratica, como
+    gap_deg/residual_deg raramente empatam exatamente entre pares
+    distintos, este criterio so decide poucos casos -- pense nele como
+    uma preferencia leve, nao uma mudanca de regime na selecao. Default
+    False preserva o comportamento de sempre bit-a-bit.
+
     **CORRIGIDO em 2026-08-27 junto com spherical_triplet_residual (ver
     docstring la para o bug/contraexemplo completo):** o t_frac aqui agora
     tambem usa o angulo COM SINAL (base ortonormal (a_par, e2) no plano do
@@ -412,75 +846,14 @@ def find_best_bracket_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarra
     dados aleatorios (200 conjuntos x 5 alvos, 0 divergencias) mais o
     contraexemplo especifico que expos o bug original.
     """
-    candidate_bvecs = np.asarray(candidate_bvecs, dtype=float)
-    target_bvecs = np.atleast_2d(np.asarray(target_bvecs, dtype=float))
-    m = candidate_bvecs.shape[0]
-    if m < 2:
-        raise ValueError("find_best_bracket_batch precisa de pelo menos 2 direcoes candidatas")
-    k_targets = target_bvecs.shape[0]
-
-    u_norm = np.linalg.norm(candidate_bvecs, axis=1, keepdims=True)
-    u_norm[u_norm == 0] = 1.0
-    U = candidate_bvecs / u_norm
-
-    t_norm = np.linalg.norm(target_bvecs, axis=1, keepdims=True)
-    t_norm[t_norm == 0] = 1.0
-    T = target_bvecs / t_norm
-
-    iu, ju = np.triu_indices(m, k=1)  # mesma ordem de enumeracao de find_best_bracket
-    n_pairs = iu.shape[0]
-
-    a_pairs = U[iu]  # (n_pairs, 3) -- papel de "a" = candidato de indice menor, como no loop original
-    b_raw = U[ju]    # (n_pairs, 3)
-    dot_ij = np.sum(a_pairs * b_raw, axis=1)
-    ang_ab = np.arccos(np.clip(np.abs(dot_ij), 0.0, 1.0))  # (n_pairs,) -- nao depende do alvo
-
-    # b SIGN-FIXADO (dot(a,b)>=0) -- precisamos do vetor de verdade (nao so
-    # do angulo sem sinal) pra montar a base ortonormal do plano usada no
-    # t_frac com sinal abaixo (ver nota no docstring do modulo, correcao de
-    # 2026-08-27).
-    sign_b = np.where(dot_ij >= 0.0, 1.0, -1.0)
-    b_pairs = b_raw * sign_b[:, None]
-
-    cross_ij = np.cross(a_pairs, b_pairs)  # (n_pairs, 3) -- consistente com b sign-fixado
-    cross_norm = np.linalg.norm(cross_ij, axis=1)
-    degenerate = cross_norm < 1e-8
-    n_hat = np.zeros_like(cross_ij)
-    ok = ~degenerate
-    n_hat[ok] = cross_ij[ok] / cross_norm[ok, None]
-
-    # e2 = componente de b perpendicular a a, normalizada -- junto com a,
-    # forma a base ortonormal do plano do grande circulo em que "andar de a
-    # para b" e sempre o sentido positivo de e2 (mesma construcao de
-    # spherical_triplet_residual, ver docstring la para o bug que isso
-    # corrige e o contraexemplo numerico).
-    e2 = np.cross(n_hat, a_pairs)  # (n_pairs, 3)
-    e2_norm = np.linalg.norm(e2, axis=1)
-    e2_ok = e2_norm > 1e-12
-    e2_safe = np.zeros_like(e2)
-    e2_safe[e2_ok] = e2[e2_ok] / e2_norm[e2_ok, None]
-    e2 = e2_safe
-
-    dot_it = U @ T.T  # (M, K) -- dot(candidato_i_bruto, alvo_bruto)
-    dot_at = dot_it[iu, :]  # (n_pairs, K) -- dot(a_pairs, alvo_bruto), a_pairs = U[iu]
-    sign_t = np.where(dot_at >= 0.0, 1.0, -1.0)  # sign-fix do alvo relativo a a_pairs
-    comp_a = np.abs(dot_at)  # dot(alvo_sign-fixado, a_pairs) -- sempre >=0 por construcao
-
-    dot_te_raw = e2 @ T.T  # (n_pairs, K) -- dot(e2, alvo_bruto)
-    comp_e2 = sign_t * dot_te_raw  # dot(alvo_sign-fixado, e2)
-
-    theta_t = np.arctan2(comp_e2, comp_a)  # (n_pairs, K) -- angulo COM SINAL de a para o alvo
-    ang_ab_col = ang_ab[:, None]
-    t_frac = np.divide(theta_t, ang_ab_col, out=np.zeros_like(theta_t), where=ang_ab_col > 1e-8)
-    t_frac[degenerate, :] = 0.0  # mesmo fallback do par degenerado usado em spherical_triplet_residual
-
-    dot_tn = n_hat @ T.T  # (n_pairs, K)
-    residual = np.arcsin(np.clip(np.abs(dot_tn), 0.0, 1.0))
-    residual[degenerate, :] = np.pi / 2.0  # par degenerado (i~=j): sem plano bem definido
-
-    between = (t_frac >= 0.0) & (t_frac <= 1.0)
-    gap_deg_pairs = np.degrees(ang_ab)
-    residual_deg = np.degrees(residual)
+    geo = _pairwise_bracket_geometry(candidate_bvecs, target_bvecs)
+    iu, ju = geo["iu"], geo["ju"]
+    gap_deg_pairs = geo["gap_deg_pairs"]
+    t_frac = geo["t_frac"]
+    residual_deg = geo["residual_deg"]
+    between = geo["between"]
+    centrality = geo["centrality"]
+    k_targets = t_frac.shape[1]
 
     out_i = np.empty(k_targets, dtype=int)
     out_j = np.empty(k_targets, dtype=int)
@@ -500,8 +873,14 @@ def find_best_bracket_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarra
                     bw_idx = pool_idx[between[pool_idx, k]]
                     if bw_idx.size:
                         pool_idx = bw_idx
-                # entre o pool, menor gap_deg; empate quebrado pelo menor residuo
-                order = np.lexsort((residual_deg[pool_idx, k], gap_deg_pairs[pool_idx]))
+                # entre o pool, menor gap_deg; empate quebrado pelo menor
+                # residuo e, se prefer_central_t_frac, por ultimo pela
+                # centralidade do alvo no arco (ver docstring do parametro).
+                if prefer_central_t_frac:
+                    order = np.lexsort((centrality[pool_idx, k], residual_deg[pool_idx, k],
+                                         gap_deg_pairs[pool_idx]))
+                else:
+                    order = np.lexsort((residual_deg[pool_idx, k], gap_deg_pairs[pool_idx]))
                 best = pool_idx[order[0]]
             else:
                 best = int(np.argmin(residual_deg[:, k]))
@@ -527,7 +906,9 @@ def find_best_bracket_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarra
 def find_star_ensemble_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarray,
                               m: int, max_residual_deg: float | None = None,
                               require_between: bool = True,
-                              max_gap_deg: float | None = None):
+                              max_gap_deg: float | None = None,
+                              prefer_central_t_frac: bool = False,
+                              avoid_shared_anchor: bool = False):
     """"Ensemble em estrela" (ver protocolo secao 14.5, item 1 -- ideia
     adiada em favor da loss angular/SH da secao 15, retomada em 2026-08-27
     depois do bug critico de t_frac corrigido, ver addendum secao 12):
@@ -594,6 +975,31 @@ def find_star_ensemble_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarr
     incluindo para m=1 (a checagem de equivalencia com
     find_best_bracket_batch nao usa este parametro).
 
+    prefer_central_t_frac (default False -- ver mesmo parametro em
+    find_best_bracket_batch): usa abs(t_frac-0.5) como desempate
+    TERCIARIO (depois de gap_deg e residual_deg) tanto para escolher a
+    SEMENTE do feixe quanto, quando max_residual_deg=None, para a ordem
+    "so por residuo" usada nesse caso -- mesma semantica exata do
+    parametro homonimo em find_best_bracket_batch (inclusive a garantia
+    de que, com m=1, o resultado continua identico a
+    find_best_bracket_batch chamada com o mesmo valor deste parametro).
+
+    avoid_shared_anchor (default False, flag ADITIVA -- ver revisao de
+    codigo 2026-09-11): quando True, a escolha dos m-1 pares ALEM da
+    semente (passo 2 acima) usa _fps_avoid_shared_anchor em vez de
+    farthest_point_sampling puro -- entre candidatos com diversidade de
+    plano equivalente, prefere pares cujas duas pontas (indices i e j em
+    candidate_bvecs) ainda NAO apareceram em nenhum outro par ja
+    escolhido do MESMO feixe, para que os `m` pares carreguem evidencia
+    geometrica mais independente entre si (dois pares que compartilham
+    uma ponta, mesmo com normais bem diferentes, reusam metade da mesma
+    informacao de entrada). Nunca reduz quantos pares reais o feixe tem
+    -- se nenhum candidato remanescente tiver ancora livre, cai de volta
+    no candidato de maior distancia sem essa restricao (mesmo padrao de
+    fallback de max_gap_deg). Default False preserva o comportamento de
+    sempre bit-a-bit, incluindo a equivalencia com find_best_bracket_batch
+    em m=1 (fallback do feixe com m=1 nunca aciona o passo de FPS).
+
     candidate_bvecs: (M_cand,3). target_bvecs: (K,3).
 
     Retorna dict de arrays, todos com shape (K, m):
@@ -612,62 +1018,26 @@ def find_star_ensemble_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarr
     m < 1.
     """
     candidate_bvecs = np.asarray(candidate_bvecs, dtype=float)
-    target_bvecs = np.atleast_2d(np.asarray(target_bvecs, dtype=float))
     n_cand = candidate_bvecs.shape[0]
     if n_cand < 2:
         raise ValueError("find_star_ensemble_batch precisa de pelo menos 2 direcoes candidatas")
     if m < 1:
         raise ValueError("m deve ser >= 1")
-    k_targets = target_bvecs.shape[0]
 
-    # ---- geometria pairwise identica a find_best_bracket_batch (nao repetimos
-    # a explicacao aqui -- ver docstring/comentarios la, mesma formula exata). ----
-    u_norm = np.linalg.norm(candidate_bvecs, axis=1, keepdims=True)
-    u_norm[u_norm == 0] = 1.0
-    U = candidate_bvecs / u_norm
-    t_norm = np.linalg.norm(target_bvecs, axis=1, keepdims=True)
-    t_norm[t_norm == 0] = 1.0
-    T = target_bvecs / t_norm
-
-    iu, ju = np.triu_indices(n_cand, k=1)
+    # ---- geometria pairwise: fatorada em _pairwise_bracket_geometry (2026-09-11)
+    # -- era recomputada aqui do zero, identica a de find_best_bracket_batch,
+    # toda vez que o script de triplets chamava as duas funcoes no mesmo
+    # (candidate_bvecs, target_bvecs); ver docstring do helper. ----
+    geo = _pairwise_bracket_geometry(candidate_bvecs, target_bvecs)
+    iu, ju = geo["iu"], geo["ju"]
     n_pairs = iu.shape[0]
-    a_pairs = U[iu]
-    b_raw = U[ju]
-    dot_ij = np.sum(a_pairs * b_raw, axis=1)
-    ang_ab = np.arccos(np.clip(np.abs(dot_ij), 0.0, 1.0))
-    sign_b = np.where(dot_ij >= 0.0, 1.0, -1.0)
-    b_pairs = b_raw * sign_b[:, None]
-    cross_ij = np.cross(a_pairs, b_pairs)
-    cross_norm = np.linalg.norm(cross_ij, axis=1)
-    degenerate = cross_norm < 1e-8
-    n_hat = np.zeros_like(cross_ij)
-    ok = ~degenerate
-    n_hat[ok] = cross_ij[ok] / cross_norm[ok, None]
-    e2 = np.cross(n_hat, a_pairs)
-    e2_norm = np.linalg.norm(e2, axis=1)
-    e2_ok = e2_norm > 1e-12
-    e2_safe = np.zeros_like(e2)
-    e2_safe[e2_ok] = e2[e2_ok] / e2_norm[e2_ok, None]
-    e2 = e2_safe
-
-    dot_it = U @ T.T
-    dot_at = dot_it[iu, :]
-    sign_t = np.where(dot_at >= 0.0, 1.0, -1.0)
-    comp_a = np.abs(dot_at)
-    dot_te_raw = e2 @ T.T
-    comp_e2 = sign_t * dot_te_raw
-    theta_t = np.arctan2(comp_e2, comp_a)
-    ang_ab_col = ang_ab[:, None]
-    t_frac = np.divide(theta_t, ang_ab_col, out=np.zeros_like(theta_t), where=ang_ab_col > 1e-8)
-    t_frac[degenerate, :] = 0.0
-
-    dot_tn = n_hat @ T.T
-    residual = np.arcsin(np.clip(np.abs(dot_tn), 0.0, 1.0))
-    residual[degenerate, :] = np.pi / 2.0
-
-    between = (t_frac >= 0.0) & (t_frac <= 1.0)
-    gap_deg_pairs = np.degrees(ang_ab)      # (n_pairs,) -- nao depende do alvo
-    residual_deg = np.degrees(residual)     # (n_pairs, K)
+    n_hat = geo["n_hat"]
+    gap_deg_pairs = geo["gap_deg_pairs"]      # (n_pairs,) -- nao depende do alvo
+    t_frac = geo["t_frac"]                    # (n_pairs, K)
+    residual_deg = geo["residual_deg"]        # (n_pairs, K)
+    between = geo["between"]
+    centrality = geo["centrality"]
+    k_targets = t_frac.shape[1]
 
     acceptable = residual_deg <= max_residual_deg if max_residual_deg is not None else None
 
@@ -688,10 +1058,15 @@ def find_star_ensemble_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarr
                     bw_idx = pool_idx[between[pool_idx, k]]
                     if bw_idx.size:
                         pool_idx = bw_idx
-                # ordena o pool por gap_deg crescente (empate: menor residuo) --
+                # ordena o pool por gap_deg crescente (empate: menor residuo,
+                # e se prefer_central_t_frac, por ultimo a centralidade) --
                 # 1o elemento = par que find_best_bracket_batch teria escolhido
                 # sozinho (mesmo criterio, so que aqui como SEMENTE do feixe).
-                order = np.lexsort((residual_deg[pool_idx, k], gap_deg_pairs[pool_idx]))
+                if prefer_central_t_frac:
+                    order = np.lexsort((centrality[pool_idx, k], residual_deg[pool_idx, k],
+                                         gap_deg_pairs[pool_idx]))
+                else:
+                    order = np.lexsort((residual_deg[pool_idx, k], gap_deg_pairs[pool_idx]))
                 pool_sorted = pool_idx[order]
             else:
                 # nenhum par passa no teto -- mesmo fallback de
@@ -717,7 +1092,10 @@ def find_star_ensemble_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarr
             # `best = argmin(residual_deg)` do fallback de
             # find_best_bracket_batch/find_best_bracket).
             pool_idx = np.arange(n_pairs)
-            order = np.argsort(residual_deg[pool_idx, k])
+            if prefer_central_t_frac:
+                order = np.lexsort((centrality[pool_idx, k], residual_deg[pool_idx, k]))
+            else:
+                order = np.argsort(residual_deg[pool_idx, k])
             pool_sorted = pool_idx[order]
 
         if pool_sorted.size <= m:
@@ -740,18 +1118,30 @@ def find_star_ensemble_batch(candidate_bvecs: np.ndarray, target_bvecs: np.ndarr
                 # localizar a posicao.
                 sub_pool = pool_sorted[preferred_idx]
                 normals_sub = n_hat[sub_pool]
-                fps_local = farthest_point_sampling(normals_sub, m, seed_idx=0, sort=False)
+                if avoid_shared_anchor:
+                    fps_local = _fps_avoid_shared_anchor(normals_sub, iu[sub_pool], ju[sub_pool],
+                                                           m, seed_idx=0)
+                else:
+                    fps_local = farthest_point_sampling(normals_sub, m, seed_idx=0, sort=False)
                 chosen = sub_pool[fps_local]
             else:
                 # nao ha candidatos suficientes dentro do teto de gap pra
                 # preencher o feixe com diversidade -- cai no comportamento
                 # antigo (FPS sobre o pool inteiro) so PARA ESTE ALVO.
                 normals_pool = n_hat[pool_sorted]
-                fps_local = farthest_point_sampling(normals_pool, m, seed_idx=0, sort=False)
+                if avoid_shared_anchor:
+                    fps_local = _fps_avoid_shared_anchor(normals_pool, iu[pool_sorted], ju[pool_sorted],
+                                                           m, seed_idx=0)
+                else:
+                    fps_local = farthest_point_sampling(normals_pool, m, seed_idx=0, sort=False)
                 chosen = pool_sorted[fps_local]
         else:
             normals_pool = n_hat[pool_sorted]  # (P,3)
-            fps_local = farthest_point_sampling(normals_pool, m, seed_idx=0, sort=False)
+            if avoid_shared_anchor:
+                fps_local = _fps_avoid_shared_anchor(normals_pool, iu[pool_sorted], ju[pool_sorted],
+                                                       m, seed_idx=0)
+            else:
+                fps_local = farthest_point_sampling(normals_pool, m, seed_idx=0, sort=False)
             chosen = pool_sorted[fps_local]
 
         n_chosen = chosen.size
