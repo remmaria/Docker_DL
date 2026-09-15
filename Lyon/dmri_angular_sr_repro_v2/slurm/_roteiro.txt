@@ -54,7 +54,8 @@ sbatch 09c_merge_basecurve.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 
 
 #RECON rcae_n16
 
-RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" CKPT_PATH="/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n16/runs/3579826_0/best.pt" \
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+  CKPT_PATH="/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/shell1000_n16/runs/3582143_0/best.pt" \
     RECON_TAG=rcae_n16 sbatch 04_reconstruct_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
 
@@ -273,10 +274,24 @@ RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
 #--------------AQUiiiiiiiiiiiiiiiiiii
 
 
-#rrin n16 star
+#rrin n16 star 35
 RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
-  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star3/runs/3578223_0/best.pt RECON_TAG=rrin_n16_star \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star3/runs/3582144_0/best.pt RECON_TAG=rrin_n16_star35 \
   ENSEMBLE_M=3 \
+  sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+#rrin n16 star 65
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star6/runs/3582128_0/best.pt RECON_TAG=rrin_n16_star65 \
+  ENSEMBLE_M=6 \
+  sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+#rrin n16 star 610
+RECON_SUBJECTS="20170417094841_802780_20170417094841_802780" \
+  CKPT_PATH=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rrin_star_checkpoints/shell1000_n16_star6/runs/3582133_0/best.pt RECON_TAG=rrin_n16_star610 \
+  ENSEMBLE_M=6 \
   sbatch 05f_reconstruct_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
 

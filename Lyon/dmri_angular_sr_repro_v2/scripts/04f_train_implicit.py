@@ -306,6 +306,46 @@ def main():
                           "(ver checagem abaixo); ganha seu proprio run_tag automaticamente, "
                           "entao um treino novo com --aggregation attention nunca colide com "
                           "checkpoints antigos de --aggregation mean no mesmo --out-dir.")
+    ap.add_argument("--cross-direction-attention", action="store_true",
+                     help="ADITIVO, default DESLIGADO (item 2 do addendum 2026-09-13, ver "
+                          "model/implicit_angular.py:CrossDirectionAttention3D) -- insere um "
+                          "bloco de self-attention ENTRE as n_level direcoes de entrada logo "
+                          "apos PerDirectionEncoder3D e ANTES de qualquer agregacao (mean OU "
+                          "attention -- as duas etapas sao independentes, esta flag compoe com "
+                          "--aggregation qualquer). Motivado por producao real saturando em "
+                          "val_loss~0,041-0,042 ja na epoca 3 mesmo com --aggregation attention "
+                          "(o teto parece ser falta de interacao ENTRE direcoes, nao 'que tipo "
+                          "de pooling'). Adiciona parametros novos -- BLOQUEANTE para "
+                          "--resume-checkpoint, mesma logica de --aggregation; ganha seu proprio "
+                          "run_tag (_xattn) automaticamente, nunca colide com checkpoints sem "
+                          "esta flag.")
+    ap.add_argument("--cross-attn-heads", type=int, default=4,
+                     help="numero de cabecas de CrossDirectionAttention3D (default 4). So tem "
+                          "efeito com --cross-direction-attention. PRECISA dividir --base-ch "
+                          "sem resto (senao a construcao do modelo falha cedo com um erro "
+                          "claro).")
+    ap.add_argument("--decoder-base-ch", type=int, default=None,
+                     help="NOVO (2026-09-14, ver addendum de capacidade): largura do "
+                          "ImplicitDecoderHead3D DESACOPLADA do resto. Default None = segue "
+                          "--base-ch (comportamento historico). Motivacao: o decoder e' a rede "
+                          "que representa a funcao continua sobre a esfera -- o PROPOSITO do "
+                          "modelo implicito -- e com base_ch=16 ele tem 13.873 parametros e 2 "
+                          "convolucoes, contra 3.723.497 e 10 convolucoes do decoder do RCAE "
+                          "(268x). MUDA O SHAPE DOS PESOS -- bloqueante para resume. Sufixo "
+                          "_dbc<N> no run_tag.")
+    ap.add_argument("--decoder-depth", type=int, default=1,
+                     help="NOVO: numero de camadas ocultas do ImplicitDecoderHead3D (default 1 = "
+                          "topologia historica, byte-a-byte). MUDA O SHAPE DOS PESOS -- "
+                          "bloqueante para resume. Sufixo _dd<N> no run_tag.")
+    ap.add_argument("--decoder-reinject-code", action="store_true",
+                     help="NOVO: reinjeta o codigo SH da direcao-alvo na entrada de CADA camada "
+                          "oculta do decoder, em vez de so' na primeira. Hoje a direcao-alvo (a "
+                          "'consulta' do modelo implicito) entra uma unica vez e precisa "
+                          "sobreviver a rede inteira a partir dali. O RCAE reinjeta o bvec em "
+                          "TODOS os estagios do decoder (RepeatBVector), e NeRF/LIIF reinjetam a "
+                          "coordenada ao longo do MLP -- e' a pratica padrao para representacoes "
+                          "implicitas. So' tem efeito com --decoder-depth > 1. MUDA O SHAPE DOS "
+                          "PESOS -- bloqueante para resume. Sufixo _dreinj no run_tag.")
     ap.add_argument("--mask-suffix", default="_mask3d.nii.gz")
     ap.add_argument("--min-tile-coverage", type=float, default=0.1)
     ap.add_argument("--batch-size", type=int, default=4)
@@ -476,11 +516,40 @@ def main():
         debug_fixed_batch = collate_variable_targets([val_ds[best_idx]])
 
     model = build_implicit_model(n_level=args.n_level, l_max=args.l_max, base_ch=args.base_ch,
-                                  norm_type=args.norm_type,
-                                  aggregation=args.aggregation).to(device)
+                                  norm_type=args.norm_type, aggregation=args.aggregation,
+                                  cross_direction_attention=args.cross_direction_attention,
+                                  cross_attn_heads=args.cross_attn_heads,
+                                  decoder_base_ch=args.decoder_base_ch,
+                                  decoder_depth=args.decoder_depth,
+                                  decoder_reinject_code=args.decoder_reinject_code).to(device)
     print(f"[modelo] n_level={args.n_level} l_max={model.l_max} (sh_dim={model.sh_dim}) "
-          f"base_ch={args.base_ch} norm_type={args.norm_type} aggregation={args.aggregation} -- "
+          f"base_ch={args.base_ch} norm_type={args.norm_type} aggregation={args.aggregation} "
+          f"cross_direction_attention={args.cross_direction_attention} "
+          f"(cross_attn_heads={args.cross_attn_heads}) "
+          f"decoder_base_ch={model.decoder_base_ch} decoder_depth={args.decoder_depth} "
+          f"decoder_reinject_code={args.decoder_reinject_code} -- "
           f"{sum(p.numel() for p in model.parameters())} parametros")
+    # quebra por submodulo + alerta do gargalo de informacao do `state` (ver
+    # addendum de capacidade 2026-09-14): o `state` que sai do encoder tem
+    # base_ch canais e precisa carregar o perfil angular INTEIRO do voxel,
+    # porque o decoder consulta esse mesmo state para QUALQUER direcao-alvo.
+    # Se base_ch < sh_dim, esse perfil nao cabe no estado nem em principio.
+    print(f"[modelo] parametros por submodulo: "
+          f"per_dir_encoder={sum(p.numel() for p in model.per_dir_encoder.parameters())}, "
+          f"trunk={sum(p.numel() for p in model.trunk.parameters())}, "
+          f"decoder_head={sum(p.numel() for p in model.decoder_head.parameters())}")
+    if args.base_ch < model.sh_dim:
+        print(f"[modelo][AVISO] base_ch={args.base_ch} e MENOR que sh_dim={model.sh_dim} "
+              f"(l_max={model.l_max}): o 'state' de {args.base_ch} canais nao tem graus de "
+              f"liberdade suficientes para representar um perfil angular de ordem "
+              f"{model.l_max}, que precisa de {model.sh_dim} coeficientes. Isso e um gargalo "
+              f"de INFORMACAO, nao so de capacidade -- considere --base-ch >= "
+              f"{2 * model.sh_dim}.", flush=True)
+    elif args.base_ch < 2 * model.sh_dim:
+        print(f"[modelo][nota] base_ch={args.base_ch} esta no limite de sh_dim={model.sh_dim} "
+              f"(l_max={model.l_max}) -- o 'state' mal comporta o perfil angular, sem folga "
+              f"para tambem codificar contexto espacial. Ver addendum de capacidade "
+              f"2026-09-14.", flush=True)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min",
@@ -533,6 +602,16 @@ def main():
         run_tag += "_bn"
     if args.aggregation == "attention":
         run_tag += "_attn"
+    if args.cross_direction_attention:
+        run_tag += "_xattn"
+        if args.cross_attn_heads != 4:
+            run_tag += f"{args.cross_attn_heads}h"
+    if args.decoder_base_ch is not None and args.decoder_base_ch != args.base_ch:
+        run_tag += f"_dbc{args.decoder_base_ch}"
+    if args.decoder_depth != 1:
+        run_tag += f"_dd{args.decoder_depth}"
+    if args.decoder_reinject_code:
+        run_tag += "_dreinj"
     if args.angular_loss_weight > 0:
         # mesmo padrao de scripts/04_train_rcae.py -- evita colisao de
         # checkpoint entre a variante com/sem loss angular no MESMO combo
@@ -594,6 +673,26 @@ def main():
                 f"--norm-type mudou entre o checkpoint ({old_norm_type}) e esta chamada "
                 f"({args.norm_type}) -- InstanceNorm3d e BatchNorm3d tem parametros "
                 f"incompativeis (mesmo motivo de model/rrin3d.py). Use --no-resume.")
+        # decoder_* (2026-09-14) -- todos mudam o shape dos pesos do decoder.
+        old_dec_bc = old_args.get("decoder_base_ch", None)
+        old_dec_bc_eff = old_dec_bc if old_dec_bc is not None else old_args.get("base_ch", 16)
+        new_dec_bc_eff = args.decoder_base_ch if args.decoder_base_ch is not None else args.base_ch
+        if old_dec_bc_eff != new_dec_bc_eff:
+            raise ValueError(
+                f"--decoder-base-ch efetivo ({new_dec_bc_eff}) nao bate com o checkpoint "
+                f"({old_dec_bc_eff}) -- muda o shape dos pesos do ImplicitDecoderHead3D. "
+                f"Use --no-resume.")
+        old_dec_depth = old_args.get("decoder_depth", 1)
+        if old_dec_depth != args.decoder_depth:
+            raise ValueError(
+                f"--decoder-depth mudou entre o checkpoint ({old_dec_depth}) e esta chamada "
+                f"({args.decoder_depth}) -- muda o numero de camadas do decoder. Use --no-resume.")
+        old_dec_reinj = old_args.get("decoder_reinject_code", False)
+        if old_dec_reinj != args.decoder_reinject_code:
+            raise ValueError(
+                f"--decoder-reinject-code mudou entre o checkpoint ({old_dec_reinj}) e esta "
+                f"chamada ({args.decoder_reinject_code}) -- muda o numero de canais de entrada "
+                f"das camadas ocultas do decoder. Use --no-resume.")
         old_aggregation = old_args.get("aggregation", "mean")
         if old_aggregation != args.aggregation:
             raise ValueError(
@@ -603,6 +702,21 @@ def main():
                 f"variante nova do zero (na pratica isso ja deveria acontecer sozinho: o "
                 f"run_tag muda automaticamente com --aggregation attention, entao os dois "
                 f"checkpoints vivem em out_dir/ diferentes e nunca deveriam colidir aqui).")
+        old_cross_attn = old_args.get("cross_direction_attention", False)
+        if old_cross_attn != args.cross_direction_attention:
+            raise ValueError(
+                f"--cross-direction-attention mudou entre o checkpoint ({old_cross_attn}) e "
+                f"esta chamada ({args.cross_direction_attention}) -- adiciona/remove os pesos "
+                f"de CrossDirectionAttention3D, incompativel para resume. Use --no-resume (na "
+                f"pratica isso ja deveria acontecer sozinho: o run_tag muda automaticamente "
+                f"com esta flag).")
+        if args.cross_direction_attention:
+            old_cross_attn_heads = old_args.get("cross_attn_heads", 4)
+            if old_cross_attn_heads != args.cross_attn_heads:
+                raise ValueError(
+                    f"--cross-attn-heads mudou entre o checkpoint ({old_cross_attn_heads}) e "
+                    f"esta chamada ({args.cross_attn_heads}) -- muda o shape interno de "
+                    f"CrossDirectionAttention3D, incompativel para resume. Use --no-resume.")
         for key in ("shell_b", "n_level", "patch_size", "q_out", "lr",
                     "angular_loss_weight", "sh_loss_high_order_min", "sh_loss_lmax_cap"):
             old_val, new_val = old_args.get(key), vars(args).get(key)

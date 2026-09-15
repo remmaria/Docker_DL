@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=train_rcae
 #SBATCH --cluster=gpu
-#SBATCH --partition=h200
+#SBATCH --partition=preempt
 #SBATCH --gres=gpu:1
-# SBATCH --constraint=h200
+#SBATCH --constraint=l40s
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=2-23:00:00
+#SBATCH --time=0-23:00:00
 #SBATCH --account=tibrahim
 #SBATCH --error=logs/train.%A_%a.err
 #SBATCH --output=logs/train.%A_%a.out
@@ -199,17 +199,31 @@ if [[ "$BATCH_LOG_EVERY" != "5" ]]; then
     echo "BATCH_LOG_EVERY=$BATCH_LOG_EVERY -- batch_log.csv gravado a cada $BATCH_LOG_EVERY batches (default 5)"
 fi
 
+LR="${LR:-1e-3}"
+if [[ "$LR" != "1e-3" ]]; then
+    echo "LR=$LR (default 1e-3)"
+fi
+
+RESET_LR_FLAG=()
+if [[ "${RESET_LR:-0}" == "1" ]]; then
+    RESET_LR_FLAG=(--reset-lr)
+    echo "RESET_LR=1 -- reinicio A QUENTE: carrega os pesos do checkpoint mas recria otimizador e scheduler em LR=$LR (sem esta flag, o resume restaura optimizer_state/scheduler_state e o LR da linha de comando e' ignorado na pratica). Mantem best_val, zera epochs_no_improve."
+    if [[ -z "${RESUME_CHECKPOINT:-}" && "${NO_RESUME:-0}" == "1" ]]; then
+        echo "  ATENCAO: RESET_LR=1 com NO_RESUME=1 nao faz reinicio a quente nenhum -- vai treinar do zero. Passe RESUME_CHECKPOINT=<best.pt> e tire o NO_RESUME."
+    fi
+fi
+
 python scripts/04_train_rcae.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --scheme-dir "$WORK_DIR/subsampling" \
     --out-dir "$WORK_DIR/rcae_checkpoints" \
     --shell-b "$SHELL_B" --n-level "$N_LEVEL" \
     --epochs 150 --batch-size 4 --patch-size 10 --q-out 10 \
-    --lr 1e-3 --num-workers 8 --max-cached-subjects 6 --patience 15 \
+    --lr "$LR" --num-workers 8 --max-cached-subjects 6 --patience 15 \
     --debug-plot-every "$DEBUG_PLOT_EVERY" --debug-plot-every-batches "$DEBUG_PLOT_EVERY_BATCHES" \
     --batch-log-every "$BATCH_LOG_EVERY" \
     --val-num-workers 4 --val-max-cached-subjects 1 \
     --angular-loss-weight "$ANGULAR_LOSS_WEIGHT" \
     --sh-loss-high-order-min "$SH_LOSS_HIGH_ORDER_MIN" \
-    "${RESUME_FLAG[@]}" "${DECODER_TYPE_FLAG[@]}" \
+    "${RESUME_FLAG[@]}" "${RESET_LR_FLAG[@]}" "${DECODER_TYPE_FLAG[@]}" \
     --job-id "${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"

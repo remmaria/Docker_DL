@@ -145,7 +145,15 @@ def main():
     model = build_star_model(base_ch=ckpt_args.get("base_ch", 16),
                               max_disp=ckpt_args.get("max_disp", 0.5),
                               use_quality_cond=use_quality_cond,
-                              norm_type=norm_type).to(device)
+                              norm_type=norm_type,
+                              weight_quality_cond=ckpt_args.get("weight_quality_cond", False),
+                              cross_candidate_attention=ckpt_args.get(
+                                  "cross_candidate_attention", False),
+                              cross_candidate_attn_heads=ckpt_args.get(
+                                  "cross_candidate_attn_heads", 4),
+                              refine_base_ch=ckpt_args.get("refine_base_ch", None),
+                              refine_depth=ckpt_args.get("refine_depth", 2),
+                              refine_cond=ckpt_args.get("refine_cond", False)).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     print(f"Checkpoint carregado (epoca {ckpt.get('epoch')}, val_loss {ckpt.get('val_loss')}, "

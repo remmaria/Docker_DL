@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=implicit_angular
 #SBATCH --cluster=gpu
-#SBATCH --partition=l40s
+#SBATCH --partition=a100
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -55,6 +55,18 @@
 # AGGREGATION=mean no mesmo <work_dir>/implicit_checkpoints -- rodar com
 # AGGREGATION=attention comeca um treino NOVO do zero, em paralelo ao
 # treino "mean" existente, sem afetar o checkpoint antigo.
+#
+# CROSS_DIRECTION_ATTENTION=1 (ADITIVO, default desligado, addendum
+# 2026-09-13, item 2 -- ver model/implicit_angular.py:CrossDirectionAttention3D)
+# -- insere um bloco de self-attention ENTRE as n_level direcoes de entrada
+# logo apos PerDirectionEncoder3D e ANTES de qualquer agregacao (compoe com
+# AGGREGATION=mean OU attention, sao etapas independentes). Motivado por
+# producao real saturando em val_loss~0,041-0,042 ja na epoca 3 mesmo com
+# AGGREGATION=attention. CROSS_ATTN_HEADS=<int> (default 4, so tem efeito
+# com CROSS_DIRECTION_ATTENTION=1) -- precisa dividir BASE_CH sem resto.
+# Adiciona parametros novos -- treino NOVO do zero (run_tag ganha sufixo
+# _xattn, nunca colide com checkpoints sem esta flag).
+#   CROSS_DIRECTION_ATTENTION=1 AGGREGATION=attention sbatch slurm/04f_train_implicit.sh <work_dir> <shell_b> <n_level>
 #
 # SCHEME_DIR=<caminho> -- por padrao usa <work_dir>/subsampling (saida da
 # etapa 2), mesma convencao de TRIPLETS_DIR nos outros wrappers.
@@ -185,6 +197,18 @@ if [[ "$AGGREGATION" != "mean" ]]; then
     echo "AGGREGATION=$AGGREGATION -- treino NOVO com agregacao aprendida (run_tag ganha sufixo _attn, nao colide com o checkpoint 'mean' existente)"
 fi
 
+CROSS_ATTN_FLAG=()
+if [[ "${CROSS_DIRECTION_ATTENTION:-0}" == "1" ]]; then
+    CROSS_ATTN_FLAG=(--cross-direction-attention)
+    echo "CROSS_DIRECTION_ATTENTION=1 -- treino NOVO com self-attention entre as n_level direcoes de entrada (run_tag ganha sufixo _xattn)"
+fi
+CROSS_ATTN_HEADS="${CROSS_ATTN_HEADS:-4}"
+CROSS_ATTN_HEADS_FLAG=()
+if [[ "$CROSS_ATTN_HEADS" != "4" ]]; then
+    CROSS_ATTN_HEADS_FLAG=(--cross-attn-heads "$CROSS_ATTN_HEADS")
+    echo "CROSS_ATTN_HEADS=$CROSS_ATTN_HEADS (default 4, so tem efeito com CROSS_DIRECTION_ATTENTION=1) -- precisa dividir BASE_CH sem resto"
+fi
+
 INIT_BIAS_FLAG=()
 if [[ "${INIT_OUTPUT_BIAS_FROM_DATA:-0}" == "1" ]]; then
     INIT_BIAS_FLAG=(--init-output-bias-from-data)
@@ -240,6 +264,34 @@ if [[ -n "${CKPT_TAG:-}" ]]; then
     echo "CKPT_TAG=$CKPT_TAG -- checkpoints em $OUT_DIR_BASE/<run_tag> (ver nota de cabecalho: o run_tag calculado por scripts/04f_train_implicit.py NAO leva em conta INIT_OUTPUT_BIAS_FROM_DATA/WARMUP_STEPS -- use CKPT_TAG pra evitar colidir/sobrescrever um run anterior com essas flags diferentes na MESMA config de shell_b/n_level/l_max/base_ch/norm_type/aggregation)"
 fi
 
+# --- capacidade do decoder (addendum 2026-09-14) ---------------------------
+# O ImplicitDecoderHead3D e' a rede que representa a funcao continua sobre a
+# esfera -- o proposito do modelo implicito -- e com BASE_CH=16 ela tem
+# 13.873 parametros e 2 convolucoes, contra 3.723.497 e 10 convolucoes do
+# decoder do RCAE (268x). Alem disso o codigo SH da direcao-alvo (a
+# "consulta") entrava so' na primeira camada.
+#   DECODER_BASE_CH=<N>    largura so' do decoder      -> sufixo _dbc<N>
+#   DECODER_DEPTH=<N>      camadas ocultas (default 1) -> sufixo _dd<N>
+#   DECODER_REINJECT_CODE=1  reinjeta o codigo SH em cada camada oculta
+#                            (como o RCAE faz com o bvec) -> sufixo _dreinj
+DECODER_BASE_CH="${DECODER_BASE_CH:-}"
+DECODER_BASE_CH_FLAG=()
+if [[ -n "$DECODER_BASE_CH" ]]; then
+    DECODER_BASE_CH_FLAG=(--decoder-base-ch "$DECODER_BASE_CH")
+    echo "DECODER_BASE_CH=$DECODER_BASE_CH -- largura do decoder desacoplada do resto (run_tag ganha _dbc$DECODER_BASE_CH)"
+fi
+DECODER_DEPTH="${DECODER_DEPTH:-1}"
+DECODER_DEPTH_FLAG=()
+if [[ "$DECODER_DEPTH" != "1" ]]; then
+    DECODER_DEPTH_FLAG=(--decoder-depth "$DECODER_DEPTH")
+    echo "DECODER_DEPTH=$DECODER_DEPTH (default 1) -- camadas ocultas do decoder (run_tag ganha _dd$DECODER_DEPTH)"
+fi
+DECODER_REINJECT_FLAG=()
+if [[ "${DECODER_REINJECT_CODE:-0}" == "1" ]]; then
+    DECODER_REINJECT_FLAG=(--decoder-reinject-code)
+    echo "DECODER_REINJECT_CODE=1 -- codigo SH da direcao-alvo reinjetado em cada camada oculta do decoder (so tem efeito com DECODER_DEPTH>1; run_tag ganha _dreinj)"
+fi
+
 python scripts/04f_train_implicit.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --scheme-dir "$SCHEME_DIR" \
@@ -251,5 +303,6 @@ python scripts/04f_train_implicit.py \
     --warmup-steps "$WARMUP_STEPS" \
     "${RESUME_FLAG[@]}" "${LMAX_FLAG[@]}" "${BASE_CH_FLAG[@]}" "${NORM_TYPE_FLAG[@]}" \
     "${AGGREGATION_FLAG[@]}" "${INIT_BIAS_FLAG[@]}" "${ANGULAR_LOSS_FLAG[@]}" "${QOUT_FLAG[@]}" \
-    "${FREEZE_ORDER_FLAG[@]}" \
+    "${FREEZE_ORDER_FLAG[@]}" "${CROSS_ATTN_FLAG[@]}" "${CROSS_ATTN_HEADS_FLAG[@]}" \
+    "${DECODER_BASE_CH_FLAG[@]}" "${DECODER_DEPTH_FLAG[@]}" "${DECODER_REINJECT_FLAG[@]}" \
     --job-id "${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"

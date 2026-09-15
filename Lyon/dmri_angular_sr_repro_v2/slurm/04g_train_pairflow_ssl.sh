@@ -36,6 +36,19 @@
 # NORM_TYPE=batch (default instance) -- mesma semantica/custo (exige treino
 # do zero) de NORM_TYPE em slurm/04b_train_rrin.sh.
 #
+# BASE_CH=<N> (default 16) -- largura do PairFlowNet3D. Muda o shape de TODOS
+# os pesos, entao NAO e' retomavel a partir de um checkpoint de outra largura;
+# o run_tag ganha o sufixo _bc<N>, de modo que o checkpoint de largura 16 em
+# .../pairflow_ssl_checkpoints/shell<B>/ NAO e' sobrescrito.
+# Motivacao (addendum 2026-09-14d): este pre-treino esta SUB-AJUSTADO -- val
+# (0,063930) abaixo de train (0,064677), os dois achatados por 10+ epocas com
+# LR ja em 2,5e-4 -- e roda com 92% de espera de I/O e gpu_mem alloc=3MB, ou
+# seja, capacidade aqui e' quase de graca.
+# ATENCAO: a largura escolhida aqui PRECISA bater com o BASE_CH do treino da
+# etapa 4i que for consumir este checkpoint via INIT_CHECKPOINT, senao o
+# flow_net nao carrega.
+#   BASE_CH=64 sbatch slurm/04g_train_pairflow_ssl.sh <work_dir> 1000
+#
 # LR=<valor> (default 1e-3). RESUME_CHECKPOINT=<caminho> ou NO_RESUME=1 --
 # mesmo mecanismo de resume automatico dos demais treinos.
 set -euo pipefail
@@ -77,6 +90,14 @@ NORM_TYPE_FLAG=()
 if [[ "$NORM_TYPE" != "instance" ]]; then
     NORM_TYPE_FLAG=(--norm-type "$NORM_TYPE")
     echo "NORM_TYPE=$NORM_TYPE -- treinando a variante com BatchNorm3d (exige treino do zero)"
+fi
+
+BASE_CH="${BASE_CH:-16}"
+BASE_CH_FLAG=()
+if [[ "$BASE_CH" != "16" ]]; then
+    BASE_CH_FLAG=(--base-ch "$BASE_CH")
+    echo "BASE_CH=$BASE_CH (default 16) -- run_tag ganha sufixo _bc$BASE_CH (nao sobrescreve o checkpoint de largura 16); NAO retomavel a partir de um checkpoint com outra largura"
+    echo "  LEMBRE: o treino da etapa 4i que consumir este checkpoint via INIT_CHECKPOINT precisa usar BASE_CH=$BASE_CH tambem"
 fi
 
 BATCH_SIZE="${BATCH_SIZE:-8}"
@@ -128,6 +149,15 @@ if [[ "${LOG_WORKER_LOADS:-0}" == "1" ]]; then
     echo "LOG_WORKER_LOADS=1 -- logando worker_id/subject_tag a cada carga real de disco (diagnostico pontual)"
 fi
 
+RESET_LR_FLAG=()
+if [[ "${RESET_LR:-0}" == "1" ]]; then
+    RESET_LR_FLAG=(--reset-lr)
+    echo "RESET_LR=1 -- reinicio A QUENTE: carrega os pesos do checkpoint mas recria otimizador e scheduler em LR=$LR (sem esta flag, o resume restaura optimizer_state/scheduler_state e o LR da linha de comando e' ignorado na pratica). Mantem best_val, zera epochs_no_improve."
+    if [[ -z "${RESUME_CHECKPOINT:-}" && "${NO_RESUME:-0}" == "1" ]]; then
+        echo "  ATENCAO: RESET_LR=1 com NO_RESUME=1 nao faz reinicio a quente nenhum -- vai treinar do zero. Passe RESUME_CHECKPOINT=<best.pt> e tire o NO_RESUME."
+    fi
+fi
+
 python scripts/04g_train_pairflow_ssl.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --out-dir "$WORK_DIR/pairflow_ssl_checkpoints" \
@@ -138,6 +168,6 @@ python scripts/04g_train_pairflow_ssl.py \
     --consistency-weight "$CONSISTENCY_WEIGHT" --smooth-weight "$SMOOTH_WEIGHT" \
     --batch-log-every "$BATCH_LOG_EVERY" --print-every "$PRINT_EVERY" \
     --gap-hist-step-deg "$GAP_HIST_STEP_DEG" \
-    "${RESUME_FLAG[@]}" "${GAP_FLAGS[@]}" "${NORM_TYPE_FLAG[@]}" \
+    "${RESUME_FLAG[@]}" "${RESET_LR_FLAG[@]}" "${GAP_FLAGS[@]}" "${NORM_TYPE_FLAG[@]}" "${BASE_CH_FLAG[@]}" \
     "${FREEZE_ORDER_FLAG[@]}" "${LOG_WORKER_LOADS_FLAG[@]}" \
     --job-id "${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"

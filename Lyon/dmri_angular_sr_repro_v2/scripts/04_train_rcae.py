@@ -479,6 +479,15 @@ def main():
                           "permanente em .../runs/<job_id_antigo>/last.pt, se quiser retomar "
                           "de um run especifico em vez do mais recente). Ignorado se "
                           "--no-resume for passado.")
+    ap.add_argument("--reset-lr", action="store_true",
+                     help="Retoma os PESOS do checkpoint mas recria otimizador e scheduler "
+                          "do zero, no --lr desta chamada (reinicio a quente). Sem esta flag, "
+                          "o resume restaura optimizer_state (que carrega os momentos do Adam "
+                          "E o LR corrente) e scheduler_state, entao o --lr da linha de "
+                          "comando e' IGNORADO na pratica. Uso tipico (addendum 2026-09-14d): "
+                          "o LR foi escolhido no regime de modelo pequeno e ficou grande "
+                          "demais depois de escalar a largura. Mantem best_val (o best.pt so' "
+                          "e' trocado por melhora real) e zera epochs_no_improve.")
     ap.add_argument("--debug-max-dirs", type=int, default=0,
                      help="quantas direcoes (colunas) mostrar nos PNGs de debug. 0 (default) "
                           "= automatico, usa max(n_level, q_out) pra sempre mostrar TODAS as "
@@ -788,17 +797,34 @@ def main():
                       f"protocolo secao 9). Se nao for intencional, use --no-resume ou aponte "
                       f"--resume-checkpoint pro job certo.", flush=True)
         model.load_state_dict(ckpt["model_state"])
-        if "optimizer_state" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state"])
+        if args.reset_lr:
+            # Reinicio a quente: pesos sim, estado de otimizacao nao. O
+            # optimizer_state do Adam carrega os momentos E o LR corrente; o
+            # scheduler_state carrega o contador de plateau. Restaurar os dois
+            # e' justamente o que faz o --lr desta chamada nao ter efeito.
+            _old_lr = ckpt.get("args", {}).get("lr")
+            print(f"[reset-lr] descartando optimizer_state/scheduler_state do checkpoint "
+                  f"-- otimizador e scheduler recriados com lr={args.lr:.2e}"
+                  + (f" (o checkpoint vinha de lr={_old_lr})" if _old_lr is not None else ""),
+                  flush=True)
         else:
-            print("[resume][aviso] checkpoint antigo sem optimizer_state (salvo antes desta "
-                  "mudanca) -- otimizador reinicia do zero (momentos do Adam perdidos, mas os "
-                  "PESOS do modelo continuam retomados normalmente).", flush=True)
-        if "scheduler_state" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state"])
+            if "optimizer_state" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+            else:
+                print("[resume][aviso] checkpoint antigo sem optimizer_state (salvo antes desta "
+                      "mudanca) -- otimizador reinicia do zero (momentos do Adam perdidos, mas os "
+                      "PESOS do modelo continuam retomados normalmente).", flush=True)
+            if "scheduler_state" in ckpt:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_val = float(ckpt.get("best_val", ckpt.get("val_loss", float("inf"))))
         epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
+        if args.reset_lr and epochs_no_improve:
+            print(f"[reset-lr] zerando epochs_no_improve ({epochs_no_improve} -> 0) -- o "
+                  f"modelo precisa de algumas epocas pra assentar no LR novo. "
+                  f"best_val={best_val:.6f} e MANTIDO, entao o best.pt so' e' substituido "
+                  f"por uma melhora real.", flush=True)
+            epochs_no_improve = 0
         print(f"[resume] retomando da epoca {start_epoch} (best_val={best_val:.6f}, "
               f"epochs_no_improve={epochs_no_improve}) -- treino ia ate a epoca "
               f"{args.epochs}", flush=True)
@@ -808,6 +834,14 @@ def main():
     else:
         print("[resume] nenhum checkpoint anterior encontrado (ou --no-resume passado) -- "
               "comecando do zero.", flush=True)
+        if args.reset_lr:
+            # Nao e' erro, mas quase sempre significa que o --resume-checkpoint
+            # nao chegou ou que veio um --no-resume junto por engano -- e nesse
+            # caso as epocas que a flag deveria aproveitar somem em silencio.
+            print("[reset-lr][aviso] --reset-lr passado, mas nao ha checkpoint pra retomar: "
+                  "nao ha estado de otimizacao a descartar e o treino comeca do zero no "
+                  f"--lr={args.lr:.2e}. Se a intencao era o reinicio A QUENTE, confira o "
+                  "--resume-checkpoint (e nao passe --no-resume junto).", flush=True)
 
     # snapshot ANTES do loop de epocas -- com pesos aleatorios (baseline de
     # verdade) se NAO houve resume, ou com os pesos JA RETOMADOS se houve

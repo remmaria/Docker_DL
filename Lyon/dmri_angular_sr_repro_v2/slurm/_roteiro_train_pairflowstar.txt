@@ -18,3 +18,11 @@ ANGULAR_LOSS_WEIGHT=0.5 \
   WARMUP_STEPS=500 ZERO_INIT_REFINE_OUTPUT=1 \
   CKPT_TAG=sslep131sh \
   sbatch 04i_train_pairflow_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+
+NO_RESUME=1 ENSEMBLE_M=8 LR=2e-4 \
+INIT_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_ssl_checkpoints/shell1000/last.pt \
+TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m8r15 \
+BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 WARMUP_STEPS=500 \
+ZERO_INIT_REFINE_OUTPUT=1 ANGULAR_LOSS_WEIGHT=0.5 CKPT_TAG=sslep131sh_mfull \
+  sbatch 04i_train_pairflow_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16

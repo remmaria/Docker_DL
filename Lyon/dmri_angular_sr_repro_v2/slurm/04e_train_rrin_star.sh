@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=rrs815
+#SBATCH --job-name=rrin_star
 #SBATCH --cluster=gpu
-#SBATCH --partition=a100
+#SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
 # SBATCH --constraint=h200
 #SBATCH --nodes=1
@@ -50,6 +50,46 @@
 # NAO tem ANGULAR_LOSS_WEIGHT/SH_LOSS_* aqui -- scripts/04e_train_rrin_star.py
 # ainda nao porta a loss angular/SH pro ensemble em estrela (TODO, ver
 # docstring do script).
+#
+# RESIDUAL_L2_WEIGHT=<valor> (ADITIVO, default 0.0 = desligado, addendum
+# 2026-09-13 -- hipotese sobre por que o RCAE bate a familia de fluxo em
+# nmse/FA: RCAE tem um prior de suavidade forte, ver addendum 2026-08-27
+# secoes 20.16/20.17) -- penaliza a MAGNITUDE do residuo do RefineNet3D
+# (media so sobre as posicoes REAIS do feixe), empurrando a predicao a
+# ficar perto do blend/warp bruto a menos que haja evidencia forte pra se
+# afastar dele. Mesmo espirito de --zero-init-refine-output (ja existente
+# no PairFlowStar), so que como penalidade continua durante o treino, nao
+# so na inicializacao. Ganha sufixo _resl2<valor> no run_tag.
+#   RESIDUAL_L2_WEIGHT=0.01 sbatch slurm/04e_train_rrin_star.sh <work_dir> <shell_b> <n_level>
+#
+# CROSS_CANDIDATE_ATTENTION=1 (ADITIVO, default 0 = desligado, addendum
+# 2026-09-13/2026-09-14 -- item 1: mesma ideia do item 2 do `implicit`, so
+# que entre os M candidatos do ensemble em estrela em vez de entre as
+# n_level direcoes) -- insere self-attention entre os M candidatos do feixe
+# (por voxel) ANTES do logit de confianca da PairWeightHead3D, ver
+# model/rrin3d_star.py:CrossCandidateAttention3D. Ganha sufixo _cattn no
+# run_tag. CROSS_CANDIDATE_ATTN_HEADS=<N> (default 4, so tem efeito com
+# CROSS_CANDIDATE_ATTENTION=1) -- precisa dividir --base-ch (16) sem resto.
+#   CROSS_CANDIDATE_ATTENTION=1 sbatch slurm/04e_train_rrin_star.sh <work_dir> <shell_b> <n_level>
+#
+# CAPACIDADE (addendum 2026-09-14) -- ate essa data este wrapper nao expunha
+# nenhuma forma de mudar a largura da rede, e o treino rodava com ~185k
+# parametros (base_ch=16) contra ~6,8M do RCAE, o modelo que vinha ganhando
+# a comparacao de val_loss. Quatro variaveis novas, todas ADITIVAS:
+#   BASE_CH=<N>          (default 16) largura geral -> sufixo _bc<N>
+#   REFINE_BASE_CH=<N>   (default: segue BASE_CH) largura SO' da RefineNet3D,
+#                        que e' a unica parte do modelo nao presa a premissa
+#                        de fluxo optico (secao 14.6 do protocolo) e tinha
+#                        so' 8.737 parametros -> sufixo _rbc<N>
+#   REFINE_DEPTH=<N>     (default 2) camadas ocultas da RefineNet3D -> _rd<N>
+#   REFINE_COND=1        (default 0) injeta bvec_a/bvec_b/bvec_t/t_frac/
+#                        quality na RefineNet3D, que hoje nao sabe nem QUAL
+#                        direcao esta predizendo -> sufixo _rcond
+# Todas mudam shape de peso => NAO retomaveis a partir de um checkpoint com
+# outra config (o script falha cedo com mensagem clara, e o sufixo proprio no
+# run_tag ja evita colisao de checkpoint).
+#   BASE_CH=32 REFINE_BASE_CH=64 REFINE_DEPTH=4 REFINE_COND=1 \
+#     sbatch slurm/04e_train_rrin_star.sh <work_dir> <shell_b> <n_level>
 set -euo pipefail
 mkdir -p logs
 WORK_DIR="${1:?uso: sbatch 04e_train_rrin_star.sh <work_dir> [shell_b n_level]}"
@@ -108,6 +148,61 @@ if [[ "$TRIPLETS_DIR" != "$WORK_DIR/subsampling" ]]; then
     echo "TRIPLETS_DIR=$TRIPLETS_DIR -- lendo trincas de pasta SEPARADA da producao (subsampling/)"
 fi
 
+RESIDUAL_L2_WEIGHT="${RESIDUAL_L2_WEIGHT:-0.0}"
+if [[ "$RESIDUAL_L2_WEIGHT" != "0.0" && "$RESIDUAL_L2_WEIGHT" != "0" ]]; then
+    echo "RESIDUAL_L2_WEIGHT=$RESIDUAL_L2_WEIGHT -- penalizando magnitude do residuo do RefineNet3D (checkpoint em .../_resl2<valor>/)"
+fi
+
+# --- capacidade (addendum 2026-09-14) --------------------------------------
+# Ate 2026-09-14 este wrapper NAO expunha --base-ch: a unica forma de mudar a
+# largura da rede era editar o .py. Como a analise de capacidade mostrou que
+# esta linha roda com ~185k parametros contra ~6,8M do RCAE (37x menos), a
+# variavel passou a ser exposta aqui.
+BASE_CH="${BASE_CH:-16}"
+BASE_CH_FLAG=()
+if [[ "$BASE_CH" != "16" ]]; then
+    BASE_CH_FLAG=(--base-ch "$BASE_CH")
+    echo "BASE_CH=$BASE_CH (default 16) -- run_tag ganha sufixo _bc$BASE_CH; NAO retomavel a partir de um checkpoint com outra largura"
+fi
+REFINE_BASE_CH="${REFINE_BASE_CH:-}"
+REFINE_BASE_CH_FLAG=()
+if [[ -n "$REFINE_BASE_CH" ]]; then
+    REFINE_BASE_CH_FLAG=(--refine-base-ch "$REFINE_BASE_CH")
+    echo "REFINE_BASE_CH=$REFINE_BASE_CH -- largura da RefineNet3D desacoplada do resto (run_tag ganha _rbc$REFINE_BASE_CH)"
+fi
+REFINE_DEPTH="${REFINE_DEPTH:-2}"
+REFINE_DEPTH_FLAG=()
+if [[ "$REFINE_DEPTH" != "2" ]]; then
+    REFINE_DEPTH_FLAG=(--refine-depth "$REFINE_DEPTH")
+    echo "REFINE_DEPTH=$REFINE_DEPTH (default 2) -- camadas ocultas da RefineNet3D (run_tag ganha _rd$REFINE_DEPTH)"
+fi
+REFINE_COND_FLAG=()
+if [[ "${REFINE_COND:-0}" == "1" ]]; then
+    REFINE_COND_FLAG=(--refine-cond)
+    echo "REFINE_COND=1 -- injetando bvec_a/bvec_b/bvec_t/t_frac/quality na RefineNet3D (run_tag ganha _rcond)"
+fi
+
+CATTN_FLAG=()
+if [[ "${CROSS_CANDIDATE_ATTENTION:-0}" == "1" ]]; then
+    CATTN_FLAG=(--cross-candidate-attention)
+    echo "CROSS_CANDIDATE_ATTENTION=1 -- treino NOVO com self-attention entre os M candidatos do feixe, ANTES do logit de confianca (run_tag ganha sufixo _cattn)"
+fi
+CROSS_CANDIDATE_ATTN_HEADS="${CROSS_CANDIDATE_ATTN_HEADS:-4}"
+CATTN_HEADS_FLAG=()
+if [[ "$CROSS_CANDIDATE_ATTN_HEADS" != "4" ]]; then
+    CATTN_HEADS_FLAG=(--cross-candidate-attn-heads "$CROSS_CANDIDATE_ATTN_HEADS")
+    echo "CROSS_CANDIDATE_ATTN_HEADS=$CROSS_CANDIDATE_ATTN_HEADS (default 4, so tem efeito com CROSS_CANDIDATE_ATTENTION=1) -- precisa dividir --base-ch sem resto"
+fi
+
+RESET_LR_FLAG=()
+if [[ "${RESET_LR:-0}" == "1" ]]; then
+    RESET_LR_FLAG=(--reset-lr)
+    echo "RESET_LR=1 -- reinicio A QUENTE: carrega os pesos do checkpoint mas recria otimizador e scheduler em LR=$LR (sem esta flag, o resume restaura optimizer_state/scheduler_state e o LR da linha de comando e' ignorado na pratica). Mantem best_val, zera epochs_no_improve."
+    if [[ -z "${RESUME_CHECKPOINT:-}" && "${NO_RESUME:-0}" == "1" ]]; then
+        echo "  ATENCAO: RESET_LR=1 com NO_RESUME=1 nao faz reinicio a quente nenhum -- vai treinar do zero. Passe RESUME_CHECKPOINT=<best.pt> e tire o NO_RESUME."
+    fi
+fi
+
 python scripts/04e_train_rrin_star.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --triplets-dir "$TRIPLETS_DIR" \
@@ -116,5 +211,8 @@ python scripts/04e_train_rrin_star.py \
     --epochs 150 --batch-size 8 --patch-size 10 \
     --lr "$LR" --num-workers 8 --max-cached-subjects 6 --patience 15 \
     --val-num-workers 4 --val-max-cached-subjects 1 \
-    "${RESUME_FLAG[@]}" "${QC_FLAG[@]}" "${WQC_FLAG[@]}" "${ONLY_VALID_FLAG[@]}" "${NORM_TYPE_FLAG[@]}" \
+    --residual-l2-weight "$RESIDUAL_L2_WEIGHT" \
+    "${RESUME_FLAG[@]}" "${RESET_LR_FLAG[@]}" "${QC_FLAG[@]}" "${WQC_FLAG[@]}" "${ONLY_VALID_FLAG[@]}" "${NORM_TYPE_FLAG[@]}" \
+    "${CATTN_FLAG[@]}" "${CATTN_HEADS_FLAG[@]}" \
+    "${BASE_CH_FLAG[@]}" "${REFINE_BASE_CH_FLAG[@]}" "${REFINE_DEPTH_FLAG[@]}" "${REFINE_COND_FLAG[@]}" \
     --job-id "${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"

@@ -17,7 +17,13 @@ TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m6r10 
     sbatch 04e_train_rrin_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
 
+NO_RESUME=1 WARMUP_STEPS=500 ZERO_INIT_REFINE_OUTPUT=1 \
+  sbatch slurm/04i_train_pairflow_star.sh <work_dir> <shell_b> <n_level>
+
+#warmup só se começar do zero
+NO_RESUME=1 \
 ENSEMBLE_M=8 \
+WARMUP_STEPS=500 ZERO_INIT_REFINE_OUTPUT=1 \
 TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m8r15 \
 INIT_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_ssl_checkpoints/shell1000/runs/3635639_0/best.pt \
 BATCH_SIZE=32 LR=2e-4 FREEZE_SUBJECT_ORDER=1 MAX_CACHED_SUBJECTS=16 \
@@ -28,8 +34,13 @@ RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/rcae_checkpoints/
     ONLY_VALID=1 \
     sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
-    sbatch 04f_train_implicit.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+   NO_RESUME=1 ANGULAR_LOSS_WEIGHT=0.5 sbatch 04f_train_implicit.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
+
+NO_RESUME=1 sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+NO_RESUME=1 ANGULAR_LOSS_WEIGHT=0.5 SH_LOSS_HIGH_ORDER_MIN=2 \
+  sbatch 03_train_rcae.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
 RESUME_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/implicit_checkpoints/shell1000_n16/runs/3634245_0/last.pt \
 AGGREGATION=mean sbatch 04f_train_implicit.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
@@ -43,6 +54,7 @@ NO_RESUME=1 \
 
 
 LOG_WORKER_LOADS=1 \
+/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_ssl_checkpoints/shell1000/runs/3635639_0/last.pt
 sbatch 04g_train_pairflow_ssl.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000
 
 INIT_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_ssl_checkpoints/shell1000/best.pt \
@@ -51,3 +63,19 @@ INIT_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_ssl_checkp
 
 sbatch 04h_train_pairflow_finetune.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
 
+ENSEMBLE_M=8 TRIPLETS_DIR=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/subsampling_ens_m8r15 \
+ANGULAR_LOSS_WEIGHT=0.5 \
+  NO_RESUME=1 \
+  INIT_CHECKPOINT=/ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir/pairflow_ssl_checkpoints/shell1000/last.pt \
+  BATCH_SIZE=32 FREEZE_SUBJECT_ORDER=1 LR=2e-4 \
+  WARMUP_STEPS=500 ZERO_INIT_REFINE_OUTPUT=1 \
+  CKPT_TAG=sslep131sh \
+  sbatch 04i_train_pairflow_star.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+ANGULAR_LOSS_WEIGHT=0.5 \
+  QOUT=16 \
+  NO_RESUME=1 \
+  AGGREGATION=attention CKPT_TAG=att_init_lr_sh \
+  sbatch 04f_train_implicit.sh /ix1/tibrahim/rmm270/Docker_DL/Lyon/work_dir 1000 16
+
+  ANGULAR_LOSS_WEIGHT=0.5 QOUT=16 sbatch slurm/04f_train_implicit.sh <work_dir> <shell_b> <n_level>

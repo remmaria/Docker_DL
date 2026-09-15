@@ -268,6 +268,8 @@ def main():
     ap.add_argument("--job-id", default="")
     ap.add_argument("--no-resume", action="store_true")
     ap.add_argument("--resume-checkpoint", default=None)
+    ap.add_argument("--reset-lr", action="store_true",
+                     help="Retoma os PESOS do checkpoint mas recria otimizador e scheduler do zero, no --lr desta chamada (reinicio a quente). Sem esta flag, o resume restaura optimizer_state (que carrega os momentos do Adam E o LR corrente) e scheduler_state, entao o --lr da linha de comando e' IGNORADO na pratica. Uso tipico (addendum 2026-09-14d): o LR foi escolhido no regime de modelo pequeno e ficou grande demais depois de escalar a largura. Mantem best_val (o best.pt so' e' trocado por melhora real) e zera epochs_no_improve.")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -368,6 +370,13 @@ def main():
     print("[sanity] ok -- comecando o loop de epocas de verdade", flush=True)
 
     run_tag = f"shell{int(args.shell_b)}"
+    if args.base_ch != 16:
+        # ADITIVO e OBRIGATORIO: --base-ch muda o shape de TODO peso do
+        # PairFlowNet3D. Sem este sufixo, um run com largura nova gravaria no
+        # MESMO out_dir do run de largura 16 e, com --no-resume, sobrescreveria
+        # o best.pt que a etapa 4i carrega via INIT_CHECKPOINT (mesma classe de
+        # bug das secoes 12, 14.1, 33.23 e 33.24 do protocolo).
+        run_tag += f"_bc{args.base_ch}"
     if args.norm_type == "batch":
         run_tag += "_bn"
     if abs(args.consistency_weight - 0.1) > 1e-12:
@@ -402,7 +411,7 @@ def main():
         print(f"[resume] carregando checkpoint existente: {resume_ckpt_path}", flush=True)
         ckpt = torch.load(resume_ckpt_path, map_location=device)
         old_args = ckpt.get("args", {})
-        for key in ("shell_b", "patch_size", "base_ch", "max_disp", "norm_type", "lr"):
+        for key in ("shell_b", "patch_size", "max_disp", "norm_type", "lr"):
             old_val, new_val = old_args.get(key), vars(args).get(key)
             if old_val is not None and old_val != new_val:
                 print(f"[resume][aviso] --{key.replace('_','-')} mudou entre o checkpoint "
@@ -413,19 +422,55 @@ def main():
             raise ValueError(
                 f"--norm-type={args.norm_type} nao bate com o checkpoint ({old_norm_type}) -- "
                 f"use --no-resume ou um --out-dir novo para treinar do zero.")
+        # --base-ch muda o shape de todo peso: retomar e' impossivel, e deixar
+        # isso so' como aviso produziria um erro de shape confuso mais adiante
+        # no load_state_dict. Falha cedo e com mensagem clara.
+        old_base_ch = old_args.get("base_ch")
+        if old_base_ch is not None and old_base_ch != args.base_ch:
+            raise ValueError(
+                f"--base-ch={args.base_ch} nao bate com o checkpoint ({old_base_ch}) -- "
+                f"a largura muda o shape de todos os pesos do PairFlowNet3D. "
+                f"Use --no-resume (o run_tag ja ganha o sufixo _bc{args.base_ch}, "
+                f"entao nao ha risco de sobrescrever o checkpoint de largura "
+                f"{old_base_ch}) ou um --out-dir novo.")
         model.load_state_dict(ckpt["model_state"])
-        if "optimizer_state" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state"])
-        if "scheduler_state" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state"])
+        if args.reset_lr:
+            # Reinicio a quente: pesos sim, estado de otimizacao nao. O
+            # optimizer_state do Adam carrega os momentos E o LR corrente; o
+            # scheduler_state carrega o contador de plateau. Restaurar os dois
+            # e' justamente o que faz o --lr desta chamada nao ter efeito.
+            _old_lr = ckpt.get("args", {}).get("lr")
+            print(f"[reset-lr] descartando optimizer_state/scheduler_state do checkpoint "
+                  f"-- otimizador e scheduler recriados com lr={args.lr:.2e}"
+                  + (f" (o checkpoint vinha de lr={_old_lr})" if _old_lr is not None else ""),
+                  flush=True)
+        else:
+            if "optimizer_state" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+            if "scheduler_state" in ckpt:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_val = float(ckpt.get("best_val", ckpt.get("val_loss", float("inf"))))
         epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
+        if args.reset_lr and epochs_no_improve:
+            print(f"[reset-lr] zerando epochs_no_improve ({epochs_no_improve} -> 0) -- o "
+                  f"modelo precisa de algumas epocas pra assentar no LR novo. "
+                  f"best_val={best_val:.6f} e MANTIDO, entao o best.pt so' e' substituido "
+                  f"por uma melhora real.", flush=True)
+            epochs_no_improve = 0
         print(f"[resume] retomando da epoca {start_epoch} (best_val={best_val:.6f}, "
               f"epochs_no_improve={epochs_no_improve})", flush=True)
     else:
         print("[resume] nenhum checkpoint anterior encontrado (ou --no-resume) -- "
               "comecando do zero.", flush=True)
+        if args.reset_lr:
+            # Nao e' erro, mas quase sempre significa que o --resume-checkpoint
+            # nao chegou ou que veio um --no-resume junto por engano -- e nesse
+            # caso as epocas que a flag deveria aproveitar somem em silencio.
+            print("[reset-lr][aviso] --reset-lr passado, mas nao ha checkpoint pra retomar: "
+                  "nao ha estado de otimizacao a descartar e o treino comeca do zero no "
+                  f"--lr={args.lr:.2e}. Se a intencao era o reinicio A QUENTE, confira o "
+                  "--resume-checkpoint (e nao passe --no-resume junto).", flush=True)
 
     log_path = run_dir / "train_log.csv"
     with open(log_path, "w") as f:

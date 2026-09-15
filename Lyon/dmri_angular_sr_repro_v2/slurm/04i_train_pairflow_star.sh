@@ -87,14 +87,52 @@
 # esta linha pedido pela usuaria em 2026-09-09, ver addendum secao 33.32) --
 # lambda do termo de loss opcional no dominio angular/SH (mesmo mecanismo
 # ja usado em scripts/04_train_rcae.py/04b_train_rrin.py). Cada direcao do
-# feixe SH extra roda pelo modelo como um ensemble DEGENERADO de M=1 par
-# real (ver scripts/04i_train_pairflow_star.py:_sh_bundle_forward_star --
-# o feixe sh_q_out do dataset ainda nao suporta um M completo por
-# direcao). Grava em run_tag com sufixo _sh. SH_LOSS_HIGH_ORDER_MIN=<int>
-# (default 4), SH_LOSS_LMAX_CAP=<int> (default 8) e SH_LOSS_Q_OUT=<int>
-# (default 16, tamanho do feixe extra amostrado por item) sao overrides
-# opcionais, so tem efeito com ANGULAR_LOSS_WEIGHT>0.
+# feixe SH extra roda pelo modelo com um ensemble COMPLETO de ate
+# ENSEMBLE_M pares candidatos (ver scripts/04i_train_pairflow_star.py:
+# _sh_bundle_forward_star e utils/rrin_dataset.py -- corrigido em
+# 2026-09-09, addendum secao 33.34; versao anterior usava M=1 degenerado
+# por direcao, o que se mostrou custar loss_signal mensuravel numa
+# comparacao controlada). Grava em run_tag com sufixo _sh.
+# SH_LOSS_HIGH_ORDER_MIN=<int> (default 4), SH_LOSS_LMAX_CAP=<int>
+# (default 8) e SH_LOSS_Q_OUT=<int> (default 16, tamanho do feixe extra
+# amostrado por item) sao overrides opcionais, so tem efeito com
+# ANGULAR_LOSS_WEIGHT>0. ATENCAO CUSTO: com ENSEMBLE_M/SH_LOSS_Q_OUT
+# default (8/16), o feixe SH agora extrai ate' 128 pares por item (era 16
+# antes da correcao) -- meca o tempo/epoca com --max-train-batches/
+# --max-val-batches (ver scripts/04i_train_pairflow_star.py) antes de um
+# job longo.
 #   ANGULAR_LOSS_WEIGHT=0.5 sbatch slurm/04i_train_pairflow_star.sh <work_dir> <shell_b> <n_level>
+#
+# RESIDUAL_L2_WEIGHT=<valor> (ADITIVO, default 0.0 = desligado, addendum
+# 2026-09-13 -- mesmo mecanismo/motivacao de slurm/04e_train_rrin_star.sh,
+# copia deliberada) -- penaliza a magnitude do residuo do RefineNet3D
+# (media so sobre as posicoes reais do feixe), empurrando a predicao a
+# ficar perto do blend por fluxo optico a menos que haja evidencia forte
+# pra se afastar dele. Ganha sufixo _resl2<valor> no run_tag.
+#   RESIDUAL_L2_WEIGHT=0.01 sbatch slurm/04i_train_pairflow_star.sh <work_dir> <shell_b> <n_level>
+#
+# CROSS_CANDIDATE_ATTENTION=1 (ADITIVO, default 0 = desligado, addendum
+# 2026-09-13/2026-09-14, item 1 -- mesmo mecanismo/motivacao de
+# slurm/04e_train_rrin_star.sh, copia deliberada) -- insere self-attention
+# entre os M candidatos do feixe (por voxel) ANTES do logit de confianca da
+# PairFlowWeightHead3D, ver model/pairflow_star.py:CrossCandidateAttention3D.
+# Ganha sufixo _cattn no run_tag. CROSS_CANDIDATE_ATTN_HEADS=<N> (default 4,
+# so tem efeito com CROSS_CANDIDATE_ATTENTION=1) -- precisa dividir
+# --base-ch (16) sem resto.
+#   CROSS_CANDIDATE_ATTENTION=1 sbatch slurm/04i_train_pairflow_star.sh <work_dir> <shell_b> <n_level>
+#
+# CAPACIDADE (addendum 2026-09-14, mesmas variaveis de
+# slurm/04e_train_rrin_star.sh -- ver o cabecalho de la para a motivacao
+# completa): BASE_CH=<N> (default 16, sufixo _bc<N>), REFINE_BASE_CH=<N>
+# (largura so' da RefineNet3D, sufixo _rbc<N>), REFINE_DEPTH=<N> (default 2,
+# sufixo _rd<N>), REFINE_COND=1 (condiciona a RefineNet3D em bvec/t_frac/
+# quality, sufixo _rcond). Todas mudam shape de peso => nao retomaveis.
+# ATENCAO especifica desta linha: BASE_CH != 16 e' INCOMPATIVEL com um
+# INIT_CHECKPOINT do SSL (etapa 4g) treinado na largura antiga -- o
+# flow_net nao vai carregar. Retreine o SSL na largura nova ou rode sem
+# INIT_CHECKPOINT.
+#   BASE_CH=32 REFINE_BASE_CH=64 REFINE_COND=1 \
+#     sbatch slurm/04i_train_pairflow_star.sh <work_dir> <shell_b> <n_level>
 #
 # CKPT_TAG=<string> (ADITIVO, default vazio, ver addendum secao 33.23) --
 # ATENCAO: OUT_DIR e' montado so' a partir de BATCH_SIZE/FREEZE_SUBJECT_
@@ -216,6 +254,58 @@ if [[ "$ANGULAR_LOSS_WEIGHT" != "0.0" && "$ANGULAR_LOSS_WEIGHT" != "0" ]]; then
     echo "ANGULAR_LOSS_WEIGHT=$ANGULAR_LOSS_WEIGHT (high_order_min=$SH_LOSS_HIGH_ORDER_MIN, lmax_cap=$SH_LOSS_LMAX_CAP, sh_q_out=$SH_LOSS_Q_OUT) -- treino NOVO com loss angular (run_tag ganha sufixo _sh)"
 fi
 
+RESIDUAL_L2_WEIGHT="${RESIDUAL_L2_WEIGHT:-0.0}"
+if [[ "$RESIDUAL_L2_WEIGHT" != "0.0" && "$RESIDUAL_L2_WEIGHT" != "0" ]]; then
+    echo "RESIDUAL_L2_WEIGHT=$RESIDUAL_L2_WEIGHT -- penalizando magnitude do residuo do RefineNet3D (run_tag ganha sufixo _resl2<valor>)"
+fi
+
+# --- capacidade (addendum 2026-09-14, mesmas variaveis de 04e) -------------
+BASE_CH="${BASE_CH:-16}"
+BASE_CH_FLAG=()
+if [[ "$BASE_CH" != "16" ]]; then
+    BASE_CH_FLAG=(--base-ch "$BASE_CH")
+    echo "BASE_CH=$BASE_CH (default 16) -- run_tag ganha sufixo _bc$BASE_CH; NAO retomavel a partir de um checkpoint com outra largura"
+    echo "  ATENCAO: se usar INIT_CHECKPOINT, o pre-treino SSL (etapa 4g) precisa ter sido feito com a MESMA largura, senao o flow_net nao carrega"
+fi
+REFINE_BASE_CH="${REFINE_BASE_CH:-}"
+REFINE_BASE_CH_FLAG=()
+if [[ -n "$REFINE_BASE_CH" ]]; then
+    REFINE_BASE_CH_FLAG=(--refine-base-ch "$REFINE_BASE_CH")
+    echo "REFINE_BASE_CH=$REFINE_BASE_CH -- largura da RefineNet3D desacoplada do resto (run_tag ganha _rbc$REFINE_BASE_CH)"
+fi
+REFINE_DEPTH="${REFINE_DEPTH:-2}"
+REFINE_DEPTH_FLAG=()
+if [[ "$REFINE_DEPTH" != "2" ]]; then
+    REFINE_DEPTH_FLAG=(--refine-depth "$REFINE_DEPTH")
+    echo "REFINE_DEPTH=$REFINE_DEPTH (default 2) -- camadas ocultas da RefineNet3D (run_tag ganha _rd$REFINE_DEPTH)"
+fi
+REFINE_COND_FLAG=()
+if [[ "${REFINE_COND:-0}" == "1" ]]; then
+    REFINE_COND_FLAG=(--refine-cond)
+    echo "REFINE_COND=1 -- injetando bvec_a/bvec_b/bvec_t/t_frac/quality na RefineNet3D (run_tag ganha _rcond)"
+fi
+
+CATTN_FLAG=()
+if [[ "${CROSS_CANDIDATE_ATTENTION:-0}" == "1" ]]; then
+    CATTN_FLAG=(--cross-candidate-attention)
+    echo "CROSS_CANDIDATE_ATTENTION=1 -- treino NOVO com self-attention entre os M candidatos do feixe, ANTES do logit de confianca (run_tag ganha sufixo _cattn)"
+fi
+CROSS_CANDIDATE_ATTN_HEADS="${CROSS_CANDIDATE_ATTN_HEADS:-4}"
+CATTN_HEADS_FLAG=()
+if [[ "$CROSS_CANDIDATE_ATTN_HEADS" != "4" ]]; then
+    CATTN_HEADS_FLAG=(--cross-candidate-attn-heads "$CROSS_CANDIDATE_ATTN_HEADS")
+    echo "CROSS_CANDIDATE_ATTN_HEADS=$CROSS_CANDIDATE_ATTN_HEADS (default 4, so tem efeito com CROSS_CANDIDATE_ATTENTION=1) -- precisa dividir --base-ch sem resto"
+fi
+
+RESET_LR_FLAG=()
+if [[ "${RESET_LR:-0}" == "1" ]]; then
+    RESET_LR_FLAG=(--reset-lr)
+    echo "RESET_LR=1 -- reinicio A QUENTE: carrega os pesos do checkpoint mas recria otimizador e scheduler em LR=$LR (sem esta flag, o resume restaura optimizer_state/scheduler_state e o LR da linha de comando e' ignorado na pratica). Mantem best_val, zera epochs_no_improve."
+    if [[ -z "${RESUME_CHECKPOINT:-}" && "${NO_RESUME:-0}" == "1" ]]; then
+        echo "  ATENCAO: RESET_LR=1 com NO_RESUME=1 nao faz reinicio a quente nenhum -- vai treinar do zero. Passe RESUME_CHECKPOINT=<best.pt> e tire o NO_RESUME."
+    fi
+fi
+
 python scripts/04i_train_pairflow_star.py \
     --manifest "$WORK_DIR/manifest.csv" \
     --triplets-dir "$TRIPLETS_DIR" \
@@ -224,8 +314,9 @@ python scripts/04i_train_pairflow_star.py \
     --epochs 150 --batch-size "$BATCH_SIZE" --patch-size 10 \
     --lr "$LR" --num-workers 8 --max-cached-subjects "$MAX_CACHED_SUBJECTS" --patience 15 \
     --val-num-workers 4 --val-max-cached-subjects 1 \
-    --warmup-steps "$WARMUP_STEPS" \
-    "${RESUME_FLAG[@]}" "${INIT_FLAG[@]}" "${FREEZE_FLAG[@]}" "${WQC_FLAG[@]}" \
+    --warmup-steps "$WARMUP_STEPS" --residual-l2-weight "$RESIDUAL_L2_WEIGHT" \
+    "${RESUME_FLAG[@]}" "${RESET_LR_FLAG[@]}" "${INIT_FLAG[@]}" "${FREEZE_FLAG[@]}" "${WQC_FLAG[@]}" \
     "${ONLY_VALID_FLAG[@]}" "${NORM_TYPE_FLAG[@]}" "${FREEZE_ORDER_FLAG[@]}" \
-    "${ZERO_INIT_FLAG[@]}" "${ANGULAR_LOSS_FLAG[@]}" \
+    "${ZERO_INIT_FLAG[@]}" "${ANGULAR_LOSS_FLAG[@]}" "${CATTN_FLAG[@]}" "${CATTN_HEADS_FLAG[@]}" \
+    "${BASE_CH_FLAG[@]}" "${REFINE_BASE_CH_FLAG[@]}" "${REFINE_DEPTH_FLAG[@]}" "${REFINE_COND_FLAG[@]}" \
     --job-id "${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"

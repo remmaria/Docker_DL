@@ -212,21 +212,64 @@ class FlowNet3D(nn.Module):
 
 
 class RefineNet3D(nn.Module):
-    """Rede de refinamento residual (pequena): ve o blend inicial + os dois
-    volumes de entrada crus (sem warp) e prediz um residuo somado ao
-    blend -- mesma ideia do "residue refinement" da RRIN, adaptada em 3D."""
+    """Rede de refinamento residual: ve o blend inicial + os dois volumes de
+    entrada crus (sem warp) e prediz um residuo somado ao blend -- mesma
+    ideia do "residue refinement" da RRIN, adaptada em 3D.
 
-    def __init__(self, base_ch: int = 16, norm_type: str = "instance"):
+    ATUALIZACAO (2026-09-14, ver addendum 2026-09-14_capacidade_refine_
+    context.md): ganhou `depth` e `cond_ch`, ADITIVOS -- com os defaults
+    (`depth=2`, `cond_ch=0`) a topologia, os NOMES dos parametros
+    (`net.0.*`/`net.1.*`/`net.2.*`) e a contagem de parametros ficam
+    IDENTICOS a versao anterior, entao todo checkpoint ja existente
+    (RRIN3D/RRIN3DStar/PairFlowStar) continua carregando sem mudanca.
+
+    Motivacao dos dois parametros novos (ver analise de capacidade no
+    addendum): esta rede tinha 8.737 parametros com `base_ch=16` -- 4,7% do
+    RRIN3DStar inteiro, e ~0,13% do RCAE (6,8M), que e o modelo que hoje
+    vence a comparacao. Ela e, ao mesmo tempo, a UNICA parte do modelo que
+    NAO esta presa a premissa de correspondencia espacial entre direcoes
+    (secao 14.6 do protocolo): o fluxo/warp propoe, e e aqui que qualquer
+    erro dessa premissa teria que ser corrigido de forma livre. Dar
+    capacidade a ESTA rede especificamente ataca justamente o que a
+    conclusao de "gargalo estrutural" deixa em aberto, em vez de gastar
+    parametros na parte que aquela conclusao ja indicou estar limitada.
+
+    `cond_ch` > 0: numero de canais de condicionamento (vetor por amostra,
+    difundido no espaco por `_repeat_vec_3d`) concatenados a entrada. Hoje
+    esta rede nao recebe NENHUM sinal de qual direcao-alvo ela esta
+    predizendo -- so o blend (que ja e especifico do alvo, mas so
+    implicitamente) e os dois volumes crus. O RCAE, em contraste, reinjeta
+    o bvec do alvo em TODOS os estagios do decoder (ver model/rcae.py:
+    RepeatBVector) -- e uma das diferencas estruturais mais visiveis entre
+    as duas linhas."""
+
+    def __init__(self, base_ch: int = 16, norm_type: str = "instance",
+                 depth: int = 2, cond_ch: int = 0):
         super().__init__()
-        in_ch = 1 + 1 + 1  # blend, vol_a, vol_b
-        self.net = nn.Sequential(
-            _conv3d(in_ch, base_ch, norm_type=norm_type),
-            _conv3d(base_ch, base_ch, norm_type=norm_type),
-            nn.Conv3d(base_ch, 1, kernel_size=3, padding=1),
-        )
+        if depth < 1:
+            raise ValueError(f"depth de RefineNet3D deve ser >= 1 (recebido {depth})")
+        self.depth = depth
+        self.cond_ch = cond_ch
+        in_ch = 1 + 1 + 1 + cond_ch  # blend, vol_a, vol_b (+ condicionamento)
+        layers = [_conv3d(in_ch, base_ch, norm_type=norm_type)]
+        for _ in range(depth - 1):
+            layers.append(_conv3d(base_ch, base_ch, norm_type=norm_type))
+        layers.append(nn.Conv3d(base_ch, 1, kernel_size=3, padding=1))
+        self.net = nn.Sequential(*layers)
 
-    def forward(self, blend, vol_a, vol_b):
-        x = torch.cat([blend, vol_a, vol_b], dim=1)
+    def forward(self, blend, vol_a, vol_b, cond=None):
+        parts = [blend, vol_a, vol_b]
+        if self.cond_ch > 0:
+            if cond is None:
+                raise ValueError(
+                    "RefineNet3D foi construida com cond_ch>0 mas `cond` nao foi passado ao "
+                    "forward -- ver --refine-cond em scripts/04e_train_rrin_star.py.")
+            if cond.shape[1] != self.cond_ch:
+                raise ValueError(
+                    f"`cond` tem {cond.shape[1]} canais mas a rede foi construida com "
+                    f"cond_ch={self.cond_ch}.")
+            parts.append(_repeat_vec_3d(cond, blend.shape[-3:]))
+        x = torch.cat(parts, dim=1)
         return self.net(x)
 
 

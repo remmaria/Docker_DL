@@ -182,14 +182,28 @@ def _sh_bundle_forward_star(model, batch, device, weight_quality_cond: bool):
     return pred_sh, target_sh, bvec_t_sh, sh_mask
 
 
+def _masked_residual_l2(residual, ensemble_mask):
+    """Copia deliberada de scripts/04e_train_rrin_star.py:_masked_residual_l2
+    (mesma independencia arquitetural entre as duas linhas, ver docstring de
+    model/pairflow_star.py:PairFlowWeightHead3D) -- media do residuo^2 do
+    RefineNet3D SO sobre as posicoes reais do feixe (ensemble_mask=True).
+    residual: (B,M,1,D,H,W). ensemble_mask: (B,M) bool."""
+    mask_f = ensemble_mask.view(*ensemble_mask.shape, 1, 1, 1, 1).float()
+    voxels_per_pair = residual.shape[2] * residual.shape[3] * residual.shape[4] * residual.shape[5]
+    n_valid_elems = mask_f.sum() * voxels_per_pair
+    return (residual.pow(2) * mask_f).sum() / n_valid_elems.clamp(min=1.0)
+
+
 def run_epoch(model, loader, optimizer, device, train: bool, epoch: int,
               need_quality: bool = False, batch_log_f=None, max_batches: int = None,
               warmup_state: dict = None, angular_loss_weight: float = 0.0,
-              sh_loss_high_order_min: int = 4, sh_loss_lmax_cap: int = 8):
+              sh_loss_high_order_min: int = 4, sh_loss_lmax_cap: int = 8,
+              residual_l2_weight: float = 0.0):
     model.train(mode=train)
     total_loss = 0.0
     total_loss_signal = 0.0
     total_loss_angular = 0.0
+    total_loss_residual = 0.0
     n_batches = 0
     n_samples = 0
     total_wait_s = 0.0
@@ -213,8 +227,14 @@ def run_epoch(model, loader, optimizer, device, train: bool, epoch: int,
         quality = batch["quality_ens"].to(device) if need_quality else None
 
         with torch.set_grad_enabled(train):
-            pred = model(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t_frac, ensemble_mask,
-                         quality=quality)
+            if residual_l2_weight > 0.0:
+                pred, extra = model(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t_frac, ensemble_mask,
+                                     quality=quality, return_pairs=True)
+                loss_residual = _masked_residual_l2(extra["residual"], ensemble_mask)
+            else:
+                pred = model(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t_frac, ensemble_mask,
+                             quality=quality)
+                loss_residual = torch.zeros((), device=device)
             # MAE, mesma escolha de 04e_train_rrin_star.py/04h_train_pairflow_finetune.py.
             loss_signal = (pred - target).abs().mean()
             # termo angular/SH opcional (porte pedido pela usuaria em
@@ -230,6 +250,7 @@ def run_epoch(model, loader, optimizer, device, train: bool, epoch: int,
             else:
                 loss_angular = None
                 loss = loss_signal
+            loss = loss + residual_l2_weight * loss_residual
             if train:
                 if warmup_state is not None and warmup_state["step"] < warmup_state["warmup_steps"]:
                     warmup_state["step"] += 1
@@ -252,6 +273,7 @@ def run_epoch(model, loader, optimizer, device, train: bool, epoch: int,
         total_loss_signal += loss_signal.item()
         if loss_angular is not None:
             total_loss_angular += loss_angular.item()
+        total_loss_residual += loss_residual.item()
         n_batches += 1
         n_samples += vol_a.shape[0]
         total_wait_s += wait_s
@@ -263,7 +285,8 @@ def run_epoch(model, loader, optimizer, device, train: bool, epoch: int,
             loss_angular_str = f"{loss_angular.item():.6f}" if loss_angular is not None else ""
             batch_log_f.write(f"{epoch},{split},{n_batches},{loss.item():.6f},"
                                f"{wait_s:.3f},{compute_s:.3f},{tags_str},{n_real_mean:.2f},"
-                               f"{loss_signal.item():.6f},{loss_angular_str}\n")
+                               f"{loss_signal.item():.6f},{loss_angular_str},"
+                               f"{loss_residual.item():.6f}\n")
             batch_log_f.flush()
 
         prev_end = time.time()
@@ -278,7 +301,8 @@ def run_epoch(model, loader, optimizer, device, train: bool, epoch: int,
 
     avg_loss_signal = total_loss_signal / max(1, n_batches)
     avg_loss_angular = (total_loss_angular / max(1, n_batches)) if angular_loss_weight > 0 else None
-    return total_loss / max(1, n_batches), avg_loss_signal, avg_loss_angular
+    avg_loss_residual = total_loss_residual / max(1, n_batches)
+    return total_loss / max(1, n_batches), avg_loss_signal, avg_loss_angular, avg_loss_residual
 
 
 def main():
@@ -309,6 +333,34 @@ def main():
                           "M pares) -- ver docstring de model/pairflow_star.py. NAO ha "
                           "--use-quality-cond equivalente aqui: PairFlowNet3D nao condiciona o "
                           "fluxo por nenhum sinal de qualidade (ver model/pairflow_ssl.py).")
+    ap.add_argument("--refine-base-ch", type=int, default=None,
+                     help="NOVO (2026-09-14, mesma flag de scripts/04e_train_rrin_star.py, ver "
+                          "addendum de capacidade): largura da RefineNet3D DESACOPLADA do resto "
+                          "do modelo. Default None = segue --base-ch. MUDA O SHAPE DOS PESOS -- "
+                          "bloqueante para resume. Sufixo _rbc<N> no run_tag.")
+    ap.add_argument("--refine-depth", type=int, default=2,
+                     help="NOVO: numero de camadas ocultas da RefineNet3D (default 2 = topologia "
+                          "historica). MUDA O SHAPE DOS PESOS -- bloqueante para resume. Sufixo "
+                          "_rd<N> no run_tag.")
+    ap.add_argument("--refine-cond", action="store_true",
+                     help="NOVO: injeta bvec_a/bvec_b/bvec_t/t_frac/quality (12 canais, ver "
+                          "model/pairflow_star.py:REFINE_COND_CH) na entrada da RefineNet3D. "
+                          "NAO viola a cegueira-ao-alvo do fluxo auto-supervisionado desta linha "
+                          "(o flow_net continua recebendo exatamente os mesmos tensores; so' o "
+                          "refino, que ja e treinado de forma supervisionada, passa a ver o "
+                          "alvo). Liga `need_quality`. Bloqueante para resume. Sufixo _rcond.")
+    ap.add_argument("--cross-candidate-attention", action="store_true",
+                     help="NOVO (item 1 do addendum 2026-09-13, mesma flag de "
+                          "scripts/04e_train_rrin_star.py, ver model/pairflow_star.py:"
+                          "CrossCandidateAttention3D): insere self-attention entre os M "
+                          "candidatos do feixe (por voxel) ANTES do logit de confianca da "
+                          "PairFlowWeightHead3D. ADITIVO (default desligado), MUDA O SHAPE DOS "
+                          "PESOS -- bloqueante para --resume-checkpoint se mudar entre chamadas. "
+                          "Ganha sufixo _cattn no run_tag.")
+    ap.add_argument("--cross-candidate-attn-heads", type=int, default=4,
+                     help="numero de cabecas de atencao de CrossCandidateAttention3D (so tem "
+                          "efeito com --cross-candidate-attention) -- precisa dividir --base-ch "
+                          "sem resto. Default 4.")
     ap.add_argument("--norm-type", choices=["instance", "batch"], default="instance",
                      help="mesmas restricoes de scripts/04e_train_rrin_star.py (batch exige "
                           "treino do zero).")
@@ -332,6 +384,8 @@ def main():
     ap.add_argument("--job-id", default="")
     ap.add_argument("--no-resume", action="store_true")
     ap.add_argument("--resume-checkpoint", default=None)
+    ap.add_argument("--reset-lr", action="store_true",
+                     help="Retoma os PESOS do checkpoint mas recria otimizador e scheduler do zero, no --lr desta chamada (reinicio a quente). Sem esta flag, o resume restaura optimizer_state (que carrega os momentos do Adam E o LR corrente) e scheduler_state, entao o --lr da linha de comando e' IGNORADO na pratica. Uso tipico (addendum 2026-09-14d): o LR foi escolhido no regime de modelo pequeno e ficou grande demais depois de escalar a largura. Mantem best_val (o best.pt so' e' trocado por melhora real) e zera epochs_no_improve.")
     ap.add_argument("--freeze-subject-order", action="store_true",
                      help="EXPERIMENTAL (mesmo flag de scripts/04g_train_pairflow_ssl.py, "
                           "trazido aqui em 2026-09-03 especificamente para o mini-teste de "
@@ -403,6 +457,17 @@ def main():
                      help="teto de ordem SH usado no ajuste -- mesma semantica de "
                           "scripts/04_train_rcae.py/04b_train_rrin.py. So tem efeito se "
                           "--angular-loss-weight > 0.")
+    ap.add_argument("--residual-l2-weight", type=float, default=0.0,
+                     help="ADITIVO, default 0.0 = desligado (addendum 2026-09-13, mesma "
+                          "hipotese/mecanismo de scripts/04e_train_rrin_star.py -- copia "
+                          "deliberada, mesma independencia arquitetural da linha PairFlow). "
+                          "Penaliza a MAGNITUDE do residuo do RefineNet3D (media so sobre as "
+                          "posicoes REAIS do feixe, ver _masked_residual_l2), empurrando a "
+                          "predicao a ficar perto do blend por fluxo optico a menos que haja "
+                          "evidencia forte pra se afastar dele -- mesmo espirito de "
+                          "--zero-init-refine-output, so que como penalidade continua durante "
+                          "o treino, nao so na inicializacao. Ganha sufixo _resl2<valor> no "
+                          "run_tag.")
     ap.add_argument("--sh-loss-q-out", type=int, default=16,
                      help="tamanho do feixe de trincas extra por item usado SO para o termo de "
                           "loss angular/SH (ver utils/rrin_dataset.py, RRINTripletDataset."
@@ -489,15 +554,29 @@ def main():
     print(f"[resumo] val:    {len(val_ds.usable)} sujeitos utilizaveis "
           f"({len(val_ds)} patches, {len(val_loader)} batches/epoca)", flush=True)
 
-    need_quality = args.weight_quality_cond
+    need_quality = args.weight_quality_cond or args.refine_cond
     model = build_pairflow_star_model(base_ch=args.base_ch, max_disp=args.max_disp,
                                        norm_type=args.norm_type, freeze_flow=args.freeze_flow,
-                                       weight_quality_cond=args.weight_quality_cond).to(device)
+                                       weight_quality_cond=args.weight_quality_cond,
+                                       cross_candidate_attention=args.cross_candidate_attention,
+                                       cross_candidate_attn_heads=args.cross_candidate_attn_heads,
+                                       refine_base_ch=args.refine_base_ch,
+                                       refine_depth=args.refine_depth,
+                                       refine_cond=args.refine_cond,
+                                       ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[resumo] PairFlowStar: {n_params} parametros ({n_trainable} treinaveis, "
           f"freeze_flow={args.freeze_flow}), base_ch={args.base_ch}, ensemble_m={args.ensemble_m}, "
-          f"weight_quality_cond={args.weight_quality_cond}, norm_type={args.norm_type})")
+          f"weight_quality_cond={args.weight_quality_cond}, norm_type={args.norm_type}, "
+          f"cross_candidate_attention={args.cross_candidate_attention}, "
+          f"cross_candidate_attn_heads={args.cross_candidate_attn_heads}, "
+          f"refine_base_ch={model.refine_base_ch}, refine_depth={args.refine_depth}, "
+          f"refine_cond={args.refine_cond})")
+    print(f"[resumo] parametros por submodulo: "
+          f"flow_net={sum(p.numel() for p in model.flow_net.parameters())}, "
+          f"refine_net={sum(p.numel() for p in model.refine_net.parameters())}, "
+          f"weight_head={sum(p.numel() for p in model.weight_head.parameters())}")
 
     if args.init_checkpoint:
         print(f"[init] carregando flow_net do checkpoint da Etapa 1: {args.init_checkpoint}",
@@ -537,9 +616,15 @@ def main():
         quality = batch["quality_ens"].to(device) if need_quality else None
         model.train(mode=do_backward)
         with torch.set_grad_enabled(do_backward):
-            pred = model(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t_frac, ensemble_mask,
-                         quality=quality)
-            loss = (pred - target).abs().mean()
+            if args.residual_l2_weight > 0.0:
+                pred, extra = model(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t_frac, ensemble_mask,
+                                     quality=quality, return_pairs=True)
+                loss_residual = _masked_residual_l2(extra["residual"], ensemble_mask)
+            else:
+                pred = model(vol_a, vol_b, bvec_a, bvec_b, bvec_t, t_frac, ensemble_mask,
+                             quality=quality)
+                loss_residual = torch.zeros((), device=device)
+            loss = (pred - target).abs().mean() + args.residual_l2_weight * loss_residual
             if do_backward:
                 optimizer.zero_grad()
                 loss.backward()
@@ -578,6 +663,20 @@ def main():
         run_tag += "_bn"
     if args.angular_loss_weight > 0:
         run_tag += "_sh"
+    if args.residual_l2_weight > 0.0:
+        run_tag += f"_resl2{args.residual_l2_weight:g}"
+    if args.base_ch != 16:
+        run_tag += f"_bc{args.base_ch}"
+    if args.refine_base_ch is not None and args.refine_base_ch != args.base_ch:
+        run_tag += f"_rbc{args.refine_base_ch}"
+    if args.refine_depth != 2:
+        run_tag += f"_rd{args.refine_depth}"
+    if args.refine_cond:
+        run_tag += "_rcond"
+    if args.cross_candidate_attention:
+        run_tag += "_cattn"
+        if args.cross_candidate_attn_heads != 4:
+            run_tag += f"{args.cross_candidate_attn_heads}h"
     if args.init_checkpoint:
         run_tag += "_pretrained"
     if args.freeze_flow:
@@ -609,7 +708,9 @@ def main():
         print(f"[resume] carregando checkpoint existente: {resume_ckpt_path}", flush=True)
         ckpt = torch.load(resume_ckpt_path, map_location=device)
         old_args = ckpt.get("args", {})
-        for key in ("shell_b", "n_level", "patch_size", "base_ch", "max_disp",
+        # base_ch saiu desta lista de AVISO em 2026-09-14 -- virou bloqueante
+        # logo abaixo (mesma mudanca de scripts/04e_train_rrin_star.py).
+        for key in ("shell_b", "n_level", "patch_size", "max_disp",
                     "weight_quality_cond", "ensemble_m", "norm_type", "freeze_flow", "lr",
                     "angular_loss_weight", "sh_loss_high_order_min", "sh_loss_lmax_cap",
                     "sh_loss_q_out"):
@@ -624,17 +725,73 @@ def main():
                 f"--norm-type={args.norm_type} nao bate com o checkpoint ({old_norm_type}) -- "
                 f"norm_type nao e retomavel entre variantes. Use --no-resume ou um --out-dir/"
                 f"--norm-type novos para treinar a variante '{args.norm_type}' do zero.")
+        # base_ch/refine_* mudam o SHAPE dos pesos -- bloqueantes (mesma
+        # correcao de 2026-09-14 aplicada em scripts/04e_train_rrin_star.py).
+        for key, default in (("base_ch", 16), ("refine_depth", 2)):
+            old_val = old_args.get(key, default)
+            new_val = vars(args).get(key)
+            if old_val != new_val:
+                raise ValueError(
+                    f"--{key.replace('_','-')}={new_val} nao bate com o checkpoint ({old_val}) -- "
+                    f"muda o shape dos pesos, nao e retomavel entre variantes. Use --no-resume ou "
+                    f"um --out-dir novo.")
+        old_refine_bc = old_args.get("refine_base_ch", None)
+        old_refine_bc_eff = old_refine_bc if old_refine_bc is not None else old_args.get("base_ch", 16)
+        new_refine_bc_eff = args.refine_base_ch if args.refine_base_ch is not None else args.base_ch
+        if old_refine_bc_eff != new_refine_bc_eff:
+            raise ValueError(
+                f"--refine-base-ch efetivo ({new_refine_bc_eff}) nao bate com o checkpoint "
+                f"({old_refine_bc_eff}) -- muda o shape dos pesos da RefineNet3D, nao e "
+                f"retomavel. Use --no-resume ou um --out-dir novo.")
+        old_refine_cond = old_args.get("refine_cond", False)
+        if old_refine_cond != args.refine_cond:
+            raise ValueError(
+                f"--refine-cond={args.refine_cond} nao bate com o checkpoint ({old_refine_cond}) "
+                f"-- muda o numero de canais de entrada da RefineNet3D, nao e retomavel. Use "
+                f"--no-resume ou um --out-dir novo.")
+        old_cross_candidate_attn = old_args.get("cross_candidate_attention", False)
+        if old_cross_candidate_attn != args.cross_candidate_attention:
+            raise ValueError(
+                f"--cross-candidate-attention={args.cross_candidate_attention} nao bate com o "
+                f"checkpoint ({old_cross_candidate_attn}) -- muda o shape dos pesos da "
+                f"PairFlowWeightHead3D (ver model/pairflow_star.py:CrossCandidateAttention3D), "
+                f"nao e retomavel entre variantes. Use --no-resume ou um --out-dir novo.")
+        if args.cross_candidate_attention:
+            old_cattn_heads = old_args.get("cross_candidate_attn_heads", 4)
+            if old_cattn_heads != args.cross_candidate_attn_heads:
+                raise ValueError(
+                    f"--cross-candidate-attn-heads={args.cross_candidate_attn_heads} nao bate com "
+                    f"o checkpoint ({old_cattn_heads}) -- muda o shape dos pesos de "
+                    f"nn.MultiheadAttention, nao e retomavel entre variantes. Use --no-resume ou "
+                    f"um --out-dir novo.")
         # ATENCAO (mesmo comentario de 04h_train_pairflow_finetune.py): retomar via last.pt
         # SOBRESCREVE o que --init-checkpoint teria carregado -- comportamento correto, o run
         # ja em andamento ja incorporou o pre-treino na primeira epoca.
         model.load_state_dict(ckpt["model_state"])
-        if "optimizer_state" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state"])
-        if "scheduler_state" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state"])
+        if args.reset_lr:
+            # Reinicio a quente: pesos sim, estado de otimizacao nao. O
+            # optimizer_state do Adam carrega os momentos E o LR corrente; o
+            # scheduler_state carrega o contador de plateau. Restaurar os dois
+            # e' justamente o que faz o --lr desta chamada nao ter efeito.
+            _old_lr = ckpt.get("args", {}).get("lr")
+            print(f"[reset-lr] descartando optimizer_state/scheduler_state do checkpoint "
+                  f"-- otimizador e scheduler recriados com lr={args.lr:.2e}"
+                  + (f" (o checkpoint vinha de lr={_old_lr})" if _old_lr is not None else ""),
+                  flush=True)
+        else:
+            if "optimizer_state" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+            if "scheduler_state" in ckpt:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_val = float(ckpt.get("best_val", ckpt.get("val_loss", float("inf"))))
         epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
+        if args.reset_lr and epochs_no_improve:
+            print(f"[reset-lr] zerando epochs_no_improve ({epochs_no_improve} -> 0) -- o "
+                  f"modelo precisa de algumas epocas pra assentar no LR novo. "
+                  f"best_val={best_val:.6f} e MANTIDO, entao o best.pt so' e' substituido "
+                  f"por uma melhora real.", flush=True)
+            epochs_no_improve = 0
         print(f"[resume] retomando da epoca {start_epoch} (best_val={best_val:.6f}, "
               f"epochs_no_improve={epochs_no_improve})", flush=True)
         if start_epoch > args.epochs:
@@ -643,10 +800,21 @@ def main():
     else:
         print("[resume] nenhum checkpoint anterior encontrado (ou --no-resume) -- "
               "comecando do zero (ou do --init-checkpoint, se passado).", flush=True)
+        if args.reset_lr:
+            # Nao e' erro, mas quase sempre significa que o --resume-checkpoint
+            # nao chegou ou que veio um --no-resume junto por engano -- e nesse
+            # caso as epocas que a flag deveria aproveitar somem em silencio.
+            print("[reset-lr][aviso] --reset-lr passado, mas nao ha checkpoint pra retomar: "
+                  "nao ha estado de otimizacao a descartar e o treino comeca do zero no "
+                  f"--lr={args.lr:.2e}. Se a intencao era o reinicio A QUENTE, confira o "
+                  "--resume-checkpoint (e nao passe --no-resume junto).", flush=True)
 
     warmup_state = None
     if args.warmup_steps > 0:
-        if resume_ckpt_path is not None:
+        # Com --reset-lr o otimizador e' novo, entao o warmup volta a fazer
+        # sentido (o motivo de ignora-lo em resume e' que o otimizador ja
+        # estava aquecido -- o que deixa de valer quando ele e' recriado).
+        if resume_ckpt_path is not None and not args.reset_lr:
             print(f"[warmup] --warmup-steps={args.warmup_steps} ignorado -- retomando de "
                   f"checkpoint existente (warmup so' faz sentido comecando do zero).", flush=True)
         else:
@@ -685,16 +853,17 @@ def main():
         # --angular-loss-weight=0.0.
         f.write("epoch,train_loss,val_loss,lr,"
                 "train_loss_signal,train_loss_angular,"
-                "val_loss_signal,val_loss_angular\n")
+                "val_loss_signal,val_loss_angular,"
+                "train_loss_residual,val_loss_residual\n")
     batch_log_path = run_dir / "batch_log.csv"
     batch_log_f = open(batch_log_path, "w")
     batch_log_f.write("epoch,split,batch,loss,wait_s,compute_s,subject_tags,n_pares_reais_media,"
-                       "loss_signal,loss_angular\n")
+                       "loss_signal,loss_angular,loss_residual\n")
 
     try:
         for epoch in range(start_epoch, args.epochs + 1):
             train_sampler.set_epoch(epoch)
-            train_loss, train_loss_signal, train_loss_angular = run_epoch(
+            train_loss, train_loss_signal, train_loss_angular, train_loss_residual = run_epoch(
                 model, train_loader, optimizer, device, train=True,
                 epoch=epoch, need_quality=need_quality,
                 batch_log_f=batch_log_f,
@@ -702,15 +871,17 @@ def main():
                 warmup_state=warmup_state,
                 angular_loss_weight=args.angular_loss_weight,
                 sh_loss_high_order_min=args.sh_loss_high_order_min,
-                sh_loss_lmax_cap=args.sh_loss_lmax_cap)
-            val_loss, val_loss_signal, val_loss_angular = run_epoch(
+                sh_loss_lmax_cap=args.sh_loss_lmax_cap,
+                residual_l2_weight=args.residual_l2_weight)
+            val_loss, val_loss_signal, val_loss_angular, val_loss_residual = run_epoch(
                 model, val_loader, optimizer, device, train=False,
                 epoch=epoch, need_quality=need_quality,
                 batch_log_f=batch_log_f,
                 max_batches=args.max_val_batches,
                 angular_loss_weight=args.angular_loss_weight,
                 sh_loss_high_order_min=args.sh_loss_high_order_min,
-                sh_loss_lmax_cap=args.sh_loss_lmax_cap)
+                sh_loss_lmax_cap=args.sh_loss_lmax_cap,
+                residual_l2_weight=args.residual_l2_weight)
             scheduler.step(val_loss)
             current_lr = optimizer.param_groups[0]["lr"]
 
@@ -719,11 +890,14 @@ def main():
             with open(log_path, "a") as f:
                 f.write(f"{epoch},{train_loss:.6f},{val_loss:.6f},{current_lr:.2e},"
                         f"{train_loss_signal:.6f},{train_loss_angular_str},"
-                        f"{val_loss_signal:.6f},{val_loss_angular_str}\n")
-            if args.angular_loss_weight > 0:
+                        f"{val_loss_signal:.6f},{val_loss_angular_str},"
+                        f"{train_loss_residual:.6f},{val_loss_residual:.6f}\n")
+            if args.angular_loss_weight > 0 or args.residual_l2_weight > 0.0:
                 print(f"epoch {epoch:03d} | train {train_loss:.6f} "
-                      f"(mae {train_loss_signal:.6f}, ang {train_loss_angular:.6f}) | "
-                      f"val {val_loss:.6f} (mae {val_loss_signal:.6f}, ang {val_loss_angular:.6f}) | "
+                      f"(mae {train_loss_signal:.6f}, ang {train_loss_angular_str or 'n/a'}, "
+                      f"resid {train_loss_residual:.6f}) | "
+                      f"val {val_loss:.6f} (mae {val_loss_signal:.6f}, "
+                      f"ang {val_loss_angular_str or 'n/a'}, resid {val_loss_residual:.6f}) | "
                       f"lr {current_lr:.2e}")
             else:
                 print(f"epoch {epoch:03d} | train {train_loss:.6f} | val {val_loss:.6f} | "

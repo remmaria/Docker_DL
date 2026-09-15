@@ -85,12 +85,18 @@ def main():
         base_ch=ckpt_args.get("base_ch", 16),
         norm_type=ckpt_args.get("norm_type", "instance"),
         aggregation=ckpt_args.get("aggregation", "mean"),
+        cross_direction_attention=ckpt_args.get("cross_direction_attention", False),
+        cross_attn_heads=ckpt_args.get("cross_attn_heads", 4),
+        decoder_base_ch=ckpt_args.get("decoder_base_ch", None),
+        decoder_depth=ckpt_args.get("decoder_depth", 1),
+        decoder_reinject_code=ckpt_args.get("decoder_reinject_code", False),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     print(f"Checkpoint carregado (epoca {ckpt.get('epoch')}, val_loss {ckpt.get('val_loss')}, "
           f"l_max={model.l_max}, sh_dim={model.sh_dim}, base_ch={model.base_ch}, "
-          f"norm_type={model.norm_type}, aggregation={model.aggregation})")
+          f"norm_type={model.norm_type}, aggregation={model.aggregation}, "
+          f"cross_direction_attention={model.cross_direction_attention})")
 
     entries = [e for e in load_manifest(args.manifest) if e.split == args.split]
 

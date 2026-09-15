@@ -224,6 +224,80 @@ class AttentionAggregator3D(nn.Module):
         return state, alpha
 
 
+class CrossDirectionAttention3D(nn.Module):
+    """Bloco de self-attention ENTRE as n_level direcoes de entrada, aplicado
+    POR VOXEL (pesos compartilhados no espaco, mesmo espirito dos blocos
+    conv3d desta linha) -- ADITIVO (item 2 da discussao 2026-09-13 sobre por
+    que o RCAE bate o `implicit` em producao: `PerDirectionEncoder3D`
+    processa cada direcao de forma totalmente independente, e a agregacao
+    por media/`AttentionAggregator3D` tambem so calcula um escore POR
+    direcao isoladamente -- nenhuma direcao "ve" as outras antes da
+    agregacao. Esse bloco insere justamente essa interacao FALTANTE, logo
+    apos `PerDirectionEncoder3D` e ANTES de qualquer agregacao (ver
+    `ImplicitAngularModel3D.encode`) -- mesmo principio geral do "Set
+    Transformer" (Lee et al., ICML 2019): deixar os elementos do CONJUNTO
+    trocarem informacao entre si antes de qualquer pooling.
+
+    Motivacao empirica direta: um treino de producao real (M8/res15,
+    BATCH_SIZE=32/LR=4e-3, AGGREGATION=attention, INIT_OUTPUT_BIAS_FROM_DATA
+    + WARMUP_STEPS ja ativos) saturou em val_loss~0,041-0,042 ja na epoca 3,
+    bem acima do platô do RCAE/RRIN3DStar (~0,028-0,030) -- mesmo com
+    aggregation="attention" (que ja aprende um peso por voxel/direcao) o
+    modelo bate um teto cedo, sinal de que o problema nao e' "que tipo de
+    pooling" e sim a falta de interacao ENTRE direcoes antes de qualquer
+    pooling.
+
+    Por que self-attention COMPLETA (SAB) em vez da versao "induzida" (ISAB,
+    tambem do paper do Set Transformer, O(n) em vez de O(n^2)): aqui
+    n_level e' pequeno (tipicamente <=54 direcoes) -- o custo O(n^2) de uma
+    SAB comum e' desprezivel comparado ao resto do modelo (a dimensao
+    realmente grande e' o espaco: B*D*H*W voxels tratados como "batch"
+    desta atencao, nao o eixo das direcoes). ISAB so' compensaria a
+    complexidade extra pra n_level grande (centenas+), o que nao e' o caso
+    deste dataset.
+
+    PERMUTATION-EQUIVARIANTE por construcao (nao invariante -- a invariancia
+    so' vem DEPOIS, na agregacao por media/`AttentionAggregator3D`, que ja
+    consome a saida deste bloco): self-attention nao usa nenhuma codificacao
+    de POSICAO na sequencia (so' o conteudo de cada direcao, que ja carrega
+    seu proprio codigo SH via `PerDirectionEncoder3D`) -- permutar a ordem
+    das n_level direcoes de entrada permuta a saida na MESMA ordem, sem
+    mudar nenhum valor individual (ver teste de permutacao em
+    `_smoke_test`)."""
+
+    def __init__(self, channels: int, num_heads: int = 4, ff_mult: int = 2):
+        super().__init__()
+        if channels % num_heads != 0:
+            raise ValueError(
+                f"channels ({channels}) precisa ser divisivel por num_heads ({num_heads}) -- "
+                f"ver --base-ch/--cross-attn-heads em scripts/04f_train_implicit.py.")
+        self.num_heads = num_heads
+        self.attn = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads,
+                                           batch_first=True)
+        self.ln1 = nn.LayerNorm(channels)
+        self.ff = nn.Sequential(
+            nn.Linear(channels, channels * ff_mult),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels * ff_mult, channels),
+        )
+        self.ln2 = nn.LayerNorm(channels)
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        """feat: (B, n_level, C, D, H, W). Retorna o MESMO shape, com cada
+        direcao atualizada por atencao sobre as demais (por voxel)."""
+        b, n_level, c, d, h, w = feat.shape
+        # (B,n_level,C,D,H,W) -> (B,D,H,W,n_level,C) -> (B*D*H*W, n_level, C):
+        # trata cada posicao espacial como um item de "batch" independente da
+        # atencao (pesos compartilhados no espaco, mesmo espirito dos blocos
+        # conv3d desta linha -- so' que aqui a "convolucao" e' sobre o eixo
+        # das direcoes, nao sobre voxels vizinhos).
+        x = feat.permute(0, 3, 4, 5, 1, 2).reshape(b * d * h * w, n_level, c)
+        attn_out, _ = self.attn(x, x, x, need_weights=False)
+        x = self.ln1(x + attn_out)
+        x = self.ln2(x + self.ff(x))
+        return x.reshape(b, d, h, w, n_level, c).permute(0, 4, 5, 1, 2, 3)
+
+
 class SpatialTrunk3D(nn.Module):
     """Pequena U-Net 3D (2 niveis de downsample), MESMA topologia de
     `FlowNet3D.enc1/enc2/enc3/dec2/dec1/head` em model/rrin3d.py -- reusada
@@ -266,16 +340,46 @@ class ImplicitDecoderHead3D(nn.Module):
     perto de nenhuma) -- concatena o estado com o codigo SH da direcao-alvo
     (broadcast espacial) e prediz o sinal nessa direcao. Analogo direto do
     "query em coordenada continua" do LIIF (aqui a "coordenada" e uma
-    direcao na esfera, nao um pixel 2D)."""
+    direcao na esfera, nao um pixel 2D).
+
+    ATUALIZACAO (2026-09-14, ver addendum de capacidade): ganhou `depth` e
+    `reinject_code`, ADITIVOS. Com os defaults (`depth=1`,
+    `reinject_code=False`) a topologia, os NOMES dos parametros (`net.0.*`,
+    `net.1.*` -- `nn.ModuleList` registra os filhos pelo indice exatamente
+    como `nn.Sequential`) e a contagem de parametros ficam IDENTICOS a
+    versao anterior, entao checkpoints ja treinados continuam carregando.
+
+    Motivacao: esta e' a rede que representa a funcao continua sobre a
+    esfera -- e' o PROPOSITO do modelo implicito inteiro. Com `base_ch=16`
+    ela tinha 13.873 parametros e DUAS convolucoes (uma oculta + a de
+    saida), contra 3.723.497 parametros e 10 convolucoes do decoder do
+    RCAE (268x mais), que ainda por cima reinjeta o bvec do alvo em TODOS
+    os estagios (`model/rcae.py:RepeatBVector`). Aqui o codigo SH da
+    direcao-alvo entrava uma unica vez, na concatenacao de entrada, e
+    precisava sobreviver a toda a rede a partir dali -- `reinject_code=True`
+    corrige isso, seguindo tanto o RCAE quanto a pratica padrao de
+    representacoes implicitas (LIIF/NeRF injetam a coordenada repetidamente
+    ao longo do MLP, nao so' na primeira camada)."""
 
     def __init__(self, state_ch: int, sh_dim: int, base_ch: int = 16,
-                 norm_type: str = "instance"):
+                 norm_type: str = "instance", depth: int = 1,
+                 reinject_code: bool = False):
         super().__init__()
+        if depth < 1:
+            raise ValueError(f"depth de ImplicitDecoderHead3D deve ser >= 1 (recebido {depth})")
+        self.depth = depth
+        self.reinject_code = reinject_code
+        self.sh_dim = sh_dim
         in_ch = state_ch + sh_dim
-        self.net = nn.Sequential(
-            _conv3d(in_ch, base_ch, norm_type=norm_type),
-            nn.Conv3d(base_ch, 1, kernel_size=3, padding=1),
-        )
+        hidden_in = base_ch + (sh_dim if reinject_code else 0)
+        layers = [_conv3d(in_ch, base_ch, norm_type=norm_type)]
+        for _ in range(depth - 1):
+            layers.append(_conv3d(hidden_in, base_ch, norm_type=norm_type))
+        layers.append(nn.Conv3d(base_ch, 1, kernel_size=3, padding=1))
+        # ModuleList (nao Sequential) porque o forward precisa reconcatenar o
+        # codigo SH entre as camadas quando reinject_code=True. Os nomes dos
+        # parametros no state_dict sao os mesmos de um Sequential equivalente.
+        self.net = nn.ModuleList(layers)
 
     def forward(self, state: torch.Tensor, sh_code: torch.Tensor) -> torch.Tensor:
         """state: (N, state_ch, D, H, W) -- N = B*N_out (ja repetido, ver
@@ -284,7 +388,11 @@ class ImplicitDecoderHead3D(nn.Module):
         spatial = state.shape[-3:]
         code_map = _repeat_vec_3d(sh_code, spatial)
         x = torch.cat([state, code_map], dim=1)
-        return self.net(x)
+        for i, layer in enumerate(self.net):
+            if self.reinject_code and 0 < i < len(self.net) - 1:
+                x = torch.cat([x, code_map], dim=1)
+            x = layer(x)
+        return x
 
 
 class ImplicitAngularModel3D(nn.Module):
@@ -313,6 +421,20 @@ class ImplicitAngularModel3D(nn.Module):
         --resume-checkpoint, mesma logica de l_max/base_ch/norm_type, ver
         scripts/04f_train_implicit.py).
 
+    cross_direction_attention: False (default, comportamento ORIGINAL) ou
+        True (ADITIVO, ver `CrossDirectionAttention3D` e addendum
+        2026-09-13, item 2) -- insere um bloco de self-attention ENTRE as
+        n_level direcoes de entrada logo apos `PerDirectionEncoder3D` e
+        ANTES de qualquer agregacao (mean/attention) -- ataca a falta de
+        interacao entre direcoes que nem "attention" (que so pondera
+        direcoes ja calculadas de forma independente) resolve. Composa com
+        QUALQUER `aggregation` (mean ou attention) -- sao etapas
+        independentes do pipeline. FIXO na construcao (adiciona parametros
+        novos -- nao pode mudar em --resume-checkpoint).
+    cross_attn_heads: numero de cabecas da `CrossDirectionAttention3D`
+        (default 4). So tem efeito se cross_direction_attention=True. Precisa
+        dividir `base_ch` (embed_dim da atencao) sem resto.
+
     Uso:
         model = build_implicit_model(n_level=16)
         pred = model(input_vols, input_bvecs, target_bvecs)
@@ -326,7 +448,10 @@ class ImplicitAngularModel3D(nn.Module):
     """
 
     def __init__(self, n_level: int, l_max: int | None = None, base_ch: int = 16,
-                 norm_type: str = "instance", aggregation: str = "mean"):
+                 norm_type: str = "instance", aggregation: str = "mean",
+                 cross_direction_attention: bool = False, cross_attn_heads: int = 4,
+                 decoder_base_ch: int = None, decoder_depth: int = 1,
+                 decoder_reinject_code: bool = False):
         super().__init__()
         if aggregation not in ("mean", "attention"):
             raise ValueError(f"aggregation deve ser 'mean' ou 'attention', recebi {aggregation!r}")
@@ -336,13 +461,24 @@ class ImplicitAngularModel3D(nn.Module):
         self.base_ch = base_ch
         self.norm_type = norm_type
         self.aggregation = aggregation
+        self.cross_direction_attention = cross_direction_attention
+        self.cross_attn_heads = cross_attn_heads
 
         self.per_dir_encoder = PerDirectionEncoder3D(self.sh_dim, base_ch=base_ch,
                                                        norm_type=norm_type)
+        self.cross_attn = (CrossDirectionAttention3D(base_ch, num_heads=cross_attn_heads)
+                            if cross_direction_attention else None)
         self.attn_aggregator = (AttentionAggregator3D(base_ch, norm_type=norm_type)
                                  if aggregation == "attention" else None)
         self.trunk = SpatialTrunk3D(base_ch, base_ch=base_ch, norm_type=norm_type)
-        self.decoder_head = ImplicitDecoderHead3D(base_ch, self.sh_dim, base_ch=base_ch,
+        # decoder_base_ch=None => segue base_ch (comportamento historico).
+        self.decoder_base_ch = decoder_base_ch if decoder_base_ch is not None else base_ch
+        self.decoder_depth = decoder_depth
+        self.decoder_reinject_code = decoder_reinject_code
+        self.decoder_head = ImplicitDecoderHead3D(base_ch, self.sh_dim,
+                                                   base_ch=self.decoder_base_ch,
+                                                   depth=decoder_depth,
+                                                   reinject_code=decoder_reinject_code,
                                                     norm_type=norm_type)
 
     def encode(self, input_vols: torch.Tensor, input_bvecs: torch.Tensor,
@@ -370,6 +506,13 @@ class ImplicitAngularModel3D(nn.Module):
         vols_flat = input_vols.reshape(b * n_level, 1, *spatial)       # (B*n_level, 1, D,H,W)
         feat_flat = self.per_dir_encoder(vols_flat, sh_flat)           # (B*n_level, base_ch, D,H,W)
         feat = feat_flat.reshape(b, n_level, self.base_ch, *spatial)
+
+        if self.cross_attn is not None:
+            # interacao ENTRE direcoes (item 2, addendum 2026-09-13) --
+            # atualiza cada feature por-direcao com base nas demais, ANTES
+            # de qualquer agregacao (equivariante a permutacao, ver
+            # docstring de CrossDirectionAttention3D).
+            feat = self.cross_attn(feat)
 
         if self.aggregation == "mean":
             # agregacao PERMUTATION-INVARIANT (media simples, estilo DeepSets
@@ -424,16 +567,25 @@ class ImplicitAngularModel3D(nn.Module):
 
 
 def build_implicit_model(n_level: int, l_max: int | None = None, base_ch: int = 16,
-                          norm_type: str = "instance",
-                          aggregation: str = "mean") -> ImplicitAngularModel3D:
+                          norm_type: str = "instance", aggregation: str = "mean",
+                          cross_direction_attention: bool = False,
+                          cross_attn_heads: int = 4,
+                          decoder_base_ch: int = None, decoder_depth: int = 1,
+                          decoder_reinject_code: bool = False) -> ImplicitAngularModel3D:
     """Factory unica -- usar em scripts/04f_train_implicit.py e
     scripts/05i_reconstruct_implicit.py em vez de instanciar
     ImplicitAngularModel3D diretamente, mesmo espirito de
     `build_rrin_model`/`build_star_model` (mantem as duas pontas
-    sincronizadas; o checkpoint grava l_max/base_ch/norm_type/aggregation em
-    `args`, e a reconstrucao le de la)."""
+    sincronizadas; o checkpoint grava l_max/base_ch/norm_type/aggregation/
+    cross_direction_attention/cross_attn_heads em `args`, e a reconstrucao
+    le de la)."""
     return ImplicitAngularModel3D(n_level=n_level, l_max=l_max, base_ch=base_ch,
-                                   norm_type=norm_type, aggregation=aggregation)
+                                   norm_type=norm_type, aggregation=aggregation,
+                                   cross_direction_attention=cross_direction_attention,
+                                   cross_attn_heads=cross_attn_heads,
+                                   decoder_base_ch=decoder_base_ch,
+                                   decoder_depth=decoder_depth,
+                                   decoder_reinject_code=decoder_reinject_code)
 
 
 def _smoke_test():
@@ -558,6 +710,97 @@ def _smoke_test():
         raise AssertionError("aggregation invalido deveria levantar ValueError na construcao")
     except ValueError:
         print("OK: aggregation invalido ('max') levanta ValueError na construcao, como esperado")
+
+    # cross_direction_attention=True (ADITIVO, ver CrossDirectionAttention3D,
+    # item 2 do addendum 2026-09-13) -- mesmos testes de shape/permutation-
+    # invariance, combinado com as duas opcoes de aggregation (mean E
+    # attention, ja que sao etapas independentes do pipeline).
+    for agg in ("mean", "attention"):
+        model_xattn = build_implicit_model(n_level=n_level, base_ch=8, aggregation=agg,
+                                            cross_direction_attention=True, cross_attn_heads=2)
+        assert model_xattn.cross_attn is not None
+        pred_xattn = model_xattn(input_vols, input_bvecs, target_bvecs)
+        assert pred_xattn.shape == expected
+        print(f"smoke test OK (cross_direction_attention=True, aggregation={agg}), "
+              f"output shape: {tuple(pred_xattn.shape)}")
+
+        model_xattn.eval()
+        with torch.no_grad():
+            pred_orig_x = model_xattn(input_vols, input_bvecs, target_bvecs)
+            pred_perm_x = model_xattn(input_vols[:, perm], input_bvecs[:, perm], target_bvecs)
+        assert torch.allclose(pred_orig_x, pred_perm_x, atol=1e-4), \
+            (f"cross_direction_attention=True (aggregation={agg}) deveria continuar invariante "
+             f"a permutacao da ORDEM das n_level direcoes de entrada")
+        print(f"OK: cross_direction_attention=True (aggregation={agg}) tambem e' invariante a "
+              f"permutacao das n_level direcoes de entrada")
+
+    # numero de cabecas que nao divide base_ch deve falhar cedo, na
+    # construcao do bloco de atencao (nao silenciosamente truncar nem falhar
+    # tarde dentro de um forward).
+    try:
+        build_implicit_model(n_level=n_level, base_ch=8, cross_direction_attention=True,
+                              cross_attn_heads=3)
+        raise AssertionError("cross_attn_heads que nao divide base_ch deveria levantar "
+                              "ValueError na construcao")
+    except ValueError:
+        print("OK: cross_attn_heads=3 com base_ch=8 (nao divisivel) levanta ValueError na "
+              "construcao, como esperado")
+
+    # CAPACIDADE DO DECODER (2026-09-14, ver addendum de capacidade):
+    # --decoder-base-ch / --decoder-depth / --decoder-reinject-code.
+    #
+    # (a) GUARDA DE RETROCOMPATIBILIDADE: com os defaults, o decoder precisa
+    # manter EXATAMENTE a contagem historica (13.873 em base_ch=16/l_max=4) e
+    # os mesmos nomes de parametro no state_dict (`net.0.*`/`net.1.*`) -- a
+    # troca de nn.Sequential por nn.ModuleList so' e' segura porque os dois
+    # registram os filhos pelo indice. Se isto quebrar, todo checkpoint do
+    # implicit ja treinado para de carregar.
+    model_def = build_implicit_model(n_level=n_level, l_max=4, base_ch=16)
+    n_dec_default = sum(p.numel() for p in model_def.decoder_head.parameters())
+    assert model_def.sh_dim == 15, f"esperado sh_dim=15 com l_max=4, obtido {model_def.sh_dim}"
+    assert n_dec_default == 13873, \
+        (f"decoder com defaults deveria manter os 13.873 parametros historicos, obtido "
+         f"{n_dec_default} -- isso INVALIDA checkpoints existentes do implicit")
+    dec_keys = sorted(k for k, _ in model_def.decoder_head.named_parameters())
+    assert all(k.startswith("net.0.") or k.startswith("net.1.") for k in dec_keys), \
+        f"nomes de parametro do decoder mudaram ({dec_keys}) -- quebra checkpoints existentes"
+    print(f"OK: decoder com defaults preserva os {n_dec_default} parametros e os nomes "
+          f"historicos ({len(dec_keys)} tensores em net.0/net.1)")
+
+    # (b) decoder maior/mais fundo/com reinjecao do codigo
+    model_dec = build_implicit_model(n_level=n_level, l_max=4, base_ch=16, decoder_base_ch=32,
+                                      decoder_depth=3, decoder_reinject_code=True)
+    pred_dec = model_dec(input_vols, input_bvecs, target_bvecs)
+    assert pred_dec.shape == (b, n_out, 1, d, h, w), f"shape mismatch: {pred_dec.shape}"
+    n_dec_big = sum(p.numel() for p in model_dec.decoder_head.parameters())
+    print(f"smoke test OK (decoder_base_ch=32, depth=3, reinject_code=True): decoder com "
+          f"{n_dec_big} parametros ({n_dec_big / n_dec_default:.1f}x o default)")
+
+    # (c) a reinjecao tem que REALMENTE mudar o calculo -- comparar contra a
+    # mesma topologia sem reinjecao (contagens diferentes ja provam que as
+    # camadas ocultas recebem canais a mais).
+    model_noreinj = build_implicit_model(n_level=n_level, l_max=4, base_ch=16, decoder_base_ch=32,
+                                          decoder_depth=3, decoder_reinject_code=False)
+    n_dec_noreinj = sum(p.numel() for p in model_noreinj.decoder_head.parameters())
+    assert n_dec_big > n_dec_noreinj, \
+        "reinject_code=True deveria adicionar canais de entrada nas camadas ocultas"
+    print(f"OK: reinject_code=True adiciona {n_dec_big - n_dec_noreinj} parametros vs. a mesma "
+          f"topologia sem reinjecao (o codigo SH volta a entrar em cada camada oculta)")
+
+    # (d) invariancia a permutacao tem que continuar valendo com o decoder novo
+    model_dec.eval()
+    with torch.no_grad():
+        p_orig = model_dec(input_vols, input_bvecs, target_bvecs)
+        p_perm = model_dec(input_vols[:, perm], input_bvecs[:, perm], target_bvecs)
+    assert torch.allclose(p_orig, p_perm, atol=1e-4), \
+        "decoder maior nao pode quebrar a invariancia a permutacao das direcoes de entrada"
+    print("OK: decoder maior/mais fundo preserva a invariancia a permutacao das direcoes")
+
+    try:
+        build_implicit_model(n_level=n_level, l_max=4, decoder_depth=0)
+        raise AssertionError("deveria ter levantado ValueError (decoder_depth=0)")
+    except ValueError:
+        print("OK: decoder_depth < 1 levanta ValueError cedo")
 
 
 if __name__ == "__main__":
